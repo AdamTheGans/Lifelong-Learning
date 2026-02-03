@@ -13,7 +13,7 @@ def make_env(
     *,
     switch_on_reset: bool = False,
     switch_mid_episode: bool = False,
-    mid_episode_switch_step_range: tuple[int, int] = (20, 80),
+    mid_episode_switch_step_range: tuple[int, int] = (10, 40),
     record_stats: bool = True,
 ) -> gym.Env:
     """

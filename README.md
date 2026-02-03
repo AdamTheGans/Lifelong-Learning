@@ -14,4 +14,4 @@ We will experiment with continual / non-stationary RL with world models + planni
 ## Directions to Run (so far)
 1) `pip install -r requirements.txt`
 2) `pip install -e .`
-3) Run the sanity check: `python scripts/00_check_env.py`
+3) Run the sanity check, env with regime switch: `python scripts/00_check_env.py --switch_mid_episode --steps 120`

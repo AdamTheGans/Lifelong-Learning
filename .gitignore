@@ -13,3 +13,8 @@ data/
 *.pt
 *.pth
 *.ckpt
+
+# Python packaging/build artifacts
+*.egg-info/
+build/
+dist/

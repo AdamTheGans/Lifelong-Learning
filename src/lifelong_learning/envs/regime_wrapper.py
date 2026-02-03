@@ -72,6 +72,13 @@ class RegimeActionRemapWrapper(gym.Wrapper):
         mapped_action = self._map_action(int(action), self.regime_id)
         obs, reward, terminated, truncated, info = self.env.step(mapped_action)
 
+        # If episode ended, attach some metadata for logging
+        if terminated or truncated:
+            info["episode_extra"] = {
+                "regime_id_end": self.regime_id,
+                "switch_step": self.switch_step,
+            }
+
         info = dict(info)
         info["regime_id"] = self.regime_id
         info["switch_step"] = self.switch_step

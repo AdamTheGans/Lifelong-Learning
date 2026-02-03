@@ -1,0 +1,17 @@
+# Core
+numpy>=1.24
+torch>=2.1
+gymnasium>=0.29
+minigrid>=2.3
+tqdm>=4.66
+
+# Logging / plotting
+tensorboard>=2.15
+matplotlib>=3.8
+
+# Optional but useful
+pygame>=2.5
+wandb>=0.16
+
+# Planning utilities (MPC/CEM, etc.)
+scipy>=1.11

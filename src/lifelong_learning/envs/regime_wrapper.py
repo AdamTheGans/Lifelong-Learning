@@ -108,12 +108,15 @@ class RegimeActionRemapWrapper(gym.Wrapper):
 
     @staticmethod
     def _map_action(action: int, regime_id: int) -> int:
-        # Regime 0: Identity
-        # Regime 1: Swap Left(0) <-> Right(1)
         if regime_id == 0:
             return action
-        if action == 0:
-            return 1
-        if action == 1:
-            return 0
+        
+        # HARD REGIME: Permute all movement keys
+        # Forward (2) -> Right (1)
+        # Right (1)   -> Left (0)
+        # Left (0)    -> Forward (2)
+        if action == 2: return 1
+        if action == 1: return 0
+        if action == 0: return 2
+        
         return action

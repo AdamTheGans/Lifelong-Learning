@@ -45,7 +45,10 @@ class CNNActorCritic(nn.Module):
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
 
     def forward(self, obs: torch.Tensor):
-        z = self.cnn(obs)
+        # Normalize input. MiniGrid object IDs are small integers (0-10).
+        # Dividing by 10.0 scales them to roughly [0, 1] range.
+        # This prevents large input values from saturating ReLU or gradients.
+        z = self.cnn(obs / 10.0) 
         z = self.mlp(z)
         logits = self.actor(z)
         value = self.critic(z).squeeze(-1)

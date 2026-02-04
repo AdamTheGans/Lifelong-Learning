@@ -42,10 +42,13 @@ class RolloutBuffer:
         last_adv = torch.zeros(self.num_envs, device=self.device)
         for t in reversed(range(self.num_steps)):
             if t == self.num_steps - 1:
+                # If this was the last step of the buffer, we check if IT was terminal.
                 next_nonterminal = 1.0 - self.dones[t]
                 next_values = last_value
             else:
-                next_nonterminal = 1.0 - self.dones[t + 1]
+                # We must use dones[t] to mask the transition from t -> t+1.
+                # The original code erroneously used dones[t+1].
+                next_nonterminal = 1.0 - self.dones[t]
                 next_values = self.values[t + 1]
 
             delta = self.rewards[t] + gamma * next_values * next_nonterminal - self.values[t]

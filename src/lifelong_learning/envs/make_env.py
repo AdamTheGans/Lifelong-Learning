@@ -1,27 +1,27 @@
 from __future__ import annotations
-
+import collections
 import gymnasium as gym
-import minigrid  # noqa: F401
-from collections import deque
+import minigrid 
 import numpy as np
 
+import lifelong_learning.envs.dual_goal
 from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
-from lifelong_learning.envs.regime_wrapper import RegimeActionRemapWrapper
+from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
 
-class RegimeStatsWrapper(gym.Wrapper):
+class RollingAvgWrapper(gym.Wrapper):
     """
-    Splits episodic returns into 'return_regime_0' and 'return_regime_1'.
-    This allows TensorBoard to show performance per regime.
+    Aggregates returns and lengths over a rolling window.
+    Only writes to 'info' when a smoothed average is ready.
+    This makes TensorBoard graphs much cleaner.
     """
-    def __init__(self, env):
+    def __init__(self, env, window_size=50):
         super().__init__(env)
+        self.window_size = window_size
+        self.return_queue = collections.deque(maxlen=window_size)
+        self.length_queue = collections.deque(maxlen=window_size)
+        
         self.current_return = 0.0
         self.current_length = 0
-
-    def reset(self, **kwargs):
-        self.current_return = 0.0
-        self.current_length = 0
-        return self.env.reset(**kwargs)
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -29,22 +29,26 @@ class RegimeStatsWrapper(gym.Wrapper):
         self.current_length += 1
 
         if terminated or truncated:
-            # Identify which regime we finished in
-            regime = info.get("regime_id", 0)
-            
-            # Inject custom stats for PPO logger
-            # (CleanRL/RecordEpisodeStatistics usually looks at info["episode"])
-            # We add a custom key that we hope the logger picks up, 
-            # OR we modify info["episode"] directly if we know the structure.
-            
+            self.return_queue.append(self.current_return)
+            self.length_queue.append(self.current_length)
+
+            # Inject the ROLLING AVERAGE into info
+            # We use a special key that your logger can look for, 
+            # or simply overwrite "episode" if you prefer.
             if "episode" not in info:
                 info["episode"] = {}
             
-            # Add specific regime keys
-            info["episode"][f"r_regime_{regime}"] = self.current_return
-            info["episode"][f"l_regime_{regime}"] = self.current_length
+            # Calculates mean of last N episodes
+            avg_r = np.mean(self.return_queue)
+            avg_l = np.mean(self.length_queue)
+
+            info["episode"]["r"] = avg_r
+            info["episode"]["l"] = avg_l
             
-            # Reset trackers
+            # Pass regime stats if present
+            regime = info.get("regime_id", 0)
+            info["episode"][f"r_regime_{regime}"] = self.current_return
+            
             self.current_return = 0.0
             self.current_length = 0
 
@@ -54,35 +58,32 @@ def make_env(
     env_id: str,
     seed: int,
     *,
-    # Deterministic args
     steps_per_regime: int | None = None,
     episodes_per_regime: int | None = None,
     start_regime: int = 0,
-    # Random args
-    switch_on_reset: bool = False,
-    switch_mid_episode: bool = False,
-    mid_episode_switch_step_range: tuple[int, int] = (10, 40),
     record_stats: bool = True,
+    **kwargs, 
 ) -> gym.Env:
     
     env = gym.make(env_id)
+    
+    # 1. Observation: (C, H, W) Integers
     env = MiniGridImageObsWrapper(env)
 
-    env = RegimeActionRemapWrapper(
+    # 2. Regime: Swap Rewards
+    env = RegimeGoalSwapWrapper(
         env,
         steps_per_regime=steps_per_regime,
         episodes_per_regime=episodes_per_regime,
         start_regime=start_regime,
-        switch_on_reset=switch_on_reset,
-        switch_mid_episode=switch_mid_episode,
-        mid_episode_switch_step_range=mid_episode_switch_step_range,
         seed=seed,
     )
 
+    # 3. Stats: Record & Smooth
     if record_stats:
-        # Standard Gym stats (overall return/length)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        # Our custom splitter for regime-specific logging
-        env = RegimeStatsWrapper(env)
+        # Apply smoothing wrapper ON TOP of RecordEpisodeStatistics
+        # This will override the noisy single-episode "r" with the smooth average
+        env = RollingAvgWrapper(env, window_size=50)
 
     return env

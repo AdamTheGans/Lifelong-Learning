@@ -5,21 +5,28 @@ import time
 import numpy as np
 import torch
 import gymnasium as gym
+from gymnasium.envs.registration import register
+
+# --- REGISTER CUSTOM ENVIRONMENTS ---
+# This must happen before make_env is called
+register(
+    id="MiniGrid-DualGoal-8x8-v0",
+    entry_point="lifelong_learning.envs.dual_goal:DualGoalEnv",
+)
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
+from lifelong_learning.envs.make_env import make_env 
 
 
 def log_vec_episodic_stats(logger, infos, global_step: int):
     """
     Robustly log episodic return/length from Gymnasium vector env info dict.
-    Handles the 'Dict of Arrays' format where `_episode` is a boolean mask.
     """
     # 1. Standard Gymnasium Vector Env format (Dict of Arrays)
-    # We look for '_episode', which is a boolean mask array indicating which envs finished.
     if "_episode" in infos:
         mask = infos["_episode"]
         # Iterate over all environments that finished an episode in this step
@@ -28,23 +35,19 @@ def log_vec_episodic_stats(logger, infos, global_step: int):
                 ep_data = infos["episode"]
                 
                 # Extract standard return/length
-                # We simply grab the value at index `i`
                 if "r" in ep_data:
                     logger.scalar("charts/episodic_return", float(ep_data["r"][i]), global_step)
                 if "l" in ep_data:
                     logger.scalar("charts/episodic_length", float(ep_data["l"][i]), global_step)
 
-                # Extract custom regime stats (e.g., r_regime_0, l_regime_1)
-                # These were injected into the 'episode' dict by our RegimeStatsWrapper
+                # Extract custom regime stats if they exist
                 for k, v in ep_data.items():
                     if k.startswith("r_regime_") or k.startswith("l_regime_"):
-                        # v is likely an array, so we take the i-th element
                         val = v[i] if hasattr(v, "__getitem__") and v.ndim > 0 else v
                         logger.scalar(f"charts/{k}", float(val), global_step)
         return
 
     # 2. Legacy/List-based format (Fallbacks)
-    # ... (Keep existing fallback logic if you want, but the above block covers your case)
     if "final_info" in infos and infos["final_info"] is not None:
         for finfo in infos["final_info"]:
             if finfo and "episode" in finfo:
@@ -70,13 +73,14 @@ def train_ppo(
     save_every_updates: int = 50,
 ):
     """
-    PPO training loop using SyncVectorEnv (stable on Windows).
+    PPO training loop using SyncVectorEnv.
     """
-    from lifelong_learning.envs.make_env import make_env  # local import to avoid circulars
-
     seed_everything(cfg.seed)
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+    # OPTIMIZATION: Increase parallel envs for stability if cfg is low
+    num_envs = max(cfg.num_envs, 16)
 
     def make_thunk(i: int):
         def thunk():
@@ -93,7 +97,7 @@ def train_ppo(
             )
         return thunk
 
-    envs = gym.vector.SyncVectorEnv([make_thunk(i) for i in range(cfg.num_envs)])
+    envs = gym.vector.SyncVectorEnv([make_thunk(i) for i in range(num_envs)])
 
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n
@@ -101,7 +105,7 @@ def train_ppo(
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
-    buffer = RolloutBuffer(cfg.num_steps, cfg.num_envs, obs_shape, device)
+    buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
@@ -113,16 +117,23 @@ def train_ppo(
     obs, info = envs.reset(seed=cfg.seed)
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
 
-    num_updates = cfg.total_timesteps // (cfg.num_envs * cfg.num_steps)
+    num_updates = cfg.total_timesteps // (num_envs * cfg.num_steps)
     global_step = 0
     start_time = time.time()
 
+    print(f"Training on {device} with {num_envs} envs for {num_updates} updates.")
+
     for update in range(1, num_updates + 1):
+        # Anneal Learning Rate
+        frac = 1.0 - (update - 1.0) / num_updates
+        lrnow = frac * cfg.lr
+        optimizer.param_groups[0]["lr"] = lrnow
+
         buffer.reset()
 
         # Rollout
         for t in range(cfg.num_steps):
-            global_step += cfg.num_envs
+            global_step += num_envs
 
             with torch.no_grad():
                 action, logprob, entropy, value = model.act(obs_t)
@@ -150,13 +161,21 @@ def train_ppo(
 
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
-        # PPO Update
-        minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-        logs = ppo_update(model, optimizer, minibatches, cfg)
+        # PPO Update (Fixed Loop)
+        update_stats = []
+        for epoch in range(cfg.update_epochs):
+            # Regenerate minibatches every epoch!
+            minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+            stats = ppo_update(model, optimizer, minibatches, cfg)
+            update_stats.append(stats)
+        
+        # Average stats across epochs
+        avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]}
 
         # Training diagnostics
-        for k, v in logs.items():
+        for k, v in avg_stats.items():
             logger.scalar(k, v, global_step)
+        logger.scalar("charts/learning_rate", lrnow, global_step)
 
         sps = int(global_step / max(1e-9, (time.time() - start_time)))
         logger.scalar("charts/SPS", sps, global_step)
@@ -170,13 +189,6 @@ def train_ppo(
                     "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": cfg.__dict__,
                     "env_id": env_id,
-                    "schedule": {
-                        "steps_per_regime": steps_per_regime,
-                        "episodes_per_regime": episodes_per_regime,
-                        "start_regime": start_regime,
-                        "switch_on_reset": switch_on_reset,
-                        "switch_mid_episode": switch_mid_episode,
-                    },
                     "global_step": global_step,
                     "update": update,
                 },

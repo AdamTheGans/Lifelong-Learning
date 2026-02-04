@@ -7,9 +7,9 @@ import torch.nn as nn
 
 @dataclass
 class PPOConfig:
-    total_timesteps: int = 300_000
-    num_envs: int = 8
-    num_steps: int = 128  # rollout length
+    total_timesteps: int = 500_000   # Increased slightly
+    num_envs: int = 16               # Increased for stability
+    num_steps: int = 128
     update_epochs: int = 4
     minibatch_size: int = 256
 
@@ -19,8 +19,7 @@ class PPOConfig:
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5
-
-    lr: float = 2.5e-4
+    lr: float = 3e-4        # Slightly higher starting LR since we decay it now
     max_grad_norm: float = 0.5
 
     seed: int = 0

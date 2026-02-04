@@ -16,66 +16,55 @@ from lifelong_learning.utils.logger import TBLogger
 def log_vec_episodic_stats(logger, infos, global_step: int):
     """
     Robustly log episodic return/length from Gymnasium vector env info dict.
-
-    Depending on gymnasium version/wrappers, episode stats may appear in:
-      - infos["final_info"] : list of dicts (one per env) when an episode ends
-      - infos["episode"]    : sometimes list/array of dicts
-      - infos["final_info"][i]["episode"] : dict with keys "r" and "l"
+    Handles the 'Dict of Arrays' format where `_episode` is a boolean mask.
     """
-    # Most reliable in Gymnasium vector envs:
-    if "final_info" in infos and infos["final_info"] is not None:
-        for finfo in infos["final_info"]:
-            if finfo is None:
-                continue
-            if isinstance(finfo, dict) and "episode" in finfo and isinstance(finfo["episode"], dict):
-                ep = finfo["episode"]
-                if "r" in ep:
-                    logger.scalar("charts/episodic_return", float(ep["r"]), global_step)
-                if "l" in ep:
-                    logger.scalar("charts/episodic_length", float(ep["l"]), global_step)
+    # 1. Standard Gymnasium Vector Env format (Dict of Arrays)
+    # We look for '_episode', which is a boolean mask array indicating which envs finished.
+    if "_episode" in infos:
+        mask = infos["_episode"]
+        # Iterate over all environments that finished an episode in this step
+        for i in np.where(mask)[0]:
+            if "episode" in infos:
+                ep_data = infos["episode"]
+                
+                # Extract standard return/length
+                # We simply grab the value at index `i`
+                if "r" in ep_data:
+                    logger.scalar("charts/episodic_return", float(ep_data["r"][i]), global_step)
+                if "l" in ep_data:
+                    logger.scalar("charts/episodic_length", float(ep_data["l"][i]), global_step)
 
-            extra = finfo.get("episode_extra", None)
-            if isinstance(extra, dict):
-                rid = extra.get("regime_id_end", None)
-                if rid is not None:
-                    logger.scalar(f"charts/episodic_return_regime_{rid}", float(ep["r"]), global_step)
+                # Extract custom regime stats (e.g., r_regime_0, l_regime_1)
+                # These were injected into the 'episode' dict by our RegimeStatsWrapper
+                for k, v in ep_data.items():
+                    if k.startswith("r_regime_") or k.startswith("l_regime_"):
+                        # v is likely an array, so we take the i-th element
+                        val = v[i] if hasattr(v, "__getitem__") and v.ndim > 0 else v
+                        logger.scalar(f"charts/{k}", float(val), global_step)
         return
 
-    # Fallback: sometimes episode info is directly here
-    if "episode" in infos and infos["episode"] is not None:
-        ep_container = infos["episode"]
-
-        # Case A: list of dicts / Nones
-        if isinstance(ep_container, (list, tuple)):
-            for ep in ep_container:
-                if isinstance(ep, dict):
-                    if "r" in ep:
-                        logger.scalar("charts/episodic_return", float(ep["r"]), global_step)
-                    if "l" in ep:
-                        logger.scalar("charts/episodic_length", float(ep["l"]), global_step)
-            return
-
-        # Case B: dict of arrays (rare)
-        if isinstance(ep_container, dict):
-            if "r" in ep_container:
-                # could be scalar or array
-                r = ep_container["r"]
-                if np.isscalar(r):
-                    logger.scalar("charts/episodic_return", float(r), global_step)
-            if "l" in ep_container:
-                l = ep_container["l"]
-                if np.isscalar(l):
-                    logger.scalar("charts/episodic_length", float(l), global_step)
-            return
+    # 2. Legacy/List-based format (Fallbacks)
+    # ... (Keep existing fallback logic if you want, but the above block covers your case)
+    if "final_info" in infos and infos["final_info"] is not None:
+        for finfo in infos["final_info"]:
+            if finfo and "episode" in finfo:
+                logger.scalar("charts/episodic_return", float(finfo["episode"]["r"]), global_step)
+                logger.scalar("charts/episodic_length", float(finfo["episode"]["l"]), global_step)
 
 
 def train_ppo(
     env_id: str,
     cfg: PPOConfig,
     *,
+    # Deterministic Schedule
+    steps_per_regime: int | None = None,
+    episodes_per_regime: int | None = None,
+    start_regime: int = 0,
+    # Random / Legacy
     switch_on_reset: bool = False,
     switch_mid_episode: bool = False,
     mid_episode_switch_step_range: tuple[int, int] = (20, 80),
+    # Training
     run_name: str | None = None,
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
@@ -94,6 +83,9 @@ def train_ppo(
             return make_env(
                 env_id=env_id,
                 seed=cfg.seed + i,
+                steps_per_regime=steps_per_regime,
+                episodes_per_regime=episodes_per_regime,
+                start_regime=start_regime,
                 switch_on_reset=switch_on_reset,
                 switch_mid_episode=switch_mid_episode,
                 mid_episode_switch_step_range=mid_episode_switch_step_range,
@@ -178,9 +170,13 @@ def train_ppo(
                     "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": cfg.__dict__,
                     "env_id": env_id,
-                    "switch_on_reset": switch_on_reset,
-                    "switch_mid_episode": switch_mid_episode,
-                    "mid_episode_switch_step_range": mid_episode_switch_step_range,
+                    "schedule": {
+                        "steps_per_regime": steps_per_regime,
+                        "episodes_per_regime": episodes_per_regime,
+                        "start_regime": start_regime,
+                        "switch_on_reset": switch_on_reset,
+                        "switch_mid_episode": switch_mid_episode,
+                    },
                     "global_step": global_step,
                     "update": update,
                 },

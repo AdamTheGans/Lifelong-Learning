@@ -14,6 +14,12 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda")
 
+    # Deterministic Schedule
+    p.add_argument("--steps_per_regime", type=int, default=None, help="Steps per env before switch")
+    p.add_argument("--episodes_per_regime", type=int, default=None, help="Episodes per env before switch")
+    p.add_argument("--start_regime", type=int, default=0)
+
+    # Legacy / Random
     p.add_argument("--switch_on_reset", action="store_true")
     p.add_argument("--switch_mid_episode", action="store_true")
     p.add_argument("--switch_lo", type=int, default=20)
@@ -30,9 +36,14 @@ def main():
         device=args.device,
     )
 
+    # NOTE: Ensure agents/ppo/train.py:train_ppo accepts these new kwargs
+    # and passes them to make_env!
     train_ppo(
         env_id=args.env_id,
         cfg=cfg,
+        steps_per_regime=args.steps_per_regime,
+        episodes_per_regime=args.episodes_per_regime,
+        start_regime=args.start_regime,
         switch_on_reset=args.switch_on_reset,
         switch_mid_episode=args.switch_mid_episode,
         mid_episode_switch_step_range=(args.switch_lo, args.switch_hi),

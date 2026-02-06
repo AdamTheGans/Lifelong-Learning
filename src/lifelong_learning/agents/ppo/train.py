@@ -7,8 +7,6 @@ import torch
 import gymnasium as gym
 from gymnasium.envs.registration import register
 
-# --- REGISTER CUSTOM ENVIRONMENTS ---
-# This must happen before make_env is called
 register(
     id="MiniGrid-DualGoal-8x8-v0",
     entry_point="lifelong_learning.envs.dual_goal:DualGoalEnv",
@@ -21,65 +19,66 @@ from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
 from lifelong_learning.envs.make_env import make_env 
 
-
 def log_vec_episodic_stats(logger, infos, global_step: int):
     """
-    Robustly log episodic return/length from Gymnasium vector env info dict.
+    Robustly log episodic return/length.
     """
-    # 1. Standard Gymnasium Vector Env format (Dict of Arrays)
-    if "_episode" in infos:
-        mask = infos["_episode"]
-        # Iterate over all environments that finished an episode in this step
-        for i in np.where(mask)[0]:
-            if "episode" in infos:
-                ep_data = infos["episode"]
-                
-                # Extract standard return/length
-                if "r" in ep_data:
-                    logger.scalar("charts/episodic_return", float(ep_data["r"][i]), global_step)
-                if "l" in ep_data:
-                    logger.scalar("charts/episodic_length", float(ep_data["l"][i]), global_step)
-
-                # Extract custom regime stats if they exist
-                for k, v in ep_data.items():
-                    if k.startswith("r_regime_") or k.startswith("l_regime_"):
-                        val = v[i] if hasattr(v, "__getitem__") and v.ndim > 0 else v
-                        logger.scalar(f"charts/{k}", float(val), global_step)
+    # Check if any episode finished
+    if "_episode" not in infos:
         return
 
-    # 2. Legacy/List-based format (Fallbacks)
-    if "final_info" in infos and infos["final_info"] is not None:
-        for finfo in infos["final_info"]:
-            if finfo and "episode" in finfo:
-                logger.scalar("charts/episodic_return", float(finfo["episode"]["r"]), global_step)
-                logger.scalar("charts/episodic_length", float(finfo["episode"]["l"]), global_step)
+    # iterate over all environments that finished an episode this step
+    for i in np.where(infos["_episode"])[0]:
+        
+        # 1. Try to get SMOOTH stats (from RollingAvgWrapper)
+        # We check 'final_info' first (standard), then fallback to infos dict
+        found_smooth = False
+        
+        # Try Method A: final_info
+        if "final_info" in infos:
+            f_info = infos["final_info"][i]
+            if f_info and "episode_avg" in f_info:
+                avg = f_info["episode_avg"]
+                logger.scalar("charts/episodic_return_smooth", avg["r"], global_step)
+                logger.scalar("charts/episodic_length_smooth", avg["l"], global_step)
+                found_smooth = True
+                
+        # Try Method B: direct key (if SyncVectorEnv didn't pack final_info correctly)
+        if not found_smooth and "episode_avg" in infos:
+             # If it's a dictionary of arrays
+             avg_root = infos["episode_avg"]
+             if "r" in avg_root:
+                 # Check if it's an array (vectorized) or scalar
+                 val = avg_root["r"][i] if isinstance(avg_root["r"], np.ndarray) else avg_root["r"]
+                 logger.scalar("charts/episodic_return_smooth", val, global_step)
+                 
+                 val_l = avg_root["l"][i] if isinstance(avg_root["l"], np.ndarray) else avg_root["l"]
+                 logger.scalar("charts/episodic_length_smooth", val_l, global_step)
 
+        # 2. Always log RAW stats (from RecordEpisodeStatistics)
+        if "episode" in infos:
+            ep_data = infos["episode"]
+            if "r" in ep_data:
+                logger.scalar("charts/episodic_return_raw", ep_data["r"][i], global_step)
+            if "l" in ep_data:
+                logger.scalar("charts/episodic_length_raw", ep_data["l"][i], global_step)
 
 def train_ppo(
     env_id: str,
     cfg: PPOConfig,
     *,
-    # Deterministic Schedule
     steps_per_regime: int | None = None,
     episodes_per_regime: int | None = None,
     start_regime: int = 0,
-    # Random / Legacy
     switch_on_reset: bool = False,
     switch_mid_episode: bool = False,
     mid_episode_switch_step_range: tuple[int, int] = (20, 80),
-    # Training
     run_name: str | None = None,
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
 ):
-    """
-    PPO training loop using SyncVectorEnv.
-    """
     seed_everything(cfg.seed)
-
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-
-    # OPTIMIZATION: Increase parallel envs for stability if cfg is low
     num_envs = max(cfg.num_envs, 16)
 
     def make_thunk(i: int):
@@ -104,14 +103,12 @@ def train_ppo(
 
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
-
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
 
     logger = TBLogger(run_name=run_name)
-
     os.makedirs(save_dir, exist_ok=True)
 
     obs, info = envs.reset(seed=cfg.seed)
@@ -124,14 +121,12 @@ def train_ppo(
     print(f"Training on {device} with {num_envs} envs for {num_updates} updates.")
 
     for update in range(1, num_updates + 1):
-        # Anneal Learning Rate
         frac = 1.0 - (update - 1.0) / num_updates
         lrnow = frac * cfg.lr
         optimizer.param_groups[0]["lr"] = lrnow
 
         buffer.reset()
 
-        # Rollout
         for t in range(cfg.num_steps):
             global_step += num_envs
 
@@ -152,27 +147,21 @@ def train_ppo(
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
-            # Episodic logging
             log_vec_episodic_stats(logger, infos, global_step)
 
-        # Bootstrap value for GAE
         with torch.no_grad():
             _, last_value = model.forward(obs_t)
 
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
-        # PPO Update (Fixed Loop)
         update_stats = []
         for epoch in range(cfg.update_epochs):
-            # Regenerate minibatches every epoch!
             minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
             stats = ppo_update(model, optimizer, minibatches, cfg)
             update_stats.append(stats)
         
-        # Average stats across epochs
         avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]}
 
-        # Training diagnostics
         for k, v in avg_stats.items():
             logger.scalar(k, v, global_step)
         logger.scalar("charts/learning_rate", lrnow, global_step)
@@ -180,17 +169,13 @@ def train_ppo(
         sps = int(global_step / max(1e-9, (time.time() - start_time)))
         logger.scalar("charts/SPS", sps, global_step)
 
-        # Save checkpoint
         if update % save_every_updates == 0 or update == num_updates:
             ckpt_path = os.path.join(save_dir, f"{run_name}_update{update}.pt")
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": cfg.__dict__,
-                    "env_id": env_id,
                     "global_step": global_step,
-                    "update": update,
                 },
                 ckpt_path,
             )

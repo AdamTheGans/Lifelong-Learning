@@ -16,8 +16,8 @@ We will experiment with continual / non-stationary RL with world models + planni
 2) `pip install -e .`
 3) Run the sanity check, env with regime switch: `python scripts/00_check_env.py --switch_mid_episode --steps 120` and this check `python scripts/00_check_vec_env.py`
 4) Test with PPO:
-    a. Stationary: `python scripts/01_train_ppo.py --env_id MiniGrid-Empty-8x8-v0 --total_timesteps 1000000 --run_name baseline_stationary`
-    b. Slow switch (~200k): `python scripts/01_train_ppo.py --env_id MiniGrid-Empty-8x8-v0 --total_timesteps 1000000 --steps_per_regime 25000 --run_name exp_slow_switch`
-    c. Fast switches (~40k): `python scripts/01_train_ppo.py --env_id MiniGrid-Empty-8x8-v0 --total_timesteps 1000000 --steps_per_regime 5000 --run_name exp_fast_switch`
+    a. Stationary: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary`
+    b. Slow switch: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 20000 --run_name exp_slow_switch`
+    c. Fast switches: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 5000 --run_name exp_fast_switch`
     d. View results: `tensorboard --logdir runs`
   

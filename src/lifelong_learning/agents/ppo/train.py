@@ -76,6 +76,7 @@ def train_ppo(
     run_name: str | None = None,
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
+    anneal_lr: bool = True,
 ):
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -121,9 +122,12 @@ def train_ppo(
     print(f"Training on {device} with {num_envs} envs for {num_updates} updates.")
 
     for update in range(1, num_updates + 1):
-        frac = 1.0 - (update - 1.0) / num_updates
-        lrnow = frac * cfg.lr
-        optimizer.param_groups[0]["lr"] = lrnow
+        if anneal_lr:
+            frac = 1.0 - (update - 1.0) / num_updates
+            lrnow = frac * cfg.lr
+            optimizer.param_groups[0]["lr"] = lrnow
+        else:
+            lrnow = cfg.lr
 
         buffer.reset()
 

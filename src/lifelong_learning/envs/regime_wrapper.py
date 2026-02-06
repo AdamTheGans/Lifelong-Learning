@@ -48,7 +48,8 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
 
         obs, original_reward, terminated, truncated, info = self.env.step(action)
 
-        final_reward = 0.0
+        # Base step cost
+        final_reward = -0.01
         
         if terminated and original_reward > 0:
             # Unwrap to get the base env with the goal positions
@@ -64,13 +65,13 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
             hit_blue = (agent_pos == blue_pos)
             
             if self.regime_id == 0:
-                # Regime 0: Green Good (+1), Blue Bad (-1)
-                if hit_green: final_reward = 1.0
-                elif hit_blue: final_reward = -1.0
+                # Regime 0: Green Good (+5), Blue Bad (-1)
+                if hit_green: final_reward += 5.0
+                elif hit_blue: final_reward += -1.0
             else:
-                # Regime 1: Green Bad (-1), Blue Good (+1)
-                if hit_green: final_reward = -1.0
-                elif hit_blue: final_reward = 1.0
+                # Regime 1: Green Bad (-1), Blue Good (+5)
+                if hit_green: final_reward += -1.0
+                elif hit_blue: final_reward += 5.0
 
         reward = final_reward
 

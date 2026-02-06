@@ -26,6 +26,11 @@ def main():
     p.add_argument("--switch_hi", type=int, default=80)
 
     p.add_argument("--run_name", type=str, default=None)
+    
+    # Annealing
+    p.add_argument("--anneal_lr", action="store_true", default=True)
+    p.add_argument("--no-anneal_lr", action="store_false", dest="anneal_lr")
+    
     args = p.parse_args()
 
     cfg = PPOConfig(
@@ -48,6 +53,7 @@ def main():
         switch_mid_episode=args.switch_mid_episode,
         mid_episode_switch_step_range=(args.switch_lo, args.switch_hi),
         run_name=args.run_name,
+        anneal_lr=args.anneal_lr,
     )
 
 

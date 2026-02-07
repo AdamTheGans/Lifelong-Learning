@@ -69,3 +69,12 @@ We will experiment with continual / non-stationary RL with world models + planni
    # Omit --jax.platform cpu to use default (CUDA)
    python scripts/train_dreamerv3_minigrid.py --run.steps 50000 --run.train_ratio 32
    ```
+
+   **Add Regime Switching:**
+   `--env.steps_per_regime [NUM_STEPS]`
+
+   **View Results:**
+   ```bash
+   tensorboard --logdir .\logdir
+   ```
+

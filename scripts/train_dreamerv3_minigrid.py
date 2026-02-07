@@ -165,6 +165,12 @@ def main():
     with open(config_path, 'r') as f:
         configs = yaml_loader.load(f)
         
+    # Inject custom env settings into defaults so elements.Flags can parse them
+    configs['defaults']['env']['steps_per_regime'] = 0
+    configs['defaults']['env']['episodes_per_regime'] = 0
+    configs['defaults']['env']['oracle_mode'] = False
+    configs['defaults']['env']['id'] = "MiniGrid-DualGoal-8x8-v0"
+
     config = elements.Config(configs['defaults'])
     config = config.update(configs['size12m']) 
     
@@ -175,14 +181,6 @@ def main():
         'batch_size': 16,
         'replay_context': 0,
     })
-    
-    # Custom Env Config (since elements.Config is strict)
-    env_config = {
-        'id': "MiniGrid-DualGoal-8x8-v0",
-        'episodes_per_regime': 100,
-        'steps_per_regime': 0,
-        'oracle_mode': False,
-    }
 
     # Check I/O if requested
     check_io = False
@@ -200,8 +198,8 @@ def main():
     if check_io:
         print("Running I/O Sanity Check...")
         check_dreamer_env_io.check_env_io(
-            env_id=env_config['id'], 
-            oracle=env_config['oracle_mode']
+            env_id=config.env.id, 
+            oracle=config.env.oracle_mode
         )
         print("Sanity Check Passed. Exiting (remove --check_env_io to train).")
         return
@@ -211,7 +209,8 @@ def main():
     bind = functools.partial
 
     print('Logdir:', config.logdir)
-    print('Env ID:', env_config['id'])
+    print('Env ID:', config.env.id)
+    print('Regime Steps:', config.env.steps_per_regime)
 
     # 4. Helper Functions using FromGymnasium
     
@@ -219,20 +218,22 @@ def main():
         from lifelong_learning.envs.make_env import make_env as ll_make_env
         from dreamerv3 import main as dv3_main
         
-        # Use env_config for environment parameters
-        steps = env_config['steps_per_regime']
+        steps = config.env.steps_per_regime
         if steps == 0: steps = None
+
+        episodes = config.env.episodes_per_regime
+        if episodes == 0: episodes = None
         
         # Calculate seed based on index
         # index is passed by embodied.run.train for each parallel env
         seed = config.seed + index
         
         env = ll_make_env(
-            env_id=env_config['id'],
+            env_id=config.env.id,
             seed=seed,
             dreamer_compatible=True,
-            oracle_mode=env_config['oracle_mode'],
-            episodes_per_regime=env_config['episodes_per_regime'],
+            oracle_mode=config.env.oracle_mode,
+            episodes_per_regime=episodes,
             steps_per_regime=steps,
         )
         # Use our custom wrapper instead of from_gym

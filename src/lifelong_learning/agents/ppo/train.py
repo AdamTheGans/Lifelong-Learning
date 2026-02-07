@@ -146,6 +146,8 @@ def train_ppo(
         for k, v in avg_stats.items():
             logger.scalar(k, v, global_step)
         logger.scalar("charts/learning_rate", lrnow, global_step)
+        logger.scalar("charts/heartbeat", global_step, global_step)
+        logger.scalar("charts/reward_step_mean", buffer.rewards.mean().item(), global_step)
 
         sps = int(global_step / max(1e-9, (time.time() - start_time)))
         logger.scalar("charts/SPS", sps, global_step)

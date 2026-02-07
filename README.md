@@ -12,6 +12,7 @@ We will experiment with continual / non-stationary RL with world models + planni
 
 
 ## Directions to Run (so far)
+0) clear pycache: `find . -type d -name "__pycache__" -exec rm -r {} +`
 1) `pip install -r requirements.txt`
 2) `pip install -e .`
 3) Option sanity checks: 

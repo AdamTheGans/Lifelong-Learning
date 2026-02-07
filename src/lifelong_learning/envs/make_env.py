@@ -6,6 +6,7 @@ import numpy as np
 from gymnasium.wrappers import TimeLimit
 from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
+from lifelong_learning.envs.dreamer_compat import DreamerReadyWrapper
 
 class RollingAvgWrapper(gym.Wrapper):
     """
@@ -42,8 +43,11 @@ class RollingAvgWrapper(gym.Wrapper):
 
         return obs, reward, terminated, truncated, info
 
-def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
-    env = gym.make(env_id)
+def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatible: bool = False, **kwargs):
+    # If dreamer compatible, force rgb_array rendering
+    render_mode = "rgb_array" if dreamer_compatible else None
+    
+    env = gym.make(env_id, render_mode=render_mode)
     
     # [FIX] 1. Force a strict TimeLimit. 
     # MiniGrid usually has one, but RegimeWrapper might be reconstructing envs without it.
@@ -62,9 +66,14 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         seed=seed,
     )
 
+    if dreamer_compatible:
+        # Apply Dreamer wrapper last (outermost)
+        env = DreamerReadyWrapper(env)
     
-    if record_stats:
+    if record_stats and not dreamer_compatible:
         # 4. RecordStatistics functionality moved to VectorEnv level in train.py
+        # Keeping this check consistent with user instruction:
+        # "Do not use RecordEpisodeStatistics or RollingAvgWrapper inside the Dreamer wrapper if they rely on info, as Dreamer might strip it."
         pass
 
     return env

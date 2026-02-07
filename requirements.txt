@@ -4,6 +4,8 @@ torch>=2.1
 gymnasium>=0.29
 minigrid>=2.3
 tqdm>=4.66
+pillow>=10.0
+tensorflow>=2.16
 
 # Logging / plotting
 tensorboard>=2.15

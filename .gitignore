@@ -18,3 +18,8 @@ data/
 *.egg-info/
 build/
 dist/
+
+dreamerv3_requirements_win_cpu.txt
+dreamerv3_requirements.txt
+
+logdir/

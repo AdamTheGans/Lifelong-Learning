@@ -18,6 +18,7 @@ from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
 from lifelong_learning.envs.make_env import make_env 
+from lifelong_learning.wrappers.vector import VectorRollingAvgWrapper 
 
 def log_vec_episodic_stats(logger, infos, global_step: int):
     """
@@ -98,6 +99,10 @@ def train_ppo(
         return thunk
 
     envs = gym.vector.SyncVectorEnv([make_thunk(i) for i in range(num_envs)])
+    
+    # [FIX] Logging wrappers at Vector level for robustness
+    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
+    envs = VectorRollingAvgWrapper(envs)
 
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n

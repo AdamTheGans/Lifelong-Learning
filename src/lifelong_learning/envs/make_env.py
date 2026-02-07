@@ -62,10 +62,9 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         seed=seed,
     )
 
+    
     if record_stats:
-        # 4. RecordStatistics must be OUTSIDE the Regime wrapper to capture true returns
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        # 5. RollingAvg on top
-        env = RollingAvgWrapper(env, window_size=50)
+        # 4. RecordStatistics functionality moved to VectorEnv level in train.py
+        pass
 
     return env

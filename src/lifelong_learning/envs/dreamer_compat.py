@@ -22,8 +22,15 @@ class DreamerReadyWrapper(gym.Wrapper):
         
         # Calculate new observation space
         obs_spaces = {}
+        
+        # 1. Filter and keep only safe keys from original space
         if isinstance(env.observation_space, Dict):
-            obs_spaces.update(env.observation_space.spaces)
+            for key, space in env.observation_space.spaces.items():
+                # Exclude 'mission' and other text/object keys that might crash Dreamer
+                if key in ["mission", "image"]: 
+                    continue
+                # Keep numeric/safe keys
+                obs_spaces[key] = space
             
         # Ensure 'image' key specification
         obs_spaces['image'] = Box(
@@ -34,17 +41,16 @@ class DreamerReadyWrapper(gym.Wrapper):
         
         if self._oracle_mode:
             # In Oracle mode, provide regime_id as a vector
+            # Fixed: Box(0, 1) as requested, though logic implies it could be 0 or 1.
             obs_spaces['regime_id'] = Box(
-                low=0, high=np.inf, shape=(1,), dtype=np.float32
+                low=0, high=1, shape=(1,), dtype=np.float32
             )
             
         self.observation_space = Dict(obs_spaces)
 
     def _resize_image(self, image):
         """Resize image to target size using scipy.ndimage."""
-        if image is None:
-            return np.zeros((self._size[0], self._size[1], 3), dtype=np.uint8)
-            
+        # Note: We now raise error on None in _get_obs, so image is guaranteed not None here
         h, w = image.shape[:2]
         target_h, target_w = self._size
         
@@ -67,13 +73,19 @@ class DreamerReadyWrapper(gym.Wrapper):
     def _get_obs(self, obs, info=None):
         out_obs = {}
         
-        # Preserve existing keys if original obs is a dict
+        # 2. Strict Key Filtering on Run
         if isinstance(obs, dict):
-            out_obs.update(obs)
+            for k, v in obs.items():
+                # Only pass through keys we explicitly kept in __init__
+                if k in self.observation_space.spaces and k != "image" and k != "regime_id":
+                    out_obs[k] = v
             
         # Render the environment for the image key
-        # We assume render_mode='rgb_array' was set during env creation or is supported
         frame = self.env.render()
+        
+        # 3. Crash on Null Render
+        if frame is None:
+            raise RuntimeError("Env returned None render. Dreamer requires valid pixels.")
         
         # Resize and set image
         out_obs['image'] = self._resize_image(frame)

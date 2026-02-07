@@ -84,8 +84,10 @@ class CNNActorCritic(nn.Module):
         # One-Hot Encode
         # F.one_hot adds a last dimension: (B, H, W, Num_Classes)
         # We need to permute to (B, Num_Classes, H, W)
-        obj_hot = F.one_hot(objects, num_classes=self.max_obj_id).permute(0, 3, 1, 2).float()
-        col_hot = F.one_hot(colors, num_classes=self.max_col_id).permute(0, 3, 1, 2).float()
+        self.num_obj_classes = 12  # e.g. max_id + 1
+        self.num_col_classes = 7
+        obj_hot = F.one_hot(objects, num_classes=self.num_obj_classes).permute(0, 3, 1, 2).float()
+        col_hot = F.one_hot(colors, num_classes=self.num_col_classes).permute(0, 3, 1, 2).float()
         
         # Concatenate along channel dimension
         return torch.cat([obj_hot, col_hot], dim=1)

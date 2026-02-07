@@ -44,20 +44,21 @@ class RollingAvgWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatible: bool = False, **kwargs):
-    # If dreamer compatible, force rgb_array rendering
     render_mode = "rgb_array" if dreamer_compatible else None
     
+    # Initialize environment
     env = gym.make(env_id, render_mode=render_mode)
     
-    # [FIX] 1. Force a strict TimeLimit. 
-    # MiniGrid usually has one, but RegimeWrapper might be reconstructing envs without it.
-    # 256 is standard for 8x8 MiniGrid.
+    # 1. Apply Strict TimeLimit
+    # Note: If env already has a TimeLimit, this wraps it. 
+    # MiniGrid usually returns truncated=True on timeout.
     env = TimeLimit(env, max_episode_steps=256)
     
-    # 2. Apply Obs Wrapper
-    env = MiniGridImageObsWrapper(env)
+    # 2. Image Obs Wrapper (Flatten/Preprocess for CNN)
+    if not dreamer_compatible:
+        env = MiniGridImageObsWrapper(env)
     
-    # 3. Apply Regime Wrapper
+    # 3. Regime Wrapper (Logic for swapping goals)
     env = RegimeGoalSwapWrapper(
         env,
         steps_per_regime=kwargs.get("steps_per_regime"),
@@ -67,13 +68,9 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     )
 
     if dreamer_compatible:
-        # Apply Dreamer wrapper last (outermost)
         env = DreamerReadyWrapper(env)
     
-    if record_stats and not dreamer_compatible:
-        # 4. RecordStatistics functionality moved to VectorEnv level in train.py
-        # Keeping this check consistent with user instruction:
-        # "Do not use RecordEpisodeStatistics or RollingAvgWrapper inside the Dreamer wrapper if they rely on info, as Dreamer might strip it."
-        pass
+    # NOTE: record_stats is handled at the VectorEnv level in train.py
+    # to ensure it captures returns even after wrappers modify them.
 
     return env

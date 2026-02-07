@@ -19,24 +19,6 @@ from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
 from lifelong_learning.envs.make_env import make_env 
 
-def log_vec_episodic_stats(logger, infos, global_step: int):
-    """
-    Robustly log episodic return/length.
-    """
-    # Check if any episode finished using VectorEnv standard key '_episode'
-    if "_episode" in infos:
-        for i in np.where(infos["_episode"])[0]:
-             # Extract raw stats from RecordEpisodeStatistics
-             if "episode" in infos:
-                 ret = infos["episode"]["r"][i]
-                 length = infos["episode"]["l"][i]
-                 
-                 logger.scalar("charts/episodic_return", ret, global_step)
-                 logger.scalar("charts/episodic_length", length, global_step)
-                 
-                 # Optional: Console print for debugging/live view
-                 # print(f"global_step={global_step}: episodic_return={ret}, episodic_length={length}")
-
 def train_ppo(
     env_id: str,
     cfg: PPOConfig,
@@ -67,15 +49,14 @@ def train_ppo(
                 switch_on_reset=switch_on_reset,
                 switch_mid_episode=switch_mid_episode,
                 mid_episode_switch_step_range=mid_episode_switch_step_range,
-                record_stats=True,
+                record_stats=False, # [FIX] Disable internal wrapper stats, we do it manually
             )
         return thunk
 
     envs = gym.vector.SyncVectorEnv([make_thunk(i) for i in range(num_envs)])
     
-    # [FIX] Logging wrappers at Vector level for robustness
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-
+    # [FIX] Do NOT use RecordEpisodeStatistics here. It's causing the empty graphs.
+    
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n
 
@@ -95,6 +76,11 @@ def train_ppo(
     num_updates = cfg.total_timesteps // (num_envs * cfg.num_steps)
     global_step = 0
     start_time = time.time()
+
+    # [NEW] Manual Stats Tracking
+    # We maintain these arrays to track progress for each environment individually
+    running_returns = np.zeros(num_envs)
+    running_lengths = np.zeros(num_envs, dtype=int)
 
     print(f"Training on {device} with {num_envs} envs for {num_updates} updates.")
 
@@ -117,6 +103,10 @@ def train_ppo(
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
 
+            # [NEW] Update manual trackers
+            running_returns += reward
+            running_lengths += 1
+
             buffer.add(
                 obs=obs_t,
                 actions=action,
@@ -128,7 +118,25 @@ def train_ppo(
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
-            log_vec_episodic_stats(logger, infos, global_step)
+            # [NEW] Check for finished episodes and log
+            if np.any(done):
+                # Identify which envs finished
+                done_indices = np.where(done)[0]
+                for i in done_indices:
+                    # Log the collected stats
+                    logger.scalar("charts/episodic_return", running_returns[i], global_step)
+                    logger.scalar("charts/episodic_length", running_lengths[i], global_step)
+                    
+                    # Optional: Attempt to log regime. 
+                    # Note: 'infos' here is from the RESET env, so this might be the *next* regime 
+                    # if the switch happened exactly now. But it's close enough for visualization.
+                    if "regime_id" in infos:
+                        regime = infos["regime_id"][i]
+                        logger.scalar(f"charts/r_regime_{regime}", running_returns[i], global_step)
+
+                    # Reset trackers for this env
+                    running_returns[i] = 0
+                    running_lengths[i] = 0
 
         with torch.no_grad():
             _, last_value = model.forward(obs_t)

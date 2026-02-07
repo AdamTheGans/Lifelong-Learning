@@ -7,7 +7,7 @@ from lifelong_learning.agents.ppo.train import train_ppo
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--env_id", type=str, default="MiniGrid-Empty-8x8-v0")
+    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-8x8-v0")
     p.add_argument("--total_timesteps", type=int, default=300_000)
     p.add_argument("--num_envs", type=int, default=8)
     p.add_argument("--num_steps", type=int, default=128)

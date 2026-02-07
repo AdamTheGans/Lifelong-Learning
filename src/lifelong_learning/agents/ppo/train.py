@@ -18,51 +18,24 @@ from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
 from lifelong_learning.envs.make_env import make_env 
-from lifelong_learning.wrappers.vector import VectorRollingAvgWrapper 
 
 def log_vec_episodic_stats(logger, infos, global_step: int):
     """
     Robustly log episodic return/length.
     """
-    # Check if any episode finished
-    if "_episode" not in infos:
-        return
-
-    # iterate over all environments that finished an episode this step
-    for i in np.where(infos["_episode"])[0]:
-        
-        # 1. Try to get SMOOTH stats (from RollingAvgWrapper)
-        # We check 'final_info' first (standard), then fallback to infos dict
-        found_smooth = False
-        
-        # Try Method A: final_info
-        if "final_info" in infos:
-            f_info = infos["final_info"][i]
-            if f_info and "episode_avg" in f_info:
-                avg = f_info["episode_avg"]
-                logger.scalar("charts/episodic_return_smooth", avg["r"], global_step)
-                logger.scalar("charts/episodic_length_smooth", avg["l"], global_step)
-                found_smooth = True
-                
-        # Try Method B: direct key (if SyncVectorEnv didn't pack final_info correctly)
-        if not found_smooth and "episode_avg" in infos:
-             # If it's a dictionary of arrays
-             avg_root = infos["episode_avg"]
-             if "r" in avg_root:
-                 # Check if it's an array (vectorized) or scalar
-                 val = avg_root["r"][i] if isinstance(avg_root["r"], np.ndarray) else avg_root["r"]
-                 logger.scalar("charts/episodic_return_smooth", val, global_step)
+    # Check if any episode finished using VectorEnv standard key '_episode'
+    if "_episode" in infos:
+        for i in np.where(infos["_episode"])[0]:
+             # Extract raw stats from RecordEpisodeStatistics
+             if "episode" in infos:
+                 ret = infos["episode"]["r"][i]
+                 length = infos["episode"]["l"][i]
                  
-                 val_l = avg_root["l"][i] if isinstance(avg_root["l"], np.ndarray) else avg_root["l"]
-                 logger.scalar("charts/episodic_length_smooth", val_l, global_step)
-
-        # 2. Always log RAW stats (from RecordEpisodeStatistics)
-        if "episode" in infos:
-            ep_data = infos["episode"]
-            if "r" in ep_data:
-                logger.scalar("charts/episodic_return_raw", ep_data["r"][i], global_step)
-            if "l" in ep_data:
-                logger.scalar("charts/episodic_length_raw", ep_data["l"][i], global_step)
+                 logger.scalar("charts/episodic_return", ret, global_step)
+                 logger.scalar("charts/episodic_length", length, global_step)
+                 
+                 # Optional: Console print for debugging/live view
+                 # print(f"global_step={global_step}: episodic_return={ret}, episodic_length={length}")
 
 def train_ppo(
     env_id: str,
@@ -102,7 +75,6 @@ def train_ppo(
     
     # [FIX] Logging wrappers at Vector level for robustness
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-    envs = VectorRollingAvgWrapper(envs)
 
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n

@@ -68,7 +68,7 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     )
 
     if dreamer_compatible:
-        env = DreamerReadyWrapper(env)
+        env = DreamerReadyWrapper(env, oracle_mode=kwargs.get("oracle_mode", False))
     
     # NOTE: record_stats is handled at the VectorEnv level in train.py
     # to ensure it captures returns even after wrappers modify them.

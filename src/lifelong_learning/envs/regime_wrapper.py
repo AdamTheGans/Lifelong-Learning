@@ -50,6 +50,12 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         self._update_regime_deterministic()
 
         obs, original_reward, terminated, truncated, info = self.env.step(action)
+        info["regime_id"] = self.regime_id
+
+        # Success counters (set on every step so log/ keys always have a value)
+        info["reached_good_goal"] = 0.0
+        info["reached_bad_goal"] = 0.0
+        info["timed_out"] = 0.0
 
         # Base step penalty
         final_reward = -0.01
@@ -70,25 +76,35 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
                 
                 if self.regime_id == 0:
                     # Regime 0: Green Good (+5), Blue Bad (-1)
-                    if hit_green: final_reward += 5.0
-                    elif hit_blue: final_reward += -1.0
+                    if hit_green:
+                        final_reward += 5.0
+                        info["reached_good_goal"] = 1.0
+                    elif hit_blue:
+                        final_reward += -1.0
+                        info["reached_bad_goal"] = 1.0
                 else:
                     # Regime 1: Green Bad (-1), Blue Good (+5)
-                    if hit_green: final_reward += -1.0
-                    elif hit_blue: final_reward += 5.0
+                    if hit_green:
+                        final_reward += -1.0
+                        info["reached_bad_goal"] = 1.0
+                    elif hit_blue:
+                        final_reward += 5.0
+                        info["reached_good_goal"] = 1.0
             else:
                 # Fallback for standard MiniGrid environments (like Empty)
-                # Just treat the single goal as "Green" (Good in R0, Bad in R1)
                 if self.regime_id == 0:
                     final_reward += 5.0
+                    info["reached_good_goal"] = 1.0
                 else:
                     final_reward += -1.0
+                    info["reached_bad_goal"] = 1.0
+        elif truncated:
+            info["timed_out"] = 1.0
 
         reward = final_reward
 
         # IMPORTANT: Count episodes for regime switching
         if terminated or truncated:
             self.cumulative_episodes += 1
-            info["regime_id"] = self.regime_id
 
         return obs, reward, terminated, truncated, info

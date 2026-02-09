@@ -28,6 +28,7 @@ We will experiment with continual / non-stationary RL with world models + planni
 ## Directions to Run Dreamer
 
 **Install (Windows CPU):**
+0. `.\.venv\Scripts\Activate.ps1`
 1. `pip install -U "jax[cpu]==0.4.33"`
 2. `mkdir third_party`
 3. `git submodule add https://github.com/danijar/dreamerv3 third_party/dreamerv3`

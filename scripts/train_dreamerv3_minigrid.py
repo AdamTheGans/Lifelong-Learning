@@ -224,6 +224,15 @@ def main():
         episodes = config.env.episodes_per_regime
         if episodes == 0: episodes = None
         
+        # Convert global steps/episodes to per-env counts.
+        # Each parallel env has its own counter, so divide by num_envs
+        # to make the CLI value correspond to global training steps.
+        num_envs = config.run.envs
+        if steps is not None:
+            steps = max(1, int(steps) // num_envs)
+        if episodes is not None:
+            episodes = max(1, int(episodes) // num_envs)
+        
         # Calculate seed based on index
         # index is passed by embodied.run.train for each parallel env
         seed = config.seed + index
@@ -261,11 +270,14 @@ def main():
             replicas=config.replicas,
         )
 
-        # IMPORTANT: Agent must NOT see reset
+        # IMPORTANT: Agent must NOT see reset or log/ keys
+        # log/ keys are for TensorBoard logging only, not neural net inputs
+        notlog = lambda k: not k.startswith('log/')
+        agent_obs_space = {k: v for k, v in env.obs_space.items() if notlog(k)}
         agent_act_space = dict(env.act_space)
         agent_act_space.pop('reset', None)
 
-        agent = dv3_agent.Agent(env.obs_space, agent_act_space, agent_config)
+        agent = dv3_agent.Agent(agent_obs_space, agent_act_space, agent_config)
         env.close()
         return agent
 
@@ -279,9 +291,13 @@ def main():
         ])
 
     def make_replay(config, folder, mode='train'):
+        # Match upstream length calculation: consec * batlen + context
+        batlen = config.batch_length if mode == 'train' else config.report_length
+        consec = config.consec_train if mode == 'train' else config.consec_report
+        length = consec * batlen + config.replay_context
         return embodied.Replay(
-            length=config.batch_length,
-            capacity=config.replay['size'],
+            length=length,
+            capacity=int(config.replay['size']),
             directory=elements.Path(config.logdir) / folder,
         )
 
@@ -303,6 +319,10 @@ def main():
         logdir=config.logdir,
         batch_size=config.batch_size,
         batch_length=config.batch_length,
+        report_length=config.report_length,
+        consec_train=config.consec_train,
+        consec_report=config.consec_report,
+        replay_context=config.replay_context,
     )
     
     # embodied.run.train expects factories, not objects

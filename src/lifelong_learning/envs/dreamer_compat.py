@@ -49,6 +49,21 @@ class DreamerReadyWrapper(gym.Wrapper):
             obs_spaces['regime_id'] = Box(
                 low=0, high=1, shape=(1,), dtype=np.float32
             )
+        
+        # log/ prefixed keys are automatically picked up by DreamerV3's
+        # logfn and written to TensorBoard (avg/max/sum per episode)
+        obs_spaces['log/regime_id'] = Box(
+            low=0, high=1, shape=(), dtype=np.float32
+        )
+        obs_spaces['log/reached_good_goal'] = Box(
+            low=0, high=1, shape=(), dtype=np.float32
+        )
+        obs_spaces['log/reached_bad_goal'] = Box(
+            low=0, high=1, shape=(), dtype=np.float32
+        )
+        obs_spaces['log/timed_out'] = Box(
+            low=0, high=1, shape=(), dtype=np.float32
+        )
             
         self.observation_space = Dict(obs_spaces)
 
@@ -122,21 +137,29 @@ class DreamerReadyWrapper(gym.Wrapper):
         # Resize and set image
         out_obs['image'] = self._resize_image(frame)
         
-        # Inject regime_id if in Oracle mode
+        # Fetch regime_id from info or env attribute
+        regime = 0.0
+        if info and 'regime_id' in info:
+            regime = float(info['regime_id'])
+        elif hasattr(self.env, "get_wrapper_attr"):
+            try:
+                regime = float(self.env.get_wrapper_attr('regime_id'))
+            except AttributeError:
+                pass
+        elif hasattr(self.env, "regime_id"):
+            regime = float(self.env.regime_id)
+        
+        # Always inject log/ keys for TensorBoard logging
+        out_obs['log/regime_id'] = np.float32(regime)
+        out_obs['log/reached_good_goal'] = np.float32(
+            info.get('reached_good_goal', 0.0) if info else 0.0)
+        out_obs['log/reached_bad_goal'] = np.float32(
+            info.get('reached_bad_goal', 0.0) if info else 0.0)
+        out_obs['log/timed_out'] = np.float32(
+            info.get('timed_out', 0.0) if info else 0.0)
+        
+        # Inject regime_id as observation input if in Oracle mode
         if self._oracle_mode:
-            regime = 0.0
-            # Try to fetch regime_id from info first
-            if info and 'regime_id' in info:
-                regime = float(info['regime_id'])
-            # Fallback to env attribute
-            elif hasattr(self.env, "get_wrapper_attr"):
-                try:
-                    regime = float(self.env.get_wrapper_attr('regime_id'))
-                except AttributeError:
-                    pass
-            elif hasattr(self.env, "regime_id"):
-                 regime = float(self.env.regime_id)
-                 
             out_obs['regime_id'] = np.array([regime], dtype=np.float32)
             
         return out_obs

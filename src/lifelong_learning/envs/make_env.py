@@ -47,7 +47,10 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     render_mode = "rgb_array" if dreamer_compatible else None
     
     # Initialize environment
-    env = gym.make(env_id, render_mode=render_mode)
+    # For DreamerV3: tile_size=8 gives native 64x64 render (8 cells * 8px)
+    # avoiding the 256→64 downscale that loses goal color info
+    tile_kwargs = {"tile_size": 8} if dreamer_compatible else {}
+    env = gym.make(env_id, render_mode=render_mode, **tile_kwargs)
     
     # Disable FOV shading for DreamerV3 — renders full grid at uniform brightness
     if dreamer_compatible:

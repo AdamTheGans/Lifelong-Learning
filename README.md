@@ -62,13 +62,13 @@ We will experiment with continual / non-stationary RL with world models + planni
 
    **Windows (CPU):**
    ```powershell
-   python scripts/train_dreamerv3_minigrid.py --jax.platform cpu --run.steps 50000 --run.train_ratio 32
+   python scripts/train_dreamerv3_minigrid.py --run.steps 75000 --run.train_ratio 32 --configs size1m
    ```
 
    **Linux (GPU):**
    ```bash
    # Omit --jax.platform cpu to use default (CUDA)
-   python scripts/train_dreamerv3_minigrid.py --run.steps 50000 --run.train_ratio 32
+   python scripts/train_dreamerv3_minigrid.py --run.steps 75000 --run.train_ratio 32 --configs size1m
    ```
 
    **Add Regime Switching:**

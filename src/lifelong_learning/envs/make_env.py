@@ -49,6 +49,10 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     # Initialize environment
     env = gym.make(env_id, render_mode=render_mode)
     
+    # Disable FOV shading for DreamerV3 — renders full grid at uniform brightness
+    if dreamer_compatible:
+        env.unwrapped.highlight = False
+    
     # 1. Apply Strict TimeLimit
     # Note: If env already has a TimeLimit, this wraps it. 
     # MiniGrid usually returns truncated=True on timeout.

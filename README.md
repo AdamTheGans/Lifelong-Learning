@@ -1,81 +1,195 @@
 # Lifelong-Learning
 
-Our goal is to prevent catastrophic forgetting, enabling lifelong learning in RL.
+> Preventing catastrophic forgetting with world models, planning, and context routing — a continual RL research project.
 
-We will experiment with continual / non-stationary RL with world models + planning + context routing.
+See [PLAN.md](PLAN.md) for our high-level roadmap.
 
-## Roadmap
-1) PPO baseline on MiniGrid (stationary + non-stationary regimes)
-2) Single world model + MPC planner baseline
-3) Multi-context (multi-head) WM + surprise routing
-4) WM adapters + hypernetwork-conditioned modulation (final method)
+## Project Structure
 
+```
+Lifelong-Learning/
+├── src/lifelong_learning/
+│   ├── envs/                     # Environment definitions
+│   │   ├── dual_goal.py          # MiniGrid-DualGoal-8x8-v0 (two goals, +5 / -1)
+│   │   ├── regime_wrapper.py     # Non-stationary reward switching
+│   │   ├── dreamer_compat.py     # DreamerReadyWrapper (RGB obs, log/ keys)
+│   │   ├── make_env.py           # Env factory (shared by PPO and Dreamer)
+│   │   ├── minigrid_obs.py       # Image obs wrapper for PPO
+│   │   └── wrappers/
+│   │       └── action_reduce.py  # Discrete(7) → Discrete(3) for Dreamer
+│   ├── agents/ppo/               # PPO agent implementation
+│   └── utils/                    # Logging, seeding utilities
+├── scripts/
+│   ├── check_env.py              # Env sanity check (regime switching)
+│   ├── check_vec_env.py          # VectorEnv sanity check
+│   ├── verify_rewards.py         # Reward correctness check
+│   ├── train_ppo.py              # PPO training script
+│   ├── train_dreamerv3_minigrid.py   # DreamerV3 training script
+│   ├── check_dreamer_env_io.py       # Dreamer I/O contract check
+│   ├── diagnostic_env_check.py       # Full pipeline diagnostic
+│   └── analyze_runs.py               # Training run analyzer + plots
+├── third_party/dreamerv3/        # Vendored DreamerV3 (git submodule)
+├── tests/
+├── requirements.txt              # PPO dependencies
+├── pyproject.toml
+└── PLAN.md                       # Research roadmap
+```
 
-## Directions to Run PPO
-0) clear pycache: `find . -type d -name "__pycache__" -exec rm -r {} +`
-1) `pip install -r requirements.txt`
-2) `pip install -e .`
-3) Option sanity checks: 
-    a. (OUTDATED RIGHT NOW) env with regime switch: `python scripts/00_check_env.py --switch_mid_episode --steps 120`
-    b. env vector: `python scripts/00_check_vec_env.py`
-    c. correct rewards: `python scripts/00_verify_rewards.py` 
-4) Train PPO:
-    a. Stationary: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --no-anneal_lr`
-    b. Slow switch: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 15000 --run_name exp_slow_switch --no-anneal_lr`
-    c. Fast switches: `python scripts/01_train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 3500 --run_name exp_fast_switch --no-anneal_lr`
-5) View results: `tensorboard --logdir runs`
+---
 
-## Directions to Run Dreamer
+## Part 1: PPO Baseline
 
-**Install (Windows CPU):**
-0. `.\.venv\Scripts\Activate.ps1`
-1. `pip install -U "jax[cpu]==0.4.33"`
-2. `mkdir third_party`
-3. `git submodule add https://github.com/danijar/dreamerv3 third_party/dreamerv3`
-4. `$env:PYTHONPATH="$PWD\third_party\dreamerv3;$env:PYTHONPATH"`
-5. **Install Deps:**
-   ```powershell
-   Get-Content third_party/dreamerv3/requirements.txt | Where-Object { $_ -notmatch "jax|nvidia" } | Set-Content dreamerv3_requirements.txt
-   pip install -U -r dreamerv3_requirements.txt
-   ```
-6. Sanity check: `python -c "import dreamerv3, embodied; import jax; print('imports ok'); print('embodied:', embodied.__file__); print('devices:', jax.devices())"`
-   - *Note: Native Windows NVIDIA GPU is not supported by JAX. Use WSL2 for GPU support.*
+### 1.1 Install
 
-**Install (Linux GPU):**
-1. Check `nvidia-smi` to ensure drivers are 525 or higher.
-2. `git submodule update --init --recursive` (Ensure dreamerv3 is pulled)
-3. `python3.12 -m venv .venv`
-4. `source .venv/bin/activate`
-5. `pip install -U pip setuptools wheel`
-6. `pip install -e .`
-7. `pip install -r third_party/dreamerv3/requirements.txt` (Installs JAX+CUDA and other Dreamer deps)
-8. Sanity check: `python -c "import jax; print(jax.devices())"` (Should show GPU)
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
 
-**Run:**
+### 1.2 Sanity Checks
 
-1. **Sanity Checks:**
-   - I/O Check: `python scripts/check_dreamer_env_io.py`
-   - Script Check (CPU/Safe): `python scripts/train_dreamerv3_minigrid.py --jax.platform cpu --check_env_io True` 
-     - *On Linux w/ GPU, you can omit `--jax.platform cpu` to check if CUDA initializes correctly.*
+```bash
+# Verify environment + rewards are correct
+python scripts/verify_rewards.py
 
-2. **Train:**
+# Verify vectorized envs work
+python scripts/check_vec_env.py
+```
 
-   **Windows (CPU):**
-   ```powershell
-   python scripts/train_dreamerv3_minigrid.py
-   ```
+### 1.3 Train PPO
 
-   **Linux (GPU):**
-   ```bash
-   # Omit --jax.platform cpu to use default (CUDA)
-   python scripts/train_dreamerv3_minigrid.py
-   ```
+```bash
+# Stationary (no regime switching)
+python scripts/train_ppo.py \
+  --env_id MiniGrid-DualGoal-8x8-v0 \
+  --total_timesteps 750000 \
+  --run_name baseline_stationary \
+  --no-anneal_lr
 
-   **Add Regime Switching:**
-   `--env.steps_per_regime [NUM_STEPS]`
+# Slow regime switching (15k steps per regime)
+python scripts/train_ppo.py \
+  --env_id MiniGrid-DualGoal-8x8-v0 \
+  --total_timesteps 750000 \
+  --steps_per_regime 15000 \
+  --run_name exp_slow_switch \
+  --no-anneal_lr
 
-   **View Results:**
-   ```bash
-   tensorboard --logdir .\logdir
-   ```
+# Fast regime switching (3.5k steps per regime)
+python scripts/train_ppo.py \
+  --env_id MiniGrid-DualGoal-8x8-v0 \
+  --total_timesteps 750000 \
+  --steps_per_regime 3500 \
+  --run_name exp_fast_switch \
+  --no-anneal_lr
+```
 
+### 1.4 View PPO Results
+
+```bash
+tensorboard --logdir runs
+```
+
+---
+
+## Part 2: DreamerV3
+
+### 2.1 Install
+
+<details>
+<summary><b>Linux / Colab (GPU) — Recommended</b></summary>
+
+```bash
+# 1. Pull DreamerV3 submodule
+git submodule update --init --recursive
+
+# 2. Create venv
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+# 3. Install project + Dreamer deps
+pip install -U pip setuptools wheel
+pip install -e .
+pip install -r third_party/dreamerv3/requirements.txt
+
+# 4. Verify GPU
+python -c "import jax; print(jax.devices())"  # Should show GPU
+```
+
+</details>
+
+<details>
+<summary><b>Windows (CPU only)</b></summary>
+
+> **Note:** Native Windows NVIDIA GPU is not supported by JAX. Use WSL2 for GPU support.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+
+# Install CPU-only JAX
+pip install -U "jax[cpu]==0.4.33"
+
+# Pull submodule
+git submodule update --init --recursive
+
+# Set PYTHONPATH
+$env:PYTHONPATH="$PWD\third_party\dreamerv3;$env:PYTHONPATH"
+
+# Install Dreamer deps (excluding JAX/NVIDIA)
+Get-Content third_party/dreamerv3/requirements.txt | Where-Object { $_ -notmatch "jax|nvidia" } | Set-Content dreamerv3_requirements.txt
+pip install -U -r dreamerv3_requirements.txt
+
+# Verify
+python -c "import dreamerv3, embodied; import jax; print('OK'); print('devices:', jax.devices())"
+```
+
+</details>
+
+### 2.2 Sanity Checks
+
+```bash
+# Full pipeline diagnostic (obs quality, action space, termination, reward distribution)
+python scripts/diagnostic_env_check.py
+
+# Dreamer I/O contract check (50-step smoke test)
+python scripts/check_dreamer_env_io.py
+```
+
+### 2.3 Train DreamerV3
+
+All tuned defaults are built into the script. No flags needed for a standard run.
+
+```bash
+# Smoke test (~minutes, good for validating setup)
+python scripts/train_dreamerv3_minigrid.py --run.steps 10000
+
+# Full stationary run (100k steps, ~30-60min on Colab GPU)
+python scripts/train_dreamerv3_minigrid.py
+
+# Add regime switching (after stationary baseline is solid)
+python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
+```
+
+**Built-in defaults** (overridable via CLI):
+| Setting | Value | Rationale |
+|---|---|---|
+| `--configs` | `size12m` | 12M-param model (256 units) |
+| `--run.steps` | `100000` | Sanity run length |
+| `--run.envs` | `4` | Parallel envs for data diversity |
+| `--run.train_ratio` | `8` | Gradient steps per env step |
+| `--agent.imag_length` | `64` | Imagination horizon (256-step episodes) |
+| `--batch_size` | `16` | Replay batch size |
+
+A resolved config is automatically saved to `logdir/<run>/config_resolved.json`.
+
+### 2.4 Analyze Results
+
+```bash
+# Interactive analyzer with plots
+python scripts/analyze_runs.py
+
+# Or point directly at a run
+python scripts/analyze_runs.py logdir/<run_folder>
+
+# TensorBoard
+tensorboard --logdir logdir
+```

@@ -183,7 +183,7 @@ def main():
     # MiniGrid-tuned defaults (can still be overridden via CLI flags)
     config = config.update({
         'logdir': f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal',
-        'run.train_ratio': 32,
+        'run.train_ratio': 8,
         'run.log_every': 30,
         'run.steps': 100000,          # Sensible default for MiniGrid sanity run
         'run.envs': 4,                # 4 parallel envs for data diversity on Colab GPU

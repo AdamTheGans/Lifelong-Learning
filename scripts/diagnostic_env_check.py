@@ -34,12 +34,27 @@ def run_diagnostics(env_id="MiniGrid-DualGoal-8x8-v0", num_episodes=50, seed=42)
         episodes_per_regime=None,
     )
 
+    # --- Wrapper Stack ---
+    print(f"\n{'─'*40}")
+    print("WRAPPER STACK")
+    print(f"{'─'*40}")
+    e = env
+    depth = 0
+    while hasattr(e, 'env'):
+        print(f"  {'  '*depth}{type(e).__name__}")
+        e = e.env
+        depth += 1
+    print(f"  {'  '*depth}{type(e).__name__} (base)")
+
     # --- A) Action Space ---
     print(f"\n{'─'*40}")
     print("A) ACTION SPACE")
     print(f"{'─'*40}")
     print(f"  action_space: {env.action_space}")
     print(f"  action_space.n: {env.action_space.n}")
+
+    if env.action_space.n > 3:
+        print("  ⚠️  WARNING: Action space > 3 — wrapper may not be applied!")
 
     # --- B) Observation Quality (first reset) ---
     print(f"\n{'─'*40}")

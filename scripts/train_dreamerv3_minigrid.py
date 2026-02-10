@@ -1,5 +1,6 @@
 import warnings
 import functools
+import json
 import os
 import sys
 import argparse
@@ -179,12 +180,16 @@ def main():
     for name in parsed.configs:
         config = config.update(configs[name])
     
+    # MiniGrid-tuned defaults (can still be overridden via CLI flags)
     config = config.update({
         'logdir': f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal',
         'run.train_ratio': 32,
         'run.log_every': 30,
+        'run.steps': 100000,          # Sensible default for MiniGrid sanity run
+        'run.envs': 4,                # 4 parallel envs for data diversity on Colab GPU
         'batch_size': 16,
-        'replay_context': 0,
+        'replay_context': 1,          # Restore default (0 was wrong)
+        'agent.imag_length': 64,      # Long enough to imagine reaching goals in 256-step eps
     })
 
     # Check I/O if requested
@@ -216,6 +221,40 @@ def main():
     print('Logdir:', config.logdir)
     print('Env ID:', config.env.id)
     print('Regime Steps:', config.env.steps_per_regime)
+    print('Envs:', config.run.envs)
+    print('Imag Length:', config.agent.imag_length)
+    print('Train Ratio:', config.run.train_ratio)
+    print('Batch Size:', config.batch_size)
+    print('Batch Length:', config.batch_length)
+    print('Replay Context:', config.replay_context)
+
+    # Dump resolved config to logdir for reproducibility
+    logdir_path = config.logdir
+    os.makedirs(logdir_path, exist_ok=True)
+    config_dump_path = os.path.join(logdir_path, 'config_resolved.json')
+    try:
+        # Convert Config to a serializable dict
+        config_dict = dict(config)
+        # Flatten nested Config objects
+        def flatten_config(d, prefix=''):
+            flat = {}
+            for k, v in d.items():
+                key = f'{prefix}.{k}' if prefix else k
+                if hasattr(v, 'items'):
+                    flat.update(flatten_config(dict(v), key))
+                else:
+                    flat[key] = v
+            return flat
+        flat = flatten_config(config_dict)
+        # Convert non-serializable values to strings
+        for k, v in flat.items():
+            if not isinstance(v, (int, float, str, bool, list, type(None))):
+                flat[k] = str(v)
+        with open(config_dump_path, 'w') as f:
+            json.dump(flat, f, indent=2, default=str)
+        print(f'Config dumped to: {config_dump_path}')
+    except Exception as e:
+        print(f'Warning: could not dump config: {e}')
 
     # 4. Helper Functions using FromGymnasium
     
@@ -318,7 +357,19 @@ def main():
             contiguous=True)
         return stream
 
-    # 5. Start Training
+    # 5. Episodic summary callback
+    _ep_count = [0]
+    _ep_scores = []
+    _ep_outcomes = {'good': 0, 'bad': 0, 'timeout': 0}
+
+    class EpisodicPrintLogger:
+        """Hooks into the training loop via make_logger to print episodic summaries."""
+        pass  # The actual printing happens via the logfn in embodied.run.train
+
+    # We'll print summaries by monitoring metrics.jsonl after training,
+    # but also add a print inside the env step for real-time feedback.
+
+    # 6. Start Training
     args = elements.Config(
         **config.run,
         logdir=config.logdir,

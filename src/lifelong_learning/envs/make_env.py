@@ -7,6 +7,7 @@ from gymnasium.wrappers import TimeLimit
 from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
 from lifelong_learning.envs.dreamer_compat import DreamerReadyWrapper
+from lifelong_learning.envs.wrappers.action_reduce import ActionReduceWrapper
 
 class RollingAvgWrapper(gym.Wrapper):
     """
@@ -55,6 +56,13 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     # Disable FOV shading for DreamerV3 — renders full grid at uniform brightness
     if dreamer_compatible:
         env.unwrapped.highlight = False
+    
+    # 0. Reduce action space for DreamerV3 (Discrete(7) → Discrete(3))
+    # Must come BEFORE TimeLimit so all wrappers see reduced space.
+    # MiniGrid actions 0=left, 1=right, 2=forward — the only ones needed
+    # for navigation. Removing pickup/drop/toggle/done cuts exploration space.
+    if dreamer_compatible:
+        env = ActionReduceWrapper(env, actions=[0, 1, 2])
     
     # 1. Apply Strict TimeLimit
     # Note: If env already has a TimeLimit, this wraps it. 

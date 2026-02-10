@@ -119,16 +119,16 @@ class DreamerReadyWrapper(gym.Wrapper):
                          out_obs[k] = v
         
         # 2. Image Source Logic
-        # Try to use existing 'image' if valid numeric array
-        frame = None
-        if isinstance(obs, dict) and 'image' in obs:
+        # Always prefer render() for full RGB pixels.
+        # MiniGrid's obs['image'] is a symbolic grid (values 0-8),
+        # not actual pixels — useless for CNN feature extraction.
+        frame = self.env.render()
+        
+        # Fallback to obs['image'] only if render is unavailable
+        if frame is None and isinstance(obs, dict) and 'image' in obs:
             img = obs['image']
             if isinstance(img, np.ndarray) and img.size > 0:
                 frame = img
-        
-        # Fallback to render if no valid image in obs
-        if frame is None:
-            frame = self.env.render()
         
         # 3. Crash on Null Render or Invalid Frame
         if frame is None:

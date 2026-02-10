@@ -172,7 +172,12 @@ def main():
     configs['defaults']['env']['id'] = "MiniGrid-DualGoal-8x8-v0"
 
     config = elements.Config(configs['defaults'])
-    config = config.update(configs['size12m']) 
+    
+    # Handle --configs flag (e.g. --configs size1m)
+    # Parse it before other flags, just like DreamerV3's main.py
+    parsed, remaining_argv = elements.Flags(configs=['size12m']).parse_known()
+    for name in parsed.configs:
+        config = config.update(configs[name])
     
     config = config.update({
         'logdir': f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal',
@@ -204,7 +209,7 @@ def main():
         print("Sanity Check Passed. Exiting (remove --check_env_io to train).")
         return
 
-    config = elements.Flags(config).parse()
+    config = elements.Flags(config).parse(remaining_argv)
     
     bind = functools.partial
 

@@ -175,7 +175,7 @@ python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
 | `--configs` | `size12m` | 12M-param model (256 units) |
 | `--run.steps` | `100000` | Sanity run length |
 | `--run.envs` | `4` | Parallel envs for data diversity |
-| `--run.train_ratio` | `8` | Gradient steps per env step |
+| `--run.train_ratio` | `64` | Gradient steps per env step |
 | `--agent.imag_length` | `64` | Imagination horizon (256-step episodes) |
 | `--batch_size` | `16` | Replay batch size |
 

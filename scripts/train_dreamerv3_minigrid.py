@@ -183,7 +183,7 @@ def main():
     # MiniGrid-tuned defaults (can still be overridden via CLI flags)
     config = config.update({
         'logdir': f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal',
-        'run.train_ratio': 8,
+        'run.train_ratio': 64,
         'run.log_every': 30,
         'run.steps': 100000,          # Sensible default for MiniGrid sanity run
         'run.envs': 4,                # 4 parallel envs for data diversity on Colab GPU
@@ -193,8 +193,7 @@ def main():
         # Long-Horizon Fixes
         'agent.imag_length': 64,      # Long enough to imagine reaching goals in 256-step eps
         'agent.horizon': 333,         # Effective discount 1 - 1/333 ~= 0.997
-        'agent.imag_loss.lam': 0.995, # lambda=0.995 for long-term credit assignment
-        'agent.repl_loss.lam': 0.995, # consistent lambda for replay loss
+        # lam left at default 0.95 — bootstraps from value fn to reduce variance
     })
 
     # Check I/O if requested

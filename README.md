@@ -14,9 +14,10 @@ Lifelong-Learning/
 │   │   ├── regime_wrapper.py     # Non-stationary reward switching
 │   │   ├── dreamer_compat.py     # DreamerReadyWrapper (symbolic/pixel obs, log/ keys)
 │   │   ├── make_env.py           # Env factory (FullyObsWrapper + PPO/Dreamer routing)
-│   │   ├── minigrid_obs.py       # Image obs wrapper for PPO
+│   │   ├── minigrid_obs.py       # Image obs wrapper (Legacy)
 │   │   └── wrappers/
-│   │       └── action_reduce.py  # Discrete(7) → Discrete(3) for Dreamer
+│   │       ├── action_reduce.py  # Discrete(7) → Discrete(3) for Dreamer
+│   │       └── one_hot.py        # Unified Observation Wrapper (One-Hot Encoding)
 │   ├── agents/ppo/               # PPO agent implementation
 │   └── utils/                    # Logging, seeding utilities
 ├── scripts/
@@ -60,27 +61,13 @@ python scripts/check_vec_env.py
 
 ```bash
 # Stationary (no regime switching)
-python scripts/train_ppo.py \
-  --env_id MiniGrid-DualGoal-8x8-v0 \
-  --total_timesteps 750000 \
-  --run_name baseline_stationary \
-  --no-anneal_lr
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --no-anneal_lr
 
 # Slow regime switching (15k steps per regime)
-python scripts/train_ppo.py \
-  --env_id MiniGrid-DualGoal-8x8-v0 \
-  --total_timesteps 750000 \
-  --steps_per_regime 15000 \
-  --run_name exp_slow_switch \
-  --no-anneal_lr
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 15000 --run_name exp_slow_switch --no-anneal_lr
 
 # Fast regime switching (3.5k steps per regime)
-python scripts/train_ppo.py \
-  --env_id MiniGrid-DualGoal-8x8-v0 \
-  --total_timesteps 750000 \
-  --steps_per_regime 3500 \
-  --run_name exp_fast_switch \
-  --no-anneal_lr
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 3500 --run_name exp_fast_switch --no-anneal_lr
 ```
 
 ### 1.4 View PPO Results
@@ -125,9 +112,6 @@ python -c "import jax; print(jax.devices())"  # Should show GPU
 ```powershell
 .\.venv\Scripts\Activate.ps1
 
-# Install CPU-only JAX
-pip install -U "jax[cpu]==0.4.33"
-
 # Pull submodule
 git submodule update --init --recursive
 
@@ -137,6 +121,9 @@ $env:PYTHONPATH="$PWD\third_party\dreamerv3;$env:PYTHONPATH"
 # Install Dreamer deps (excluding JAX/NVIDIA)
 Get-Content third_party/dreamerv3/requirements.txt | Where-Object { $_ -notmatch "jax|nvidia" } | Set-Content dreamerv3_requirements.txt
 pip install -U -r dreamerv3_requirements.txt
+
+# Install CPU-only JAX for the correct version
+pip install -U "jax[cpu]==0.4.33"
 
 # Verify
 python -c "import dreamerv3, embodied; import jax; print('OK'); print('devices:', jax.devices())"
@@ -162,6 +149,8 @@ All tuned defaults are built into the script. No flags needed for a standard run
 # Smoke test (~minutes, good for validating setup)
 python scripts/train_dreamerv3_minigrid.py --run.steps 10000
 
+# If running on CPU, add `--jax.platform cpu`
+
 # Full stationary run (100k steps, ~30-60min on Colab GPU)
 python scripts/train_dreamerv3_minigrid.py
 
@@ -173,7 +162,10 @@ python scripts/train_dreamerv3_minigrid.py --env.symbolic False
 ```
 
 **Observation modes:**
-- **Symbolic (default):** Flattened `(192,)` float32 grid → MLP encoder. Each cell stores `(object_type, color_id, state)`. Goal colors are explicit integers — no pixel ambiguity.
+- **Symbolic (default):** unified One-Hot float tensor `(20, 8, 8)` → MLP encoder.
+    - **Unified Strategy:** Both PPO and DreamerV3 now see the exact same mathematically correct representation.
+    - **Encoding:** Object Type (11), Color (6), State (3) are one-hot encoded and concatenated.
+    - DreamerV3 receives this as a flattened vector `(1280,)`. PPO receives it as a `(20, 8, 8)` tensor.
 - **Pixel:** `(64, 64, 3)` uint8 RGB from `env.render()` → CNN encoder. Set `--env.symbolic False`.
 
 Both PPO and DreamerV3 use `FullyObsWrapper` for full 8×8 grid observability (no partial view).

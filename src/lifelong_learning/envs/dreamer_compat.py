@@ -48,9 +48,9 @@ class DreamerReadyWrapper(gym.Wrapper):
             if img_space is not None:
                 flat_dim = int(np.prod(img_space.shape))
             else:
-                flat_dim = 192  # 8x8x3 default for FullyObsWrapper
+                flat_dim = 1280  # 20x8x8 default for FullyObsWrapper(OneHot)
             obs_spaces['image'] = Box(
-                low=0, high=255,
+                low=0.0, high=1.0,
                 shape=(flat_dim,),
                 dtype=np.float32
             )

@@ -9,6 +9,7 @@ from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
 from lifelong_learning.envs.dreamer_compat import DreamerReadyWrapper
 from lifelong_learning.envs.wrappers.action_reduce import ActionReduceWrapper
+from lifelong_learning.envs.wrappers.one_hot import OneHotPartialObsWrapper
 
 class RollingAvgWrapper(gym.Wrapper):
     """
@@ -79,9 +80,15 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     # MiniGrid usually returns truncated=True on timeout.
     env = TimeLimit(env, max_episode_steps=256)
     
-    # 2. Image Obs Wrapper (Flatten/Preprocess for CNN)
+    # 2. Image Obs Wrapper (One-Hot for Symbolic)
+    # Replaces MiniGridImageObsWrapper for PPO
+    # And is applied before DreamerReadyWrapper for Dreamer
     if not dreamer_compatible:
-        env = MiniGridImageObsWrapper(env)
+        # PPO requires just the Tensor (Box)
+        env = OneHotPartialObsWrapper(env, dict_mode=False)
+    elif dreamer_compatible and symbolic:
+         # Dreamer requires Dict with 'image' key
+         env = OneHotPartialObsWrapper(env, dict_mode=True)
     
     # 3. Regime Wrapper (Logic for swapping goals)
     env = RegimeGoalSwapWrapper(

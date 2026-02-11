@@ -46,15 +46,13 @@ def test_dreamer_compat():
         sys.exit(1)
         
     img = obs["image"]
-    if img.shape != (64, 64, 3):
-        print(f"FAILED: Image must be 64x64x3, got {img.shape}")
+    if img.dtype == np.float32 and img.ndim == 1:
+        print(f"Observation structure valid (dict, image {img.shape} float32 — symbolic mode).")
+    elif img.dtype == np.uint8 and img.shape == (64, 64, 3):
+        print("Observation structure valid (dict, image 64x64x3 uint8 — pixel mode).")
+    else:
+        print(f"FAILED: Unexpected image shape={img.shape} dtype={img.dtype}")
         sys.exit(1)
-        
-    if img.dtype != np.uint8:
-        print(f"FAILED: Image must be uint8, got {img.dtype}")
-        sys.exit(1)
-        
-    print("Observation structure valid (dict, image 64x64x3 uint8).")
     
     # 2. Check Info
     if "is_terminal" not in info:

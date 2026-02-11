@@ -4,6 +4,7 @@ import gymnasium as gym
 import numpy as np
 
 from gymnasium.wrappers import TimeLimit
+from minigrid.wrappers import FullyObsWrapper
 from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
 from lifelong_learning.envs.dreamer_compat import DreamerReadyWrapper
@@ -45,16 +46,25 @@ class RollingAvgWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatible: bool = False, **kwargs):
-    render_mode = "rgb_array" if dreamer_compatible else None
+    symbolic = kwargs.get("symbolic", True)
     
-    # Initialize environment
-    # For DreamerV3: tile_size=8 gives native 64x64 render (8 cells * 8px)
-    # avoiding the 256→64 downscale that loses goal color info
-    tile_kwargs = {"tile_size": 8} if dreamer_compatible else {}
+    # In pixel mode (dreamer + not symbolic), we need render_mode and tile_size
+    # In symbolic mode or PPO mode, no rendering needed
+    if dreamer_compatible and not symbolic:
+        render_mode = "rgb_array"
+        tile_kwargs = {"tile_size": 8}
+    else:
+        render_mode = None
+        tile_kwargs = {}
+    
     env = gym.make(env_id, render_mode=render_mode, **tile_kwargs)
     
-    # Disable FOV shading for DreamerV3 — renders full grid at uniform brightness
-    if dreamer_compatible:
+    # Full observability: both PPO and DreamerV3 see the entire 8×8 grid
+    # instead of the default partial 7×7 agent-centered view.
+    env = FullyObsWrapper(env)
+    
+    # Disable FOV shading for DreamerV3 pixel mode
+    if dreamer_compatible and not symbolic:
         env.unwrapped.highlight = False
     
     # 0. Reduce action space for DreamerV3 (Discrete(7) → Discrete(3))
@@ -83,7 +93,11 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     )
 
     if dreamer_compatible:
-        env = DreamerReadyWrapper(env, oracle_mode=kwargs.get("oracle_mode", False))
+        env = DreamerReadyWrapper(
+            env,
+            oracle_mode=kwargs.get("oracle_mode", False),
+            symbolic=symbolic,
+        )
     
     # NOTE: record_stats is handled at the VectorEnv level in train.py
     # to ensure it captures returns even after wrappers modify them.

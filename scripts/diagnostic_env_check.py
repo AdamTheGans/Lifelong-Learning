@@ -2,7 +2,7 @@
 Diagnostic script for DreamerV3 + MiniGrid DualGoal pipeline.
 
 Checks:
-  A) Observation quality: image shape, dtype, min/max/mean, saves PNG
+  A) Observation quality: image shape, dtype, min/max/mean
   B) Termination semantics: terminated vs truncated vs is_terminal
   C) Action space: prints action_space.n and mapping
   D) Reward distribution over random episodes
@@ -24,7 +24,7 @@ def run_diagnostics(env_id="MiniGrid-DualGoal-8x8-v0", num_episodes=50, seed=42)
     print("  DreamerV3 Pipeline Diagnostic")
     print("=" * 60)
 
-    # Create env exactly as training does
+    # Create env exactly as training does (symbolic=True by default)
     env = make_env(
         env_id=env_id,
         seed=seed,
@@ -67,48 +67,63 @@ def run_diagnostics(env_id="MiniGrid-DualGoal-8x8-v0", num_episodes=50, seed=42)
     assert "image" in obs, f"FAIL: 'image' not in obs. Keys: {list(obs.keys())}"
 
     img = obs["image"]
+    is_symbolic = img.ndim == 1  # (192,) float32 = symbolic; (64,64,3) uint8 = pixel
+
     print(f"  obs keys: {sorted(obs.keys())}")
     print(f"  image shape: {img.shape}")
     print(f"  image dtype: {img.dtype}")
     print(f"  image min:   {img.min()}")
     print(f"  image max:   {img.max()}")
     print(f"  image mean:  {img.mean():.1f}")
+    print(f"  mode:        {'symbolic' if is_symbolic else 'pixel'}")
 
-    if img.max() <= 15:
-        print("  ⚠️  WARNING: image max is very low — possible symbolic/dark frames!")
-    elif img.max() >= 200:
-        print("  ✅ Image appears to be valid RGB (max >= 200)")
-
-    if img.mean() < 5:
-        print("  ⚠️  WARNING: image mean is near 0 — likely black frames!")
+    if is_symbolic:
+        # Symbolic mode: values are object_type/color_id/state integers (0-10 range)
+        if img.dtype != np.float32:
+            print(f"  ⚠️  WARNING: symbolic obs dtype is {img.dtype}, expected float32")
+        else:
+            print("  ✅ Symbolic obs is float32 — DreamerV3 will use MLP encoder")
+        if img.max() <= 15:
+            print("  ✅ Symbolic values in expected range (0-10)")
+        else:
+            print(f"  ⚠️  WARNING: symbolic max {img.max()} is unusually high")
     else:
-        print(f"  ✅ Image mean is {img.mean():.1f} — looks reasonable")
+        # Pixel mode checks
+        if img.max() <= 15:
+            print("  ⚠️  WARNING: image max is very low — possible symbolic/dark frames!")
+        elif img.max() >= 200:
+            print("  ✅ Image appears to be valid RGB (max >= 200)")
 
-    # Save frame as PNG
-    try:
-        from PIL import Image
-        save_dir = "logdir"
-        os.makedirs(save_dir, exist_ok=True)
-        png_path = os.path.join(save_dir, "diagnostic_frame_0.png")
-        Image.fromarray(img).save(png_path)
-        print(f"  📸 Saved frame to: {png_path}")
-    except ImportError:
-        print("  (PIL not available — skipping PNG save)")
+        if img.mean() < 5:
+            print("  ⚠️  WARNING: image mean is near 0 — likely black frames!")
+        else:
+            print(f"  ✅ Image mean is {img.mean():.1f} — looks reasonable")
+
+        # Save frame as PNG (pixel mode only)
+        try:
+            from PIL import Image
+            save_dir = "logdir"
+            os.makedirs(save_dir, exist_ok=True)
+            png_path = os.path.join(save_dir, "diagnostic_frame_0.png")
+            Image.fromarray(img).save(png_path)
+            print(f"  📸 Saved frame to: {png_path}")
+        except ImportError:
+            print("  (PIL not available — skipping PNG save)")
 
     # Check a few steps for variation
-    prev_mean = img.mean()
+    prev = img.copy()
     changes = 0
     for i in range(10):
         action = env.action_space.sample()
         obs2, _, term, trunc, _ = env.step(action)
         if term or trunc:
             obs2, _ = env.reset()
-        new_mean = obs2["image"].mean()
-        if abs(new_mean - prev_mean) > 0.1:
+        new_img = obs2["image"]
+        if not np.array_equal(new_img, prev):
             changes += 1
-        prev_mean = new_mean
+        prev = new_img.copy()
 
-    print(f"  Image mean changed in {changes}/10 steps: "
+    print(f"  Image changed in {changes}/10 steps: "
           f"{'✅ Dynamic' if changes >= 2 else '⚠️  Possibly static'}")
 
     # --- C) Termination Semantics ---

@@ -10,16 +10,18 @@ class DreamerReadyWrapper(gym.Wrapper):
     
     Features:
     - Forces observation to be a Dict with an 'image' key.
-    - 'image' is resized to 64x64 and is uint8 (H, W, 3).
+    - Pixel mode: 'image' is resized to 64x64 uint8 (H, W, 3) → CNN encoder.
+    - Symbolic mode: 'image' is the flattened symbolic grid (192,) float32 → MLP encoder.
     - Filters out all non-numeric keys from observation.
     - Rewards are cast to float32.
     - info['is_terminal'] is explicitly set to terminated status.
     - Optional Oracle mode to inject regime_id into observation.
     """
-    def __init__(self, env, size=(64, 64), oracle_mode=False):
+    def __init__(self, env, size=(64, 64), oracle_mode=False, symbolic=False):
         super().__init__(env)
         self._size = size
         self._oracle_mode = oracle_mode
+        self._symbolic = symbolic
         
         # Calculate new observation space
         obs_spaces = {}
@@ -38,11 +40,27 @@ class DreamerReadyWrapper(gym.Wrapper):
                 # or keys that look like strings.
             
         # Ensure 'image' key specification
-        obs_spaces['image'] = Box(
-            low=0, high=255, 
-            shape=(size[0], size[1], 3), 
-            dtype=np.uint8
-        )
+        if self._symbolic:
+            # Symbolic mode: flattened grid → float32 vector → MLP encoder
+            # DreamerV3's isimage check (dtype==uint8 and ndim==3) will be False,
+            # so it automatically uses MLP encoder/decoder instead of CNN.
+            img_space = env.observation_space.spaces.get('image')
+            if img_space is not None:
+                flat_dim = int(np.prod(img_space.shape))
+            else:
+                flat_dim = 192  # 8x8x3 default for FullyObsWrapper
+            obs_spaces['image'] = Box(
+                low=0, high=255,
+                shape=(flat_dim,),
+                dtype=np.float32
+            )
+        else:
+            # Pixel mode: resized RGB image → uint8 → CNN encoder
+            obs_spaces['image'] = Box(
+                low=0, high=255, 
+                shape=(size[0], size[1], 3), 
+                dtype=np.uint8
+            )
         
         if self._oracle_mode:
             # In Oracle mode, provide regime_id as a vector
@@ -118,24 +136,28 @@ class DreamerReadyWrapper(gym.Wrapper):
                     if isinstance(v, (np.ndarray, np.generic, float, int)):
                          out_obs[k] = v
         
-        # 2. Image Source Logic
-        # Always prefer render() for full RGB pixels.
-        # MiniGrid's obs['image'] is a symbolic grid (values 0-8),
-        # not actual pixels — useless for CNN feature extraction.
-        frame = self.env.render()
-        
-        # Fallback to obs['image'] only if render is unavailable
-        if frame is None and isinstance(obs, dict) and 'image' in obs:
-            img = obs['image']
-            if isinstance(img, np.ndarray) and img.size > 0:
-                frame = img
-        
-        # 3. Crash on Null Render or Invalid Frame
-        if frame is None:
-            raise RuntimeError("Env returned None render and no 'image' in obs. Dreamer requires valid pixels.")
-        
-        # Resize and set image
-        out_obs['image'] = self._resize_image(frame)
+        if self._symbolic:
+            # Symbolic mode: take the grid from obs, flatten, cast to float32
+            if isinstance(obs, dict) and 'image' in obs:
+                grid = obs['image']  # (H, W, 3) uint8 symbolic grid
+            else:
+                raise RuntimeError("Symbolic mode requires obs dict with 'image' key")
+            out_obs['image'] = grid.flatten().astype(np.float32)
+        else:
+            # Pixel mode: render RGB pixels, resize to target size
+            frame = self.env.render()
+            
+            # Fallback to obs['image'] only if render is unavailable
+            if frame is None and isinstance(obs, dict) and 'image' in obs:
+                img = obs['image']
+                if isinstance(img, np.ndarray) and img.size > 0:
+                    frame = img
+            
+            if frame is None:
+                raise RuntimeError("Env returned None render and no 'image' in obs. Dreamer requires valid pixels.")
+            
+            # Resize and set image
+            out_obs['image'] = self._resize_image(frame)
         
         # Fetch regime_id from info or env attribute
         regime = 0.0

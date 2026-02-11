@@ -170,6 +170,7 @@ def main():
     configs['defaults']['env']['steps_per_regime'] = 0
     configs['defaults']['env']['episodes_per_regime'] = 0
     configs['defaults']['env']['oracle_mode'] = False
+    configs['defaults']['env']['symbolic'] = True
     configs['defaults']['env']['id'] = "MiniGrid-DualGoal-8x8-v0"
 
     config = elements.Config(configs['defaults'])
@@ -224,6 +225,7 @@ def main():
 
     print('Logdir:', config.logdir)
     print('Env ID:', config.env.id)
+    print('Symbolic:', config.env.symbolic)
     print('Regime Steps:', config.env.steps_per_regime)
     print('Envs:', config.run.envs)
     print('Imag Length:', config.agent.imag_length)
@@ -290,6 +292,7 @@ def main():
             seed=seed,
             dreamer_compatible=True,
             oracle_mode=config.env.oracle_mode,
+            symbolic=config.env.symbolic,
             episodes_per_regime=episodes,
             steps_per_regime=steps,
         )

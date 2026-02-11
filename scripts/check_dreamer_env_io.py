@@ -59,11 +59,19 @@ def check_env_io(env_id="MiniGrid-DualGoal-8x8-v0", steps=50, oracle=False):
             sys.exit(1)
             
         img = obs['image']
-        if img.dtype != np.uint8:
-            print(f"FAIL: Image dtype is {img.dtype}, expected uint8")
-            sys.exit(1)
-        if img.ndim != 3 or img.shape[2] != 3:
-            print(f"FAIL: Image shape {img.shape} incorrect. Expected (H, W, 3)")
+        # Accept either symbolic (float32, 1D) or pixel (uint8, 3D) observations
+        if img.dtype == np.float32:
+            # Symbolic mode: expect flattened vector
+            if img.ndim != 1:
+                print(f"FAIL: Symbolic image ndim is {img.ndim}, expected 1")
+                sys.exit(1)
+        elif img.dtype == np.uint8:
+            # Pixel mode: expect (H, W, 3)
+            if img.ndim != 3 or img.shape[2] != 3:
+                print(f"FAIL: Pixel image shape {img.shape} incorrect. Expected (H, W, 3)")
+                sys.exit(1)
+        else:
+            print(f"FAIL: Image dtype is {img.dtype}, expected float32 or uint8")
             sys.exit(1)
         
         # Check 5: Non-blank

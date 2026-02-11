@@ -12,8 +12,8 @@ Lifelong-Learning/
 │   ├── envs/                     # Environment definitions
 │   │   ├── dual_goal.py          # MiniGrid-DualGoal-8x8-v0 (two goals, +5 / -1)
 │   │   ├── regime_wrapper.py     # Non-stationary reward switching
-│   │   ├── dreamer_compat.py     # DreamerReadyWrapper (RGB obs, log/ keys)
-│   │   ├── make_env.py           # Env factory (shared by PPO and Dreamer)
+│   │   ├── dreamer_compat.py     # DreamerReadyWrapper (symbolic/pixel obs, log/ keys)
+│   │   ├── make_env.py           # Env factory (FullyObsWrapper + PPO/Dreamer routing)
 │   │   ├── minigrid_obs.py       # Image obs wrapper for PPO
 │   │   └── wrappers/
 │   │       └── action_reduce.py  # Discrete(7) → Discrete(3) for Dreamer
@@ -167,7 +167,16 @@ python scripts/train_dreamerv3_minigrid.py
 
 # Add regime switching (after stationary baseline is solid)
 python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
+
+# Revert to pixel-based observations (64×64 RGB)
+python scripts/train_dreamerv3_minigrid.py --env.symbolic False
 ```
+
+**Observation modes:**
+- **Symbolic (default):** Flattened `(192,)` float32 grid → MLP encoder. Each cell stores `(object_type, color_id, state)`. Goal colors are explicit integers — no pixel ambiguity.
+- **Pixel:** `(64, 64, 3)` uint8 RGB from `env.render()` → CNN encoder. Set `--env.symbolic False`.
+
+Both PPO and DreamerV3 use `FullyObsWrapper` for full 8×8 grid observability (no partial view).
 
 **Built-in defaults** (overridable via CLI):
 | Setting | Value | Rationale |
@@ -178,6 +187,7 @@ python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
 | `--run.train_ratio` | `64` | Gradient steps per env step |
 | `--agent.imag_length` | `64` | Imagination horizon (256-step episodes) |
 | `--batch_size` | `16` | Replay batch size |
+| `--env.symbolic` | `True` | Symbolic obs (MLP) vs pixel obs (CNN) |
 
 A resolved config is automatically saved to `logdir/<run>/config_resolved.json`.
 

@@ -189,7 +189,12 @@ def main():
         'run.envs': 4,                # 4 parallel envs for data diversity on Colab GPU
         'batch_size': 16,
         'replay_context': 1,          # Restore default (0 was wrong)
+        
+        # Long-Horizon Fixes
         'agent.imag_length': 64,      # Long enough to imagine reaching goals in 256-step eps
+        'agent.horizon': 333,         # Effective discount 1 - 1/333 ~= 0.997
+        'agent.imag_loss.lam': 0.995, # lambda=0.995 for long-term credit assignment
+        'agent.repl_loss.lam': 0.995, # consistent lambda for replay loss
     })
 
     # Check I/O if requested

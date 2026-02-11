@@ -26,6 +26,7 @@ def main():
     p.add_argument("--switch_hi", type=int, default=80)
 
     p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint.pt to resume from")
     
     # Annealing
     p.add_argument("--anneal_lr", action="store_true", default=True)
@@ -54,6 +55,7 @@ def main():
         mid_episode_switch_step_range=(args.switch_lo, args.switch_hi),
         run_name=args.run_name,
         anneal_lr=args.anneal_lr,
+        resume_path=args.resume_path,
     )
 
 

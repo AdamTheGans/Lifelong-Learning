@@ -76,6 +76,15 @@ python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 
 tensorboard --logdir runs
 ```
 
+### 1.5 Resume Training
+
+To resume training from a checkpoint (e.g., if a run didn't converge):
+
+```bash
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --resume_path checkpoints/baseline_stationary_update170.pt --no-anneal_lr
+```
+*Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*
+
 ---
 
 ## Part 2: DreamerV3
@@ -166,6 +175,7 @@ python scripts/train_dreamerv3_minigrid.py --env.symbolic False
     - **Unified Strategy:** Both PPO and DreamerV3 now see the exact same mathematically correct representation.
     - **Encoding:** Object Type (11), Color (6), State (3) are one-hot encoded and concatenated.
     - DreamerV3 receives this as a flattened vector `(1280,)`. PPO receives it as a `(20, 8, 8)` tensor.
+    - *Note: DreamerV3 automatically detects 1D inputs as vectors (MLP) and 3D inputs as images (CNN). By flattening to `(1280,)`, we ensure it uses the correct MLP encoder without applying image augmentations.*
 - **Pixel:** `(64, 64, 3)` uint8 RGB from `env.render()` → CNN encoder. Set `--env.symbolic False`.
 
 Both PPO and DreamerV3 use `FullyObsWrapper` for full 8×8 grid observability (no partial view).

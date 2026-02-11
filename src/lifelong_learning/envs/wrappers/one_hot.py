@@ -20,7 +20,7 @@ class OneHotPartialObsWrapper(gym.ObservationWrapper):
         # Define max classes based on MiniGrid constants
         self.num_objs = 11   # Empty, Wall, Floor, Door, Key, Ball, Box, Goal, Lava, Agent, etc.
         self.num_cols = 6    # Red, Green, Blue, Purple, Yellow, Grey
-        self.num_states = 3  # Open, Closed, Locked
+        self.num_states = 4  # Open, Closed, Locked, plus Direction (0=East, 1=South, 2=West, 3=North)
         
         self.total_channels = self.num_objs + self.num_cols + self.num_states
         

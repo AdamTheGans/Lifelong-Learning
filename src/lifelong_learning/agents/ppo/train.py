@@ -33,6 +33,7 @@ def train_ppo(
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
     anneal_lr: bool = True,
+    resume_path: str | None = None,
 ):
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -64,6 +65,24 @@ def train_ppo(
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
+    # [RESUME LOGIC]
+    start_global_step = 0
+    if resume_path is not None and os.path.exists(resume_path):
+        print(f"Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            print("Optimizer state loaded.")
+        else:
+            print("WARNING: Optimizer state not found in checkpoint. Starting fresh (with potential LR mismatch if annealing).")
+
+        if "global_step" in ckpt:
+            start_global_step = ckpt["global_step"]
+            print(f"Resuming from global_step={start_global_step}")
+
+
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
 
@@ -74,7 +93,8 @@ def train_ppo(
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
 
     num_updates = cfg.total_timesteps // (num_envs * cfg.num_steps)
-    global_step = 0
+    global_step = start_global_step
+    start_update = global_step // (num_envs * cfg.num_steps) + 1
     start_time = time.time()
 
     # [NEW] Manual Stats Tracking
@@ -82,9 +102,9 @@ def train_ppo(
     running_returns = np.zeros(num_envs)
     running_lengths = np.zeros(num_envs, dtype=int)
 
-    print(f"Training on {device} with {num_envs} envs for {num_updates} updates.")
+    print(f"Training on {device} with {num_envs} envs for {num_updates} updates (starting from update {start_update}).")
 
-    for update in range(1, num_updates + 1):
+    for update in range(start_update, num_updates + 1):
         if anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * cfg.lr
@@ -165,6 +185,7 @@ def train_ppo(
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": cfg.__dict__,
                     "global_step": global_step,
                 },

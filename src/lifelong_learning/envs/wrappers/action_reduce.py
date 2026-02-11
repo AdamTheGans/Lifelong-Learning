@@ -37,8 +37,8 @@ class ActionReduceWrapper(gym.ActionWrapper):
         self.action_space = gym.spaces.Discrete(len(self._actions))
 
         names = [self.MINIGRID_ACTION_NAMES[a] for a in self._actions]
-        print(f"[ActionReduceWrapper] Discrete({len(self._actions)}): "
-              f"{list(zip(range(len(self._actions)), names, self._actions))}")
+        # print(f"[ActionReduceWrapper] Discrete({len(self._actions)}): "
+        #       f"{list(zip(range(len(self._actions)), names, self._actions))}")
 
     def action(self, action):
         """Map reduced action index to original MiniGrid action."""

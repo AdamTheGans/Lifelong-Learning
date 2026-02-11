@@ -148,6 +148,9 @@ python scripts/diagnostic_env_check.py
 
 # Dreamer I/O contract check (50-step smoke test)
 python scripts/check_dreamer_env_io.py
+
+# Comprehensive Environment Integrity Test (Obs, Physics, Rewards)
+python tests/test_env_integrity.py
 ```
 
 ### 2.3 Train DreamerV3

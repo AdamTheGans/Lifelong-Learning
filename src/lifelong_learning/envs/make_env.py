@@ -58,7 +58,7 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
         render_mode = None
         tile_kwargs = {}
     
-    env = gym.make(env_id, render_mode=render_mode, **tile_kwargs)
+    env = gym.make(env_id, render_mode=render_mode, max_episode_steps=256, **tile_kwargs)
     
     # Full observability: both PPO and DreamerV3 see the entire 8×8 grid
     # instead of the default partial 7×7 agent-centered view.
@@ -76,9 +76,10 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
         env = ActionReduceWrapper(env, actions=[0, 1, 2])
     
     # 1. Apply Strict TimeLimit
-    # Note: If env already has a TimeLimit, this wraps it. 
-    # MiniGrid usually returns truncated=True on timeout.
-    env = TimeLimit(env, max_episode_steps=256)
+    # MiniGrid envs generally have a TimeLimit by default via registration.
+    # We only apply it if the env doesn't have one, or we want to override it.
+    # For now, we rely on the default, or if needed, use gym.make's max_episode_steps.
+    # env = TimeLimit(env, max_episode_steps=256) # REMOVED to avoid double wrapping
     
     # 2. Image Obs Wrapper (One-Hot for Symbolic)
     # Replaces MiniGridImageObsWrapper for PPO

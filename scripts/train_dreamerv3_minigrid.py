@@ -181,9 +181,30 @@ def main():
     for name in parsed.configs:
         config = config.update(configs[name])
     
+    # Parse CLI flags that aren't config related
+    resume = '--resume' in sys.argv
+    if resume:
+        # Remove --resume from argv so Flags doesn't complain
+        sys.argv.remove('--resume')
+
     # MiniGrid-tuned defaults (can still be overridden via CLI flags)
+    default_logdir = f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal'
+    
+    # Resume Logic: Find latest directory if requested and not specified
+    if resume and not any(arg.startswith('--logdir') for arg in sys.argv):
+        if os.path.exists('./logdir'):
+            dirs = [os.path.join('./logdir', d) for d in os.listdir('./logdir') 
+                    if os.path.isdir(os.path.join('./logdir', d))]
+            if dirs:
+                default_logdir = max(dirs, key=os.path.getmtime)
+                print(f"Resuming from latest logdir: {default_logdir}")
+            else:
+                print("Warning: --resume specified but no directories found in ./logdir. Starting fresh.")
+        else:
+             print("Warning: --resume specified but ./logdir does not exist. Starting fresh.")
+
     config = config.update({
-        'logdir': f'./logdir/{datetime.now().strftime("%Y%m%d-%H%M%S")}-dualgoal',
+        'logdir': default_logdir,
         'run.train_ratio': 32,        # Reduced from 64 for faster wall-clock training
         'run.log_every': 30,
         'run.steps': 100000,          # Sensible default for MiniGrid sanity run

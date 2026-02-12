@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import gymnasium as gym
 from gymnasium.envs.registration import register
+from collections import deque
 
 register(
     id="MiniGrid-DualGoal-8x8-v0",
@@ -101,6 +102,9 @@ def train_ppo(
     # We maintain these arrays to track progress for each environment individually
     running_returns = np.zeros(num_envs)
     running_lengths = np.zeros(num_envs, dtype=int)
+    
+    # Outcome tracking (rolling window of last 100 episodes)
+    outcome_window = deque(maxlen=100)
 
     print(f"Training on {device} with {num_envs} envs for {num_updates} updates (starting from update {start_update}).")
 
@@ -150,6 +154,38 @@ def train_ppo(
                     # Optional: Attempt to log regime. 
                     # Note: 'infos' here is from the RESET env, so this might be the *next* regime 
                     # if the switch happened exactly now. But it's close enough for visualization.
+                    
+                    # Extract outcome from final_info
+                    # When using SyncVectorEnv, 'infos' is a dict of arrays.
+                    # But for done envs, we need to look into 'final_info' to get the stats of the *finished* episode.
+                    # 'final_info' is a list of info dicts for the envs that are done.
+                    # However, gymnasium's vector env interface is a bit tricky. 
+                    # 'infos' returned by step() contains 'final_info' key if any env is done.
+                    
+                    if "final_info" in infos:
+                        for final_info in infos["final_info"]:
+                            if final_info is not None and "reached_good_goal" in final_info:
+                                # This was a valid episode end
+                                outcome = 0 # unknown
+                                if final_info.get("reached_good_goal", 0.0) > 0:
+                                    outcome = 1 # success
+                                elif final_info.get("reached_bad_goal", 0.0) > 0:
+                                    outcome = -1 # failure
+                                elif final_info.get("timed_out", 0.0) > 0:
+                                    outcome = 0 # timeout 
+                                
+                                outcome_window.append(outcome)
+                                
+                                # Log rolling stats
+                                if len(outcome_window) > 0:
+                                    success_rate = sum(1 for x in outcome_window if x == 1) / len(outcome_window)
+                                    failure_rate = sum(1 for x in outcome_window if x == -1) / len(outcome_window)
+                                    timeout_rate = sum(1 for x in outcome_window if x == 0) / len(outcome_window)
+                                    
+                                    logger.scalar("charts/success_rate", success_rate, global_step)
+                                    logger.scalar("charts/failure_rate", failure_rate, global_step)
+                                    logger.scalar("charts/timeout_rate", timeout_rate, global_step)
+
                     if "regime_id" in infos:
                         regime = infos["regime_id"][i]
                         logger.scalar(f"charts/r_regime_{regime}", running_returns[i], global_step)

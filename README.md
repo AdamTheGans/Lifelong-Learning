@@ -171,7 +171,14 @@ python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
 
 # Revert to pixel-based observations (64×64 RGB)
 python scripts/train_dreamerv3_minigrid.py --env.symbolic False
+
+# To resume from the latest checkpoint:
+python scripts/train_dreamerv3_minigrid.py --resume --run.steps 200000
 ```
+
+> [!NOTE]
+> When resuming, you must set `--run.steps` to a value *larger* than the steps already completed in the checkpoint, otherwise the training will terminate immediately.
+
 
 **Observation modes:**
 - **Symbolic (default):** unified One-Hot float tensor `(20, 8, 8)` → MLP encoder.

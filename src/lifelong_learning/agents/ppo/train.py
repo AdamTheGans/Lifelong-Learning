@@ -15,6 +15,7 @@ register(
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
+from lifelong_learning.agents.ppo.world_model import SimpleWorldModel # [NEW]
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
@@ -64,6 +65,10 @@ def train_ppo(
 
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
+
+    # [NEW] Sidekick World Model
+    world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
+    wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=1e-3) # Standard Adam LR
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
     # [RESUME LOGIC]
@@ -131,6 +136,13 @@ def train_ppo(
             running_returns += reward
             running_lengths += 1
 
+            # [NEW] Handle Correct Next Obs for World Model (Autoreset handling)
+            real_next_obs = next_obs.copy()
+            if "final_observation" in infos:
+                for idx, final_obs in enumerate(infos["final_observation"]):
+                    if final_obs is not None:
+                        real_next_obs[idx] = final_obs
+
             buffer.add(
                 obs=obs_t,
                 actions=action,
@@ -138,6 +150,7 @@ def train_ppo(
                 rewards=torch.tensor(reward, dtype=torch.float32, device=device),
                 dones=torch.tensor(done, dtype=torch.float32, device=device),
                 values=value,
+                next_obs=torch.tensor(real_next_obs, dtype=torch.float32, device=device), # [NEW]
             )
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
@@ -200,15 +213,50 @@ def train_ppo(
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
         update_stats = []
+        wm_stats = [] # [NEW]
+
         for epoch in range(cfg.update_epochs):
             minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            stats = ppo_update(model, optimizer, minibatches, cfg)
-            update_stats.append(stats)
+            # PPO Update needs obs, actions, logprobs, advantages, returns, values
+            # World Model needs obs, actions, next_obs, rewards
+            for obs, actions, logprobs, advantages, returns, values, next_obs, rewards in minibatches:
+                
+                # 1. PPO Update
+                # Re-package for ppo_update signature
+                ppo_batch = [obs, actions, logprobs, advantages, returns, values]
+                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
+                update_stats.append(stats)
+
+                # 2. World Model Update (Sidekick)
+                # Predict
+                pred_next_obs, pred_reward = world_model(obs, actions)
+                
+                # Loss
+                loss_state = torch.nn.functional.mse_loss(pred_next_obs, next_obs)
+                loss_reward = torch.nn.functional.mse_loss(pred_reward, rewards)
+                
+                wm_loss = loss_state + loss_reward
+                
+                wm_optimizer.zero_grad()
+                wm_loss.backward()
+                wm_optimizer.step()
+                
+                wm_stats.append({
+                    "world_model/loss_total": wm_loss.item(),
+                    "world_model/loss_state": loss_state.item(), # Surprise
+                    "world_model/loss_reward": loss_reward.item(),
+                })
         
         avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]}
+        avg_wm_stats = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} # [NEW]
 
         for k, v in avg_stats.items():
             logger.scalar(k, v, global_step)
+        
+        # [NEW] Log World Model Stats
+        for k, v in avg_wm_stats.items():
+            logger.scalar(k, v, global_step)
+            
         logger.scalar("charts/learning_rate", lrnow, global_step)
         logger.scalar("charts/heartbeat", global_step, global_step)
         logger.scalar("charts/reward_step_mean", buffer.rewards.mean().item(), global_step)

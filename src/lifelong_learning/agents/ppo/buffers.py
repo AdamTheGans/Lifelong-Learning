@@ -21,15 +21,17 @@ class RolloutBuffer:
         self.rewards = torch.zeros((num_steps, num_envs), device=device)
         self.dones = torch.zeros((num_steps, num_envs), device=device)
         self.values = torch.zeros((num_steps, num_envs), device=device)
+        self.next_obs = torch.zeros((num_steps, num_envs) + obs_shape, device=device) # [NEW] For World Model
 
         self.advantages = torch.zeros((num_steps, num_envs), device=device)
         self.returns = torch.zeros((num_steps, num_envs), device=device)
 
         self.step = 0
 
-    def add(self, obs, actions, logprobs, rewards, dones, values):
+    def add(self, obs, actions, logprobs, rewards, dones, values, next_obs):
         t = self.step
         self.obs[t].copy_(obs)
+        self.next_obs[t].copy_(next_obs) # [NEW]
         self.actions[t].copy_(actions)
         self.logprobs[t].copy_(logprobs)
         self.rewards[t].copy_(rewards)
@@ -63,11 +65,15 @@ class RolloutBuffer:
         batch_size = T * N
 
         b_obs = self.obs.reshape((batch_size,) + self.obs_shape)
+        b_next_obs = self.next_obs.reshape((batch_size,) + self.obs_shape) # [NEW]
         b_actions = self.actions.reshape(batch_size)
         b_logprobs = self.logprobs.reshape(batch_size)
         b_advantages = self.advantages.reshape(batch_size)
         b_returns = self.returns.reshape(batch_size)
         b_values = self.values.reshape(batch_size)
+
+        b_rewards = self.rewards.reshape(batch_size) # [NEW]
+        b_dones = self.dones.reshape(batch_size) # [NEW] (might as well)
 
         # Normalize advantage
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
@@ -78,7 +84,7 @@ class RolloutBuffer:
 
         for start in range(0, batch_size, minibatch_size):
             mb = idxs[start:start + minibatch_size]
-            yield b_obs[mb], b_actions[mb], b_logprobs[mb], b_advantages[mb], b_returns[mb], b_values[mb]
+            yield b_obs[mb], b_actions[mb], b_logprobs[mb], b_advantages[mb], b_returns[mb], b_values[mb], b_next_obs[mb], b_rewards[mb]
 
     def reset(self):
         self.step = 0

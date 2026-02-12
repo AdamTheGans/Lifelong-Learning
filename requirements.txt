@@ -6,6 +6,7 @@ minigrid>=2.3
 tqdm>=4.66
 pillow>=10.0
 tensorflow>=2.16
+pandas>=2.1
 
 # Logging / plotting
 tensorboard>=2.15

@@ -32,7 +32,22 @@ def main():
     p.add_argument("--anneal_lr", action="store_true", default=True)
     p.add_argument("--no-anneal_lr", action="store_false", dest="anneal_lr")
     
+    # [NEW] Dyna-PPO / Passive Mode
+    p.add_argument("--mode", type=str, default="dyna", choices=["dyna", "passive"], help="regime: 'dyna' (active) or 'passive' (baseline)")
+    p.add_argument("--intrinsic_coef", type=float, default=0.02, help="Coefficient for intrinsic curiosity reward")
+    p.add_argument("--imagined_horizon", type=int, default=5, help="Length of imagined trajectories")
+
     args = p.parse_args()
+
+    # Handle Mode Logic
+    if args.mode == "passive":
+        print("Running in PASSIVE mode (No curiosity, No dreaming).")
+        intrinsic_coef = 0.0
+        imagined_horizon = 0
+    else:
+        print(f"Running in DYNA mode (intrinsic_coef={args.intrinsic_coef}, horizon={args.imagined_horizon}).")
+        intrinsic_coef = args.intrinsic_coef
+        imagined_horizon = args.imagined_horizon
 
     cfg = PPOConfig(
         total_timesteps=args.total_timesteps,
@@ -56,6 +71,8 @@ def main():
         run_name=args.run_name,
         anneal_lr=args.anneal_lr,
         resume_path=args.resume_path,
+        intrinsic_coef=intrinsic_coef, # [NEW]
+        imagined_horizon=imagined_horizon, # [NEW]
     )
 
 

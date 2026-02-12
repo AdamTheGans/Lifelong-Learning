@@ -81,3 +81,101 @@ class SimpleWorldModel(nn.Module):
         next_obs_pred = next_obs_flat.reshape(B, self.c, self.h, self.w)
         
         return next_obs_pred, reward_pred
+
+    def discretize_state(self, continuous_obs: torch.Tensor) -> torch.Tensor:
+        """
+        Converts continuous World Model outputs back into a valid One-Hot encoded state.
+        
+        Args:
+            continuous_obs: (B, C, H, W) float tensor
+            
+        Returns:
+            discrete_obs: (B, C, H, W) float tensor (containing only 0.0 and 1.0)
+        """
+        # 1. Identify the most likely channel (category) for each pixel
+        # shape: (B, H, W)
+        max_indices = torch.argmax(continuous_obs, dim=1)
+        
+        # 2. Convert back to One-Hot
+        # shape: (B, H, W, C)
+        one_hot = F.one_hot(max_indices, num_classes=self.c)
+        
+        # 3. Permute back to (B, C, H, W) and float
+        # shape: (B, C, H, W)
+        discrete_obs = one_hot.permute(0, 3, 1, 2).float()
+        
+        return discrete_obs
+
+    def generate_imagined_trajectories(
+        self, 
+        policy_net: nn.Module, 
+        start_states: torch.Tensor, 
+        horizon: int
+    ) -> list[dict]:
+        """
+        Generates imagined trajectories using the World Model and Policy.
+        
+        Args:
+            policy_net: The PPO Actor-Critic network
+            start_states: (B, C, H, W) tensor from the real buffer
+            horizon: Int, number of steps to dream
+            
+        Returns:
+            list of transition dicts: {
+                'obs': (B, ...), 
+                'actions': (B,), 
+                'logprobs': (B,), 
+                'rewards': (B,), 
+                'dones': (B,), 
+                'values': (B,), 
+                'next_obs': (B, ...)
+            }
+        """
+        trajectories = []
+        curr_obs = start_states
+        
+        # We process 'horizon' steps
+        for _ in range(horizon):
+            # 1. Action Selection (Policy)
+            # Note: distinct from real env step, we use the policy on the *imagined* observation
+            # We must ensure gradients flow through the policy for PPO, but NOT through the world model
+            # For the *input* to the policy, we treat it as ground truth state.
+            with torch.no_grad():
+                # We typically don't backprop through the *generation* of the data for PPO 
+                # (PPO assumes fixed data collection).
+                # So we can run this completely in no_grad for data generation efficiency, 
+                # OR we might want gradients for solving differentiable planning?
+                # User request: "gradients are strictly blocked from updating the World Model's weights".
+                # Standard Dyna-PPO: Collect imagined data (no grad), then train PPO on it (grad).
+                action, logprob, _, value = policy_net.act(curr_obs)
+            
+            # 2. World Model Prediction
+            # We need the prediction to advance the state
+            # For "Dyna", we treat the World Model as an Environment.
+            # We do NOT propagate gradients from the policy loss into the World Model.
+            # So this forward pass is also effectively no_grad or detached.
+            with torch.no_grad():
+                next_obs_pred, reward_pred = self.forward(curr_obs, action)
+            
+            # 3. Handle Hallucinations (Discrete State Enforcement)
+            # This is crucial for the "Symbolic" environment consistency
+            next_obs_discrete = self.discretize_state(next_obs_pred)
+            
+            # 4. Store transition
+            # Using 0 for done/truncated for simplicity in dreams (infinite horizon assumption or fixed horizon)
+            dones = torch.zeros(curr_obs.shape[0], device=curr_obs.device)
+            
+            trajectories.append({
+                "obs": curr_obs,
+                "actions": action,
+                "logprobs": logprob,
+                "rewards": reward_pred,
+                "dones": dones,
+                "values": value,
+                "next_obs": next_obs_discrete
+            })
+            
+            # 5. Advance
+            curr_obs = next_obs_discrete
+            
+        return trajectories

@@ -36,6 +36,8 @@ def train_ppo(
     save_every_updates: int = 50,
     anneal_lr: bool = True,
     resume_path: str | None = None,
+    intrinsic_coef: float = 0.02, # [NEW] Curiosity
+    imagined_horizon: int = 5,    # [NEW] Dream length
 ):
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -123,34 +125,59 @@ def train_ppo(
 
         buffer.reset()
 
+        # [NEW] Track intrinsic rewards
+        episodic_intrinsic_rewards = []
+
         for t in range(cfg.num_steps):
             global_step += num_envs
 
             with torch.no_grad():
                 action, logprob, entropy, value = model.act(obs_t)
+                
+                # [NEW] Intrinsic Motivation Calculation
+                # We do this inside no_grad because we don't want gradients during collection
+                pred_next_obs, _ = world_model(obs_t, action) 
 
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
-
-            # [NEW] Update manual trackers
-            running_returns += reward
-            running_lengths += 1
-
-            # [NEW] Handle Correct Next Obs for World Model (Autoreset handling)
+            
+            # [NEW] Handle Correct Next Obs (Autoreset) for surprise calc
             real_next_obs = next_obs.copy()
             if "final_observation" in infos:
                 for idx, final_obs in enumerate(infos["final_observation"]):
                     if final_obs is not None:
                         real_next_obs[idx] = final_obs
+            
+            real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
+
+            # [NEW] Compute Surprise
+            with torch.no_grad():
+                # We use MSE as surprise. 
+                # Note: This is an aggregation over (C, H, W). 
+                # We want a scalar per environment.
+                # pred_next_obs: (B, C, H, W), real_next_obs_t: (B, C, H, W)
+                surprise = torch.nn.functional.mse_loss(pred_next_obs, real_next_obs_t, reduction='none')
+                # Sum over C, H, W to get surprise per env
+                surprise_per_env = surprise.view(num_envs, -1).mean(dim=1) 
+                
+                intrinsic_reward = intrinsic_coef * surprise_per_env
+                episodic_intrinsic_rewards.append(intrinsic_reward.mean().item())
+
+            # [NEW] Update manual trackers
+            running_returns += reward
+            running_lengths += 1
+
+            # Combined Reward for PPO
+            total_reward = torch.tensor(reward, dtype=torch.float32, device=device) + intrinsic_reward
 
             buffer.add(
                 obs=obs_t,
                 actions=action,
                 logprobs=logprob,
-                rewards=torch.tensor(reward, dtype=torch.float32, device=device),
+                rewards=total_reward, # [MODIFIED] Now includes intrinsic curiosity
                 dones=torch.tensor(done, dtype=torch.float32, device=device),
                 values=value,
-                next_obs=torch.tensor(real_next_obs, dtype=torch.float32, device=device), # [NEW]
+                next_obs=real_next_obs_t, 
             )
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
@@ -165,16 +192,6 @@ def train_ppo(
                     logger.scalar("charts/episodic_length", running_lengths[i], global_step)
                     
                     # Optional: Attempt to log regime. 
-                    # Note: 'infos' here is from the RESET env, so this might be the *next* regime 
-                    # if the switch happened exactly now. But it's close enough for visualization.
-                    
-                    # Extract outcome from final_info
-                    # When using SyncVectorEnv, 'infos' is a dict of arrays.
-                    # But for done envs, we need to look into 'final_info' to get the stats of the *finished* episode.
-                    # 'final_info' is a list of info dicts for the envs that are done.
-                    # However, gymnasium's vector env interface is a bit tricky. 
-                    # 'infos' returned by step() contains 'final_info' key if any env is done.
-                    
                     if "final_info" in infos:
                         for final_info in infos["final_info"]:
                             if final_info is not None and "reached_good_goal" in final_info:
@@ -213,7 +230,7 @@ def train_ppo(
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
         update_stats = []
-        wm_stats = [] # [NEW]
+        wm_stats = [] 
 
         for epoch in range(cfg.update_epochs):
             minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
@@ -247,8 +264,79 @@ def train_ppo(
                     "world_model/loss_reward": loss_reward.item(),
                 })
         
+        # [NEW] Imagined Phase (Active Dyna)
+        # -------------------------------
+        # Perform 1 epoch of PPO update on imagined data
+        # Do this AFTER real updates to ensure policy is up to date before dreaming? 
+        # Or before? Usually mixed. We'll do it after.
+        
+        # 1. Sample start states from the Buffer (randomly from what we just experienced)
+        # Sample one start state per env
+        # [FIX] Correctly sample (time, env) pairs to get (Num_Envs, C, H, W)
+        rand_time_idxs = torch.randint(0, cfg.num_steps, (num_envs,), device=device)
+        env_idxs = torch.arange(num_envs, device=device)
+        start_states = buffer.obs[rand_time_idxs, env_idxs] 
+        
+        # 2. Dream
+        # This uses the specific simple world model methods we added
+        imagined_trajectories = world_model.generate_imagined_trajectories(
+            policy_net=model,
+            start_states=start_states,
+            horizon=imagined_horizon
+        )
+        
+        # 3. Create Dream Buffer
+        dream_buffer = RolloutBuffer(imagined_horizon, num_envs, obs_shape, device)
+        
+        # 4. Fill Buffer
+        for t, traj in enumerate(imagined_trajectories):
+            dream_buffer.add(
+                obs=traj["obs"],
+                actions=traj["actions"],
+                logprobs=traj["logprobs"],
+                rewards=traj["rewards"],
+                dones=traj["dones"],
+                values=traj["values"],
+                next_obs=traj["next_obs"]
+            )
+            
+        # 5. Bootstrap Value for the last step
+        # The last trajectory item has 'next_obs' which is the state *after* the horizon
+        last_dream_obs = imagined_trajectories[-1]["next_obs"]
+        with torch.no_grad():
+            _, last_dream_value = model.forward(last_dream_obs)
+            
+        # 6. Compute GAE for Dream
+        dream_buffer.compute_returns_and_advantages(last_dream_value, cfg.gamma, cfg.gae_lambda)
+        
+        # 7. Update PPO on Dream Data
+        # We use a reduced number of epochs (e.g., 1) to avoid over-optimizing on dreams
+        dream_stats = []
+        dream_minibatches = dream_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+        
+        for obs, actions, logprobs, advantages, returns, values, _, _ in dream_minibatches:
+            # We must ensure NO gradients flow to world model. 
+            # generate_imagined_trajectories uses 'torch.no_grad()' for world model forward, so we are safe.
+            # The 'obs' in dream_buffer are detached tensors.
+            
+            ppo_batch = [obs, actions, logprobs, advantages, returns, values]
+            stats = ppo_update(model, optimizer, [ppo_batch], cfg)
+            dream_stats.append(stats)
+
+        # Log Dream Stats
+        avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}
+        for k, v in avg_dream_stats.items():
+            logger.scalar(k, v, global_step)
+            
+        # [NEW] Log Dream Value/Return stats
+        if len(dream_stats) > 0:
+             logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), global_step)
+             logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), global_step)
+
+        # -------------------------------
+
         avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]}
-        avg_wm_stats = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} # [NEW]
+        avg_wm_stats = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} 
 
         for k, v in avg_stats.items():
             logger.scalar(k, v, global_step)
@@ -257,9 +345,20 @@ def train_ppo(
         for k, v in avg_wm_stats.items():
             logger.scalar(k, v, global_step)
             
+        # [NEW] Log Intrinsic Reward Components
+        mean_intrinsic = np.mean(episodic_intrinsic_rewards)
+        mean_total_abs = buffer.rewards.abs().mean().item()
+        
+        logger.scalar("ppo/intrinsic_reward_mean", mean_intrinsic, global_step)
+        # Ratio of intrinsic to total signal magnitude
+        if mean_total_abs > 1e-6:
+            logger.scalar("ppo/intrinsic_reward_ratio", mean_intrinsic / mean_total_abs, global_step)
+        else:
+            logger.scalar("ppo/intrinsic_reward_ratio", 0.0, global_step)
+
         logger.scalar("charts/learning_rate", lrnow, global_step)
         logger.scalar("charts/heartbeat", global_step, global_step)
-        logger.scalar("charts/reward_step_mean", buffer.rewards.mean().item(), global_step)
+        logger.scalar("charts/reward_step_mean", buffer.rewards.mean().item(), global_step) # Note: this includes intrinsic
 
         sps = int(global_step / max(1e-9, (time.time() - start_time)))
         logger.scalar("charts/SPS", sps, global_step)

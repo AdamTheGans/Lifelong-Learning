@@ -1,0 +1,10 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.7, pytest-9.0.1, pluggy-1.6.0
+rootdir: C:\Users\Owner\Desktop\CS172b\Lifelong-Learning
+configfile: pyproject.toml
+plugins: anyio-4.6.2.post1
+collected 4 items
+
+tests\test_dyna_logic.py ....                                            [100%]
+
+============================== 4 passed in 8.79s ==============================

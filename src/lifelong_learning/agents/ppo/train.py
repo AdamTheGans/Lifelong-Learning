@@ -14,12 +14,14 @@ register(
 )
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
+
+
 from lifelong_learning.agents.ppo.network import CNNActorCritic
-from lifelong_learning.agents.ppo.world_model import SimpleWorldModel # [NEW]
+from lifelong_learning.agents.ppo.world_model import SimpleWorldModel 
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
-from lifelong_learning.envs.make_env import make_env 
+from lifelong_learning.envs.make_env import make_env
 
 def train_ppo(
     env_id: str,
@@ -36,8 +38,11 @@ def train_ppo(
     save_every_updates: int = 50,
     anneal_lr: bool = True,
     resume_path: str | None = None,
-    intrinsic_coef: float = 0.02, # [NEW] Curiosity
+
+    intrinsic_coef: float = 500.0, # [NEW] Amplified Error Coefficient (was 0.02)
+    intrinsic_reward_clip: float = 0.5, # [NEW] Cap for intrinsic reward
     imagined_horizon: int = 5,    # [NEW] Dream length
+    wm_lr: float = 1e-4,          # [NEW] Slower World Model (was 1e-3)
 ):
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -70,8 +75,11 @@ def train_ppo(
 
     # [NEW] Sidekick World Model
     world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
-    wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=1e-3) # Standard Adam LR
+    wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr) # [MODIFIED] Slow down WM
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
+    
+    # [REMOVED] Running Mean Std for Curiosity (Z-Score was unstable)
+
 
     # [RESUME LOGIC]
     start_global_step = 0
@@ -85,6 +93,17 @@ def train_ppo(
             print("Optimizer state loaded.")
         else:
             print("WARNING: Optimizer state not found in checkpoint. Starting fresh (with potential LR mismatch if annealing).")
+
+        # [NEW] Load World Model
+        if "world_model_state_dict" in ckpt:
+            world_model.load_state_dict(ckpt["world_model_state_dict"])
+            print("World Model state loaded.")
+        else:
+            print("WARNING: World Model state not found in checkpoint (likely from a pre-Dyna run). Starting Fresh.")
+            
+        if "wm_optimizer_state_dict" in ckpt:
+            wm_optimizer.load_state_dict(ckpt["wm_optimizer_state_dict"])
+            print("World Model Optimizer state loaded.")
 
         if "global_step" in ckpt:
             start_global_step = ckpt["global_step"]
@@ -127,6 +146,7 @@ def train_ppo(
 
         # [NEW] Track intrinsic rewards
         episodic_intrinsic_rewards = []
+        episodic_intrinsic_rewards_max = [] # [NEW] Track max surprise 
 
         for t in range(cfg.num_steps):
             global_step += num_envs
@@ -136,7 +156,7 @@ def train_ppo(
                 
                 # [NEW] Intrinsic Motivation Calculation
                 # We do this inside no_grad because we don't want gradients during collection
-                pred_next_obs, _ = world_model(obs_t, action) 
+                pred_next_obs, pred_reward = world_model(obs_t, action) 
 
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
@@ -150,18 +170,36 @@ def train_ppo(
             
             real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
 
-            # [NEW] Compute Surprise
+            # [NEW] Compute Surprise (State + Reward)
             with torch.no_grad():
-                # We use MSE as surprise. 
-                # Note: This is an aggregation over (C, H, W). 
-                # We want a scalar per environment.
+                # 1. State Surprise (Visual)
+                # MSE over (C, H, W), summed or averaged? 
+                # previously: surprise.view(num_envs, -1).mean(dim=1) -> Mean MSE per pixel.
                 # pred_next_obs: (B, C, H, W), real_next_obs_t: (B, C, H, W)
-                surprise = torch.nn.functional.mse_loss(pred_next_obs, real_next_obs_t, reduction='none')
-                # Sum over C, H, W to get surprise per env
-                surprise_per_env = surprise.view(num_envs, -1).mean(dim=1) 
+                state_surprise_loss = torch.nn.functional.mse_loss(pred_next_obs, real_next_obs_t, reduction='none')
+                state_surprise = state_surprise_loss.view(num_envs, -1).mean(dim=1) 
                 
-                intrinsic_reward = intrinsic_coef * surprise_per_env
+                # 2. Reward Surprise (Dynamics)
+                # pred_reward: (B,), reward: (B,)
+                real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
+                reward_surprise_loss = torch.nn.functional.mse_loss(pred_reward, real_reward_t, reduction='none')
+                reward_surprise = reward_surprise_loss # Already (B,)
+                
+                # 3. Combined Surprise
+                # We simply sum them. 
+                total_surprise = state_surprise + reward_surprise
+                
+                # [NEW] Amplified Error Logic
+                # Instead of normalizing (which can go negative or be too small),
+                # we amplify the error and clip it.
+                # error=0.0002 -> reward=0.1
+                # error=0.1 -> reward=50 -> clipped to 0.5
+                raw_intrinsic = total_surprise * intrinsic_coef 
+                intrinsic_reward = torch.clamp(raw_intrinsic, 0.0, intrinsic_reward_clip)
+
+                
                 episodic_intrinsic_rewards.append(intrinsic_reward.mean().item())
+                episodic_intrinsic_rewards_max.append(intrinsic_reward.max().item()) # [NEW]
 
             # [NEW] Update manual trackers
             running_returns += reward
@@ -347,9 +385,12 @@ def train_ppo(
             
         # [NEW] Log Intrinsic Reward Components
         mean_intrinsic = np.mean(episodic_intrinsic_rewards)
+        max_intrinsic = np.max(episodic_intrinsic_rewards_max) # [NEW]
         mean_total_abs = buffer.rewards.abs().mean().item()
         
         logger.scalar("ppo/intrinsic_reward_mean", mean_intrinsic, global_step)
+        logger.scalar("ppo/intrinsic_reward_max", max_intrinsic, global_step) # [NEW]
+
         # Ratio of intrinsic to total signal magnitude
         if mean_total_abs > 1e-6:
             logger.scalar("ppo/intrinsic_reward_ratio", mean_intrinsic / mean_total_abs, global_step)
@@ -359,6 +400,12 @@ def train_ppo(
         logger.scalar("charts/learning_rate", lrnow, global_step)
         logger.scalar("charts/heartbeat", global_step, global_step)
         logger.scalar("charts/reward_step_mean", buffer.rewards.mean().item(), global_step) # Note: this includes intrinsic
+        
+        # [NEW] More granular reward stats
+        logger.scalar("charts/reward_step_max", buffer.rewards.max().item(), global_step)
+        logger.scalar("charts/reward_step_std", buffer.rewards.std().item(), global_step)
+
+
 
         sps = int(global_step / max(1e-9, (time.time() - start_time)))
         logger.scalar("charts/SPS", sps, global_step)
@@ -369,6 +416,11 @@ def train_ppo(
                 {
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    
+                    # [NEW] Save World Model State
+                    "world_model_state_dict": world_model.state_dict(),
+                    "wm_optimizer_state_dict": wm_optimizer.state_dict(),
+                    
                     "cfg": cfg.__dict__,
                     "global_step": global_step,
                 },

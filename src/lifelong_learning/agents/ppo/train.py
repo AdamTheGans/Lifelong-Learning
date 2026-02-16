@@ -14,6 +14,8 @@ register(
 )
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
+# [REMOVED] RunningMeanStd - switching to simple EMA
+
 
 
 from lifelong_learning.agents.ppo.network import CNNActorCritic
@@ -39,11 +41,13 @@ def train_ppo(
     anneal_lr: bool = True,
     resume_path: str | None = None,
 
-    intrinsic_coef: float = 500.0, # [NEW] Amplified Error Coefficient (was 0.02)
+    intrinsic_coef: float = 500.0, # [NEW] Amplified Error Coefficient
     intrinsic_reward_clip: float = 0.5, # [NEW] Cap for intrinsic reward
+    intrinsic_noise_threshold: float = 0.02, # [NEW] Hard Noise Gate
     imagined_horizon: int = 5,    # [NEW] Dream length
-    wm_lr: float = 1e-4,          # [NEW] Slower World Model (was 1e-3)
+    wm_lr: float = 1e-4,          # [NEW] Slower World Model
 ):
+
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -78,7 +82,10 @@ def train_ppo(
     wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr) # [MODIFIED] Slow down WM
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
     
-    # [REMOVED] Running Mean Std for Curiosity (Z-Score was unstable)
+    # [NEW] Hard Noise Gate Logic
+    # No more EMA. We use a static threshold to filter noise.
+
+
 
 
     # [RESUME LOGIC]
@@ -189,13 +196,29 @@ def train_ppo(
                 # We simply sum them. 
                 total_surprise = state_surprise + reward_surprise
                 
-                # [NEW] Amplified Error Logic
-                # Instead of normalizing (which can go negative or be too small),
-                # we amplify the error and clip it.
-                # error=0.0002 -> reward=0.1
-                # error=0.1 -> reward=50 -> clipped to 0.5
-                raw_intrinsic = total_surprise * intrinsic_coef 
+                # [NEW] Hard Noise Gate Logic
+                # ---------------------------
+                # Absolute Novelty: If error > threshold, it's a signal. Else, it's noise.
+                # This ensures that during regime switches (high error), rewards stay high.
+                # Threshold default: 0.02
+                
+                # Create mask: 1.0 if surprise > threshold, 0.0 otherwise
+                noise_mask = (total_surprise > intrinsic_noise_threshold).float()
+                
+                # Apply mask
+                signal_surprise = total_surprise * noise_mask
+                
+                # Compute reward
+                raw_intrinsic = signal_surprise * intrinsic_coef
+                
+                # 4. Clip to [0, max]
                 intrinsic_reward = torch.clamp(raw_intrinsic, 0.0, intrinsic_reward_clip)
+ 
+                # [NEW] Debug Logging
+                logger.scalar("debug/wm_raw_error_mean", total_surprise.mean().item(), global_step)
+                # logger.scalar("debug/wm_running_mean", running_mean_error, global_step) # Removed
+                logger.scalar("debug/intrinsic_reward_raw", raw_intrinsic.mean().item(), global_step)
+
 
                 
                 episodic_intrinsic_rewards.append(intrinsic_reward.mean().item())

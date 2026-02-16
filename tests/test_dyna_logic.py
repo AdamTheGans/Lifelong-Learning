@@ -100,7 +100,7 @@ class TestDynaLogic(unittest.TestCase):
         
         # Verify shape
         expected_shape = (num_envs, C, H, W)
-from lifelong_learning.utils.running_stats import RunningMeanStd
+
 import numpy as np
 
 class TestDynaLogic(unittest.TestCase):
@@ -178,46 +178,55 @@ class TestDynaLogic(unittest.TestCase):
         expected_shape = (num_envs, C, H, W)
         self.assertEqual(start_states.shape, expected_shape)
 
-    def test_amplified_error_logic(self):
-        # [NEW] Verify Amplified Error Logic
-        # Formula: reward = clamp(error * coef, 0.0, clip)
+    def test_hard_noise_gate(self):
+        # [NEW] Verify Hard Noise Gate Logic (Absolute Novelty)
         
         coef = 500.0
         clip = 0.5
+        threshold = 0.02
         
-        # Case 1: Boring transition (low error)
-        # error = 0.0002 -> reward = 0.1
-        boring_error = 0.0002
-        reward_boring = min(clip, boring_error * coef)
-        self.assertAlmostEqual(reward_boring, 0.1)
-        self.assertLess(reward_boring, clip)
+        # 1. Noise (< Threshold)
+        # error = 0.01
+        # reward should be 0.0
+        noise_error = 0.01
         
-        # Case 2: Surprising transition (high error)
-        # error = 0.1 -> reward = 50.0 -> clipped to 0.5
-        surprise_error = 0.1
-        reward_surprise = min(clip, surprise_error * coef)
-        self.assertEqual(reward_surprise, clip)
+        # Logic: (error > threshold).float() * error * coef
+        mask = 1.0 if noise_error > threshold else 0.0
+        reward_noise = min(clip, max(0.0, noise_error * mask * coef))
+        self.assertEqual(reward_noise, 0.0)
         
-        # Case 3: Zero error
-        zero_error = 0.0
-        reward_zero = min(clip, zero_error * coef)
-        self.assertEqual(reward_zero, 0.0)
+        # 2. Signal (> Threshold)
+        # error = 0.05
+        # reward = 0.05 * 500 = 25 -> clipped to 0.5
+        signal_error = 0.05
+        mask = 1.0 if signal_error > threshold else 0.0
+        reward_signal = min(clip, max(0.0, signal_error * mask * coef))
+        self.assertEqual(reward_signal, clip)
         
-        # Case 4: Edge case (exact clip boundary)
-        # error = 0.001 -> reward = 0.5
-        edge_error = 0.001
-        reward_edge = min(clip, edge_error * coef)
-        self.assertEqual(reward_edge, 0.5)
+        # 3. Sustained High Error (Regime Switch)
+        # Verify NO DECAY
+        regime_error = 0.1
+        rewards = []
+        for _ in range(10):
+            # Logic remains stateless
+            mask = 1.0 if regime_error > threshold else 0.0
+            r = min(clip, max(0.0, regime_error * mask * coef))
+            rewards.append(r)
+            
+        # All rewards should be identical and high
+        self.assertTrue(all(r == clip for r in rewards))
+        self.assertEqual(len(rewards), 10)
 
     def test_intrinsic_rewards_non_negative(self):
         # Ensure logic doesn't produce negative rewards
         coef = 500.0
         clip = 0.5
+        mean = 0.1
         
-        # Random errors should always be positive (MSE Loss is always >= 0)
+        # Random errors 
         errors = torch.rand(100) * 0.5 # [0, 0.5]
         
-        rewards = torch.clamp(errors * coef, 0.0, clip)
+        rewards = torch.clamp((errors - mean) * coef, 0.0, clip)
         
         self.assertTrue(torch.all(rewards >= 0.0))
         self.assertTrue(torch.all(rewards <= clip))

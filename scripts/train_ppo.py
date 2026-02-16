@@ -36,6 +36,7 @@ def main():
     p.add_argument("--mode", type=str, default="dyna", choices=["dyna", "passive"], help="regime: 'dyna' (active) or 'passive' (baseline)")
     p.add_argument("--intrinsic_coef", type=float, default=500.0, help="Coefficient for intrinsic curiosity reward (Amplified Error)")
     p.add_argument("--intrinsic_reward_clip", type=float, default=0.5, help="Max intrinsic reward per step")
+    p.add_argument("--intrinsic_noise_threshold", type=float, default=0.02, help="Error threshold for intrinsic reward (Hard Gate)")
     p.add_argument("--imagined_horizon", type=int, default=5, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model Learning Rate")
 
@@ -76,6 +77,7 @@ def main():
         intrinsic_coef=intrinsic_coef, # [NEW]
         imagined_horizon=imagined_horizon, # [NEW]
         intrinsic_reward_clip=args.intrinsic_reward_clip, # [NEW]
+        intrinsic_noise_threshold=args.intrinsic_noise_threshold, # [NEW]
         wm_lr=args.wm_lr, # [NEW]
     )
 

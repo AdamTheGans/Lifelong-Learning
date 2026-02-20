@@ -60,6 +60,27 @@ class CNNActorCritic(nn.Module):
             nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
+        
+        # [FIX] Specific Init for Heads
+        # Actor: gain 0.01 (Near uniform policy at start)
+        for layer in self.actor_head:
+            if isinstance(layer, nn.Linear):
+                if layer == self.actor_head[-1]:
+                    nn.init.orthogonal_(layer.weight, gain=0.01)
+                else:
+                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+        # Critic: gain 1.0 (Standard for value function)
+        for layer in self.critic_head:
+            if isinstance(layer, nn.Linear):
+                if layer == self.critic_head[-1]:
+                    nn.init.orthogonal_(layer.weight, gain=1.0)
+                else:
+                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
     def forward(self, obs: torch.Tensor):
         # Input is already float one-hot, just pass to encoder

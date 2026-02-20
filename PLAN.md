@@ -52,7 +52,7 @@ Training occurs in three phases per update:
 ### 2. Baseline: Dyna-PPO (Single Model)
 - Establish performance of the single-model Dyna approach.
 - Measure how quickly the WM adapts vs. how quickly it forgets old regimes.
-- **Status**: [/] In Progress.
+- **Status**: [x] Working (Refined & Audited).
 
 ### 3. Future Direction A: Multi-Head World Model
 - **Idea**: Detect surprise spikes (high prediction error) and spawn/switch to new network heads.

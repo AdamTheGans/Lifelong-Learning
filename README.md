@@ -92,6 +92,6 @@ tensorboard --logdir runs
 To resume training from a checkpoint:
 
 ```bash
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --resume_path checkpoints/baseline_stationary_update170.pt --no-anneal_lr
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --resume_path checkpoints/baseline_stationary_update170.pt
 ```
 *Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*

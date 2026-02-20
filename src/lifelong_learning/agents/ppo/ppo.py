@@ -51,7 +51,19 @@ def ppo_update(
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
         # Value loss
-        v_loss = 0.5 * (returns - new_values).pow(2).mean()
+        # [FIX] Value Clipping (Standard PPO)
+        new_values = new_values.view(-1)
+        if cfg.clip_coef > 0:
+            v_clipped = old_values + torch.clamp(
+                new_values - old_values,
+                -cfg.clip_coef,
+                cfg.clip_coef,
+            )
+            v_loss_unclipped = (new_values - returns).pow(2)
+            v_loss_clipped = (v_clipped - returns).pow(2)
+            v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+        else:
+            v_loss = 0.5 * (returns - new_values).pow(2).mean()
 
         # Entropy
         ent_loss = entropy.mean()

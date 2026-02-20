@@ -162,8 +162,9 @@ class SimpleWorldModel(nn.Module):
             next_obs_discrete = self.discretize_state(next_obs_pred)
             
             # 4. Store transition
-            # Using 0 for done/truncated for simplicity in dreams (infinite horizon assumption or fixed horizon)
-            dones = torch.zeros(curr_obs.shape[0], device=curr_obs.device)
+            # [FIX] termination heuristic: In DualGoal, reward > 0 means goal reached (done)
+            # We use a threshold of 0.5 for stability.
+            dones = (reward_pred > 0.5).float()
             
             trajectories.append({
                 "obs": curr_obs,

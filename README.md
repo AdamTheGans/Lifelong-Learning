@@ -99,11 +99,8 @@ python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --tota
 # View results in browser
 tensorboard --logdir runs
 
-# View plots
+# Create detailed analysis plots
 python scripts/analyze_runs.py
-
-# Create nice regime switching plot
-python scripts/visualize_regimes.py --logdir runs/dyna_regime_switch_slow
 ```
 
 ### 1.6 Resume Training
@@ -111,6 +108,6 @@ python scripts/visualize_regimes.py --logdir runs/dyna_regime_switch_slow
 To resume training from a checkpoint:
 
 ```bash
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --resume_path checkpoints/baseline_stationary_update170.pt
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 1500000 --run_name ppo_stationary --resume_path checkpoints/ppo_stationary_update170.pt
 ```
 *Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*

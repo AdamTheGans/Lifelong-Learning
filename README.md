@@ -55,26 +55,39 @@ python scripts/verify_rewards.py
 python scripts/check_vec_env.py
 ```
 
-### 1.3 Train PPO
+### 1.3 Train Normal PPO
 
 ```bash
 # Stationary (no regime switching)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --no-anneal_lr
+python scripts/train_ppo.py --mode passive --total_timesteps 1000000 --run_name ppo_stationary
 
-# Dyna Mode (Active Dreaming + Curiosity)
-python scripts/train_ppo.py --mode dyna --total_timesteps 500000 --run_name dyna_run
+# Regime switching (slow)
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --total_timesteps 2500000 --steps_per_regime 45000 --run_name ppo_regime_switch_slow
 
-# Passive Mode (Standard PPO Baseline)
-python scripts/train_ppo.py --mode passive --total_timesteps 500000 --run_name passive_run
+# Regime switching (fast)
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --total_timesteps 1500000 --steps_per_regime 20000 --run_name ppo_regime_switch_fast
 ```
 
-### 1.4 View Results
+### 1.4 Train Dyna-PPO
+
+```bash
+# Stationary (no regime switching)
+python scripts/train_ppo.py --mode dyna --total_timesteps 1000000 --run_name dyna_stationary
+
+# Regime switching (slow)
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --total_timesteps 2500000 --steps_per_regime 45000 --run_name dyna_regime_switch_slow
+
+# Regime switching (fast)
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --total_timesteps 1500000 --steps_per_regime 20000 --run_name dyna_regime_switch_fast
+```
+
+### 1.5 View Results
 
 ```bash
 tensorboard --logdir runs
 ```
 
-### 1.5 Resume Training
+### 1.6 Resume Training
 
 To resume training from a checkpoint:
 

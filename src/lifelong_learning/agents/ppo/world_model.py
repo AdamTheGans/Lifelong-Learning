@@ -56,7 +56,7 @@ class SimpleWorldModel(nn.Module):
         action: (B,) int
         
         Returns:
-            next_obs_pred: (B, C, H, W) logits (or raw values for MSE)
+            next_obs_pred: (B, C, H, W) logits (unnormalized scores)
             reward_pred: (B,)
         """
         B = obs.shape[0]

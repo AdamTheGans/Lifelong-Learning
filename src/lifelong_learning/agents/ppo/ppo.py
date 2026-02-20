@@ -24,6 +24,7 @@ class PPOConfig:
 
     seed: int = 0
     device: str = "cuda"
+    mode: str = "dyna"
 
 
 def ppo_update(

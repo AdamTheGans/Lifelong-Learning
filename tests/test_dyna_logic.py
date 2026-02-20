@@ -215,3 +215,38 @@ class TestDynaLogic(unittest.TestCase):
         
         self.assertTrue(torch.all(rewards >= 0.0))
         self.assertTrue(torch.all(rewards <= clip))
+
+    def test_cross_entropy_intrinsic_reward(self):
+        # [NEW] Verify CrossEntropy Logic used in train.py
+        B, C, H, W = 2, 3, 4, 4
+        
+        # 1. Mock Preds (Logits)
+        pred_next_obs = torch.randn(B, C, H, W)
+        
+        # 2. Mock Real (One-Hot)
+        real_next_obs = torch.zeros(B, C, H, W)
+        # Set some "correct" classes
+        target_indices = torch.randint(0, C, (B, H, W))
+        for b in range(B):
+            for h in range(H):
+                for w in range(W):
+                    c = target_indices[b, h, w]
+                    real_next_obs[b, c, h, w] = 1.0
+                    
+        # 3. Logic from train.py
+        # Convert One-Hot target to indices
+        target_indices_recovered = torch.argmax(real_next_obs, dim=1)
+        self.assertTrue(torch.equal(target_indices, target_indices_recovered))
+        
+        # Compute CrossEntropy Loss (no reduction)
+        # Expected shape: (B, H, W)
+        loss = torch.nn.functional.cross_entropy(pred_next_obs, target_indices_recovered, reduction='none')
+        self.assertEqual(loss.shape, (B, H, W))
+        
+        # Aggregate spatial dimensions -> (B,)
+        surprise = loss.mean(dim=[1, 2])
+        self.assertEqual(surprise.shape, (B,))
+        
+        # Verify values are positive (CrossEntropy is always non-negative)
+        self.assertTrue(torch.all(surprise >= 0.0))
+

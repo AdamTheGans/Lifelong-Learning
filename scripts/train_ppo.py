@@ -29,12 +29,12 @@ def main():
     p.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint.pt to resume from")
     
     # Annealing
-    p.add_argument("--anneal_lr", action="store_true", default=True)
-    p.add_argument("--no-anneal_lr", action="store_false", dest="anneal_lr")
+    p.add_argument("--anneal_lr", action="store_true", default=False, help="Enable linear decay of learning rate to 0")
+    p.add_argument("--no-anneal_lr", action="store_false", dest="anneal_lr", help="Use constant learning rate (Recommended for Lifelong)")
     
     # [NEW] Dyna-PPO / Passive Mode
     p.add_argument("--mode", type=str, default="dyna", choices=["dyna", "passive"], help="regime: 'dyna' (active) or 'passive' (baseline)")
-    p.add_argument("--intrinsic_coef", type=float, default=0.1, help="Coefficient for intrinsic curiosity reward (Pure Proportional)")
+    p.add_argument("--intrinsic_coef", type=float, default=0.015, help="Coefficient for intrinsic curiosity reward (Pure Proportional)")
     p.add_argument("--intrinsic_reward_clip", type=float, default=0.1, help="Max intrinsic reward per step")
     p.add_argument("--imagined_horizon", type=int, default=5, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model Learning Rate")
@@ -57,6 +57,7 @@ def main():
         num_steps=args.num_steps,
         seed=args.seed,
         device=args.device,
+        mode=args.mode,
     )
 
     # NOTE: Ensure agents/ppo/train.py:train_ppo accepts these new kwargs

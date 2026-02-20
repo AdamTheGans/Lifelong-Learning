@@ -166,10 +166,12 @@ def train_ppo(
             # Handle autoreset: use final_observation for surprise calc on done envs
             real_next_obs = next_obs.copy()
             if "final_observation" in infos:
-                for idx, final_obs in enumerate(infos["final_observation"]):
-                    if final_obs is not None:
-                        real_next_obs[idx] = final_obs
-
+                # Use _final_observation mask if available, or assume all done envs have it
+                final_obs_mask = infos.get("_final_observation", done)
+                for i, is_final in enumerate(final_obs_mask):
+                    if is_final and i < len(infos["final_observation"]):
+                         real_next_obs[i] = infos["final_observation"][i]
+            
             real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
 
             # Compute intrinsic reward (surprise signal)
@@ -232,26 +234,31 @@ def train_ppo(
                     logger.scalar("charts/episodic_return", running_returns[i], global_step)
                     logger.scalar("charts/episodic_length", running_lengths[i], global_step)
 
-                    if "final_info" in infos:
-                        for final_info in infos["final_info"]:
-                            if final_info is not None:
-                                outcome = 0  # timeout
-                                if final_info.get("reached_good_goal", 0.0) > 0:
-                                    outcome = 1  # success
-                                elif final_info.get("reached_bad_goal", 0.0) > 0:
-                                    outcome = -1  # failure
+                    # Extract Goal Outcomes
+                    outcome = 0  # timeout/other
+                    
+                    # Safe access: default to 0.0 if key missing
+                    reached_good = infos["reached_good_goal"][i] if "reached_good_goal" in infos else 0.0
+                    reached_bad = infos["reached_bad_goal"][i] if "reached_bad_goal" in infos else 0.0
+                    # timed_out check can be inferred or explicit if key exists
+                    
+                    if reached_good > 0:
+                        outcome = 1  # success
+                    elif reached_bad > 0:
+                        outcome = -1  # failure
+                    
+                    outcome_window.append(outcome)
 
-                                outcome_window.append(outcome)
+                    if len(outcome_window) > 0:
+                        success_rate = sum(1 for x in outcome_window if x == 1) / len(outcome_window)
+                        failure_rate = sum(1 for x in outcome_window if x == -1) / len(outcome_window)
+                        timeout_rate = sum(1 for x in outcome_window if x == 0) / len(outcome_window)
 
-                                if len(outcome_window) > 0:
-                                    success_rate = sum(1 for x in outcome_window if x == 1) / len(outcome_window)
-                                    failure_rate = sum(1 for x in outcome_window if x == -1) / len(outcome_window)
-                                    timeout_rate = sum(1 for x in outcome_window if x == 0) / len(outcome_window)
+                        logger.scalar("charts/success_rate", success_rate, global_step)
+                        logger.scalar("charts/failure_rate", failure_rate, global_step)
+                        logger.scalar("charts/timeout_rate", timeout_rate, global_step)
 
-                                    logger.scalar("charts/success_rate", success_rate, global_step)
-                                    logger.scalar("charts/failure_rate", failure_rate, global_step)
-                                    logger.scalar("charts/timeout_rate", timeout_rate, global_step)
-
+                    # Regime tracking
                     if "regime_id" in infos:
                         regime = infos["regime_id"][i]
                         logger.scalar(f"charts/r_regime_{regime}", running_returns[i], global_step)

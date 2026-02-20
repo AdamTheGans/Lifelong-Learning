@@ -1,7 +1,6 @@
 from gymnasium.envs.registration import register
 from lifelong_learning.envs.dual_goal import DualGoalEnv
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
-from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.make_env import make_env
 
 register(

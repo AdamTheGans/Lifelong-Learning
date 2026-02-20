@@ -5,9 +5,7 @@ import numpy as np
 
 from gymnasium.wrappers import TimeLimit
 from minigrid.wrappers import FullyObsWrapper
-from lifelong_learning.envs.minigrid_obs import MiniGridImageObsWrapper
 from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
-from lifelong_learning.envs.dreamer_compat import DreamerReadyWrapper
 from lifelong_learning.envs.wrappers.action_reduce import ActionReduceWrapper
 from lifelong_learning.envs.wrappers.one_hot import OneHotPartialObsWrapper
 
@@ -46,34 +44,22 @@ class RollingAvgWrapper(gym.Wrapper):
 
         return obs, reward, terminated, truncated, info
 
-def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatible: bool = False, **kwargs):
-    symbolic = kwargs.get("symbolic", True)
-    
-    # In pixel mode (dreamer + not symbolic), we need render_mode and tile_size
-    # In symbolic mode or PPO mode, no rendering needed
-    if dreamer_compatible and not symbolic:
-        render_mode = "rgb_array"
-        tile_kwargs = {"tile_size": 8}
-    else:
-        render_mode = None
-        tile_kwargs = {}
+def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
+    # Standard PPO setup: No rendering needed for training
+    render_mode = None
+    tile_kwargs = {}
     
     env = gym.make(env_id, render_mode=render_mode, max_episode_steps=256, **tile_kwargs)
     
-    # Full observability: both PPO and DreamerV3 see the entire 8×8 grid
+    # Full observability: PPO sees the entire 8×8 grid
     # instead of the default partial 7×7 agent-centered view.
     env = FullyObsWrapper(env)
     
-    # Disable FOV shading for DreamerV3 pixel mode
-    if dreamer_compatible and not symbolic:
-        env.unwrapped.highlight = False
-    
-    # 0. Reduce action space for DreamerV3 (Discrete(7) → Discrete(3))
+    # 0. Reduce action space (Discrete(7) → Discrete(3))
     # Must come BEFORE TimeLimit so all wrappers see reduced space.
     # MiniGrid actions 0=left, 1=right, 2=forward — the only ones needed
-    # for navigation. Removing pickup/drop/toggle/done cuts exploration space.
-    if dreamer_compatible:
-        env = ActionReduceWrapper(env, actions=[0, 1, 2])
+    # for navigation. Removing pickup/drop/toggle/done cuts exploration space significantly.
+    env = ActionReduceWrapper(env, actions=[0, 1, 2])
     
     # 1. Apply Strict TimeLimit
     # MiniGrid envs generally have a TimeLimit by default via registration.
@@ -83,13 +69,8 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
     
     # 2. Image Obs Wrapper (One-Hot for Symbolic)
     # Replaces MiniGridImageObsWrapper for PPO
-    # And is applied before DreamerReadyWrapper for Dreamer
-    if not dreamer_compatible:
-        # PPO requires just the Tensor (Box)
-        env = OneHotPartialObsWrapper(env, dict_mode=False)
-    elif dreamer_compatible and symbolic:
-         # Dreamer requires Dict with 'image' key
-         env = OneHotPartialObsWrapper(env, dict_mode=True)
+    # PPO requires just the Tensor (Box), so dict_mode=False
+    env = OneHotPartialObsWrapper(env, dict_mode=False)
     
     # 3. Regime Wrapper (Logic for swapping goals)
     env = RegimeGoalSwapWrapper(
@@ -100,13 +81,6 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, dreamer_compatib
         seed=seed,
     )
 
-    if dreamer_compatible:
-        env = DreamerReadyWrapper(
-            env,
-            oracle_mode=kwargs.get("oracle_mode", False),
-            symbolic=symbolic,
-        )
-    
     # NOTE: record_stats is handled at the VectorEnv level in train.py
     # to ensure it captures returns even after wrappers modify them.
 

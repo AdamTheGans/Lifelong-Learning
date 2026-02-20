@@ -11,7 +11,7 @@ class OneHotPartialObsWrapper(gym.ObservationWrapper):
         env: The environment to wrap
         dict_mode (bool): If True, returns observation as a Dict {'image': ...}.
                           If False, returns just the image tensor (Box).
-                          Default True (for backward compatibility/Dreamer).
+                          Default True.
     """
     def __init__(self, env, dict_mode=True):
         super().__init__(env)

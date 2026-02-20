@@ -10,15 +10,11 @@ from lifelong_learning.envs.make_env import make_env
 class BaseEnvIntegrity(object):
     """
     Base class for environment integrity tests.
-    Subclasses must implement setUp to create either a Dreamer or PPO env.
     """
-    def setUpEnv(self, dreamer_compatible):
-        self.dreamer_compatible = dreamer_compatible
+    def setUpEnv(self):
         self.env = make_env(
             env_id="MiniGrid-DualGoal-8x8-v0",
             seed=42,
-            dreamer_compatible=dreamer_compatible,
-            symbolic=True,
             steps_per_regime=1000,
         )
         self.obs_shape = (21, 8, 8) 
@@ -28,15 +24,12 @@ class BaseEnvIntegrity(object):
             self.env.close()
 
     def get_raw_obs(self, obs):
-        """Standardizes observation format between Dreamer (dict) and PPO (tensor)."""
-        if self.dreamer_compatible:
-            return obs['image']
+        """Standardizes observation format."""
         return obs
 
     def decode_observation(self, obs):
         """
         Decodes the observation back to its component grids.
-        Handles both flattened (Dreamer) and 3D (PPO) formats.
         """
         flat_obs = self.get_raw_obs(obs)
         
@@ -63,7 +56,7 @@ class BaseEnvIntegrity(object):
 
     def test_data_integrity(self):
         """Data Type & Range Sanity"""
-        print(f"\n=== Test: Data Integrity ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Data Integrity (PPO) ===")
         obs, _ = self.env.reset()
         raw_obs = self.get_raw_obs(obs)
         
@@ -72,16 +65,13 @@ class BaseEnvIntegrity(object):
                         "Observation must be purely One-Hot (0.0 or 1.0).")
         
         # Check Shape
-        if self.dreamer_compatible:
-            self.assertEqual(raw_obs.shape, (1344,), "Dreamer obs should be flattened vector of 1344 (21*8*8)")
-        else:
-            self.assertEqual(raw_obs.shape, (21, 8, 8), "PPO obs should be 3D tensor (21, 8, 8)")
+        self.assertEqual(raw_obs.shape, (21, 8, 8), "PPO obs should be 3D tensor (21, 8, 8)")
             
         print("PASSED")
 
     def test_reset_cleanliness(self):
         """Reset Cleanliness"""
-        print(f"\n=== Test: Reset Cleanliness ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Reset Cleanliness (PPO) ===")
         self.env.reset()
         self.env.step(self.env.action_space.sample())
         
@@ -96,16 +86,15 @@ class BaseEnvIntegrity(object):
 
     def test_full_compass_sweep(self):
         """Full Compass Sweep (0,1,2,3) verification"""
-        print(f"\n=== Test: Full Compass Sweep ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Full Compass Sweep (PPO) ===")
         self.env.reset()
         
         for i in range(4):
             current_dir_gt = self.env.unwrapped.agent_dir
             
-            # Action: Right turn (PPO uses standard minigrid, but make_env might wrap it)
-            # In make_env: if dreamer_compatible, ActionReduceWrapper is applied.
-            # If not, no ActionReduce. 
-            # MiniGrid standard: 1 = Right, 0 = Left, 2 = Forward
+            # Action: Right turn (Action 1)
+            # PPO now uses ActionReduceWrapper (0=left, 1=right, 2=forward)
+            # MiniGrid standard: 1 = Right
             step_action = 1 
             obs, _, _, _, _ = self.env.step(step_action)
             
@@ -128,14 +117,14 @@ class BaseEnvIntegrity(object):
         
     def test_scenario_collision(self):
         """Collision/Physics Test"""
-        print(f"\n=== Test: Collision Physics ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Collision Physics (PPO) ===")
         self.env.reset()
         
         self.env.unwrapped.agent_pos = np.array([1, 1])
         self.env.unwrapped.agent_dir = 2 # West
         
         start_pos = self.env.unwrapped.agent_pos.copy()
-        obs, _, _, _, _ = self.env.step(2) # Forward
+        obs, _, _, _, _ = self.env.step(2) # Forward (Action 2)
         
         end_pos = self.env.unwrapped.agent_pos
         self.assertTrue(np.array_equal(start_pos, end_pos), "Agent should have collided!")
@@ -147,7 +136,7 @@ class BaseEnvIntegrity(object):
 
     def test_scenario_basic_navigation(self):
         """Scenario: Basic Navigation (Empty path)"""
-        print(f"\n=== Test: Basic Navigation ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Basic Navigation (PPO) ===")
         self.env.reset()
         
         # Place agent in a clear spot
@@ -156,7 +145,7 @@ class BaseEnvIntegrity(object):
         
         start_pos = self.env.unwrapped.agent_pos.copy()
         
-        # Action: Forward
+        # Action: Forward (Action 2)
         obs, _, _, _, _ = self.env.step(2)
         
         end_pos = self.env.unwrapped.agent_pos
@@ -172,7 +161,7 @@ class BaseEnvIntegrity(object):
 
     def test_color_isolation(self):
         """Color Channel Isolation"""
-        print(f"\n=== Test: Color Isolation ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Color Isolation (PPO) ===")
         obs, _ = self.env.reset()
         raw_obs = self.get_raw_obs(obs)
         
@@ -198,7 +187,7 @@ class BaseEnvIntegrity(object):
 
     def test_scenario_goals(self):
         """Scenario: Goals correctness and distinctness"""
-        print(f"\n=== Test: Goal Correctness ({'Dreamer' if self.dreamer_compatible else 'PPO'}) ===")
+        print(f"\n=== Test: Goal Correctness (PPO) ===")
         self.env.reset()
         
         goal_pos = self.env.unwrapped.green_goal_pos
@@ -213,13 +202,9 @@ class BaseEnvIntegrity(object):
         self.assertAlmostEqual(reward, 4.99, places=2)
         print("PASSED")
 
-class TestDreamerEnvIntegrity(BaseEnvIntegrity, unittest.TestCase):
-    def setUp(self):
-        self.setUpEnv(dreamer_compatible=True)
-
 class TestPPOEnvIntegrity(BaseEnvIntegrity, unittest.TestCase):
     def setUp(self):
-        self.setUpEnv(dreamer_compatible=False)
+        self.setUpEnv()
 
 if __name__ == '__main__':
     unittest.main()

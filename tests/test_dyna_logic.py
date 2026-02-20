@@ -178,44 +178,29 @@ class TestDynaLogic(unittest.TestCase):
         expected_shape = (num_envs, C, H, W)
         self.assertEqual(start_states.shape, expected_shape)
 
-    def test_hard_noise_gate(self):
-        # [NEW] Verify Hard Noise Gate Logic (Absolute Novelty)
+    def test_proportional_reward(self):
+        # [NEW] Verify Pure Proportional Reward Logic
         
-        coef = 500.0
-        clip = 0.5
-        threshold = 0.02
+        coef = 0.1
+        clip = 0.1
         
-        # 1. Noise (< Threshold)
-        # error = 0.01
-        # reward should be 0.0
-        noise_error = 0.01
+        # 1. Small Error (0.01)
+        # reward = 0.01 * 0.1 = 0.001
+        small_error = 0.01
+        reward_small = min(clip, max(0.0, small_error * coef))
+        self.assertAlmostEqual(reward_small, 0.001)
         
-        # Logic: (error > threshold).float() * error * coef
-        mask = 1.0 if noise_error > threshold else 0.0
-        reward_noise = min(clip, max(0.0, noise_error * mask * coef))
-        self.assertEqual(reward_noise, 0.0)
+        # 2. Large Error (0.5) (e.g., Regime Switch)
+        # reward = 0.05 (No gating, immediate signal)
+        large_error = 0.5
+        reward_large = min(clip, max(0.0, large_error * coef))
+        self.assertAlmostEqual(reward_large, 0.05)
         
-        # 2. Signal (> Threshold)
-        # error = 0.05
-        # reward = 0.05 * 500 = 25 -> clipped to 0.5
-        signal_error = 0.05
-        mask = 1.0 if signal_error > threshold else 0.0
-        reward_signal = min(clip, max(0.0, signal_error * mask * coef))
-        self.assertEqual(reward_signal, clip)
-        
-        # 3. Sustained High Error (Regime Switch)
-        # Verify NO DECAY
-        regime_error = 0.1
-        rewards = []
-        for _ in range(10):
-            # Logic remains stateless
-            mask = 1.0 if regime_error > threshold else 0.0
-            r = min(clip, max(0.0, regime_error * mask * coef))
-            rewards.append(r)
-            
-        # All rewards should be identical and high
-        self.assertTrue(all(r == clip for r in rewards))
-        self.assertEqual(len(rewards), 10)
+        # 3. Huge Error (2.0)
+        # reward = 0.2 -> clipped to 0.1
+        huge_error = 2.0
+        reward_huge = min(clip, max(0.0, huge_error * coef))
+        self.assertEqual(reward_huge, clip)
 
     def test_intrinsic_rewards_non_negative(self):
         # Ensure logic doesn't produce negative rewards

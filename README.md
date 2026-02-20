@@ -12,11 +12,9 @@ Lifelong-Learning/
 │   ├── envs/                     # Environment definitions
 │   │   ├── dual_goal.py          # MiniGrid-DualGoal-8x8-v0 (two goals, +5 / -1)
 │   │   ├── regime_wrapper.py     # Non-stationary reward switching
-│   │   ├── dreamer_compat.py     # DreamerReadyWrapper (symbolic/pixel obs, log/ keys)
-│   │   ├── make_env.py           # Env factory (FullyObsWrapper + PPO/Dreamer routing)
-│   │   ├── minigrid_obs.py       # Image obs wrapper (Legacy)
+│   │   ├── make_env.py           # Env factory (FullyObsWrapper + ActionReduce)
 │   │   └── wrappers/
-│   │       ├── action_reduce.py  # Discrete(7) → Discrete(3) for Dreamer
+│   │       ├── action_reduce.py  # Discrete(7) → Discrete(3) optimization
 │   │       └── one_hot.py        # Unified Observation Wrapper (One-Hot Encoding)
 │   ├── agents/ppo/               # PPO agent implementation
 │   └── utils/                    # Logging, seeding utilities
@@ -24,21 +22,21 @@ Lifelong-Learning/
 │   ├── check_env.py              # Env sanity check (regime switching)
 │   ├── check_vec_env.py          # VectorEnv sanity check
 │   ├── verify_rewards.py         # Reward correctness check
-│   ├── train_ppo.py              # PPO training script
-│   ├── train_dreamerv3_minigrid.py   # DreamerV3 training script
-│   ├── check_dreamer_env_io.py       # Dreamer I/O contract check
-│   ├── diagnostic_env_check.py       # Full pipeline diagnostic
-│   └── analyze_runs.py               # Training run analyzer + plots
-├── third_party/dreamerv3/        # Vendored DreamerV3 (git submodule)
+│   ├── train_ppo.py              # PPO training script (Dyna-PPO)
+│   └── analyze_runs.py           # Training run analyzer + plots
 ├── tests/
-├── requirements.txt              # PPO dependencies
+├── requirements.txt              # Dependencies
 ├── pyproject.toml
 └── PLAN.md                       # Research roadmap
 ```
 
 ---
 
-## Part 1: PPO Baseline
+## Part 1: Dyna-PPO Baseline
+
+The active training pipeline uses **Dyna-PPO**, which augments a standard PPO agent with a `SimpleWorldModel` sidekick. The World Model provides:
+1. **Intrinsic Curiosity**: Reward augmentation based on prediction error (surprise).
+2. **Dreaming**: Generates imagined trajectories to train the policy on latent/predicted transitions (Dyna-style).
 
 ### 1.1 Install
 
@@ -63,14 +61,14 @@ python scripts/check_vec_env.py
 # Stationary (no regime switching)
 python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --no-anneal_lr
 
-# Slow regime switching (15k steps per regime)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 15000 --run_name exp_slow_switch --no-anneal_lr
+# Dyna Mode (Active Dreaming + Curiosity)
+python scripts/train_ppo.py --mode dyna --total_timesteps 500000 --run_name dyna_run
 
-# Fast regime switching (3.5k steps per regime)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --steps_per_regime 3500 --run_name exp_fast_switch --no-anneal_lr
+# Passive Mode (Standard PPO Baseline)
+python scripts/train_ppo.py --mode passive --total_timesteps 500000 --run_name passive_run
 ```
 
-### 1.4 View PPO Results
+### 1.4 View Results
 
 ```bash
 tensorboard --logdir runs
@@ -78,140 +76,9 @@ tensorboard --logdir runs
 
 ### 1.5 Resume Training
 
-To resume training from a checkpoint (e.g., if a run didn't converge):
+To resume training from a checkpoint:
 
 ```bash
 python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 750000 --run_name baseline_stationary --resume_path checkpoints/baseline_stationary_update170.pt --no-anneal_lr
 ```
 *Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*
-
----
-
-## Part 2: DreamerV3
-
-### 2.1 Install
-
-<details>
-<summary><b>Linux / Colab (GPU) — Recommended</b></summary>
-
-```bash
-# 1. Pull DreamerV3 submodule
-git submodule update --init --recursive
-
-# 2. Create venv
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# 3. Install project + Dreamer deps
-pip install -U pip setuptools wheel
-pip install -e .
-pip install -r third_party/dreamerv3/requirements.txt
-
-# 4. Verify GPU
-python -c "import jax; print(jax.devices())"  # Should show GPU
-```
-
-</details>
-
-<details>
-<summary><b>Windows (CPU only)</b></summary>
-
-> **Note:** Native Windows NVIDIA GPU is not supported by JAX. Use WSL2 for GPU support.
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-
-# Pull submodule
-git submodule update --init --recursive
-
-# Set PYTHONPATH
-$env:PYTHONPATH="$PWD\third_party\dreamerv3;$env:PYTHONPATH"
-
-# Install Dreamer deps (excluding JAX/NVIDIA)
-Get-Content third_party/dreamerv3/requirements.txt | Where-Object { $_ -notmatch "jax|nvidia" } | Set-Content dreamerv3_requirements.txt
-pip install -U -r dreamerv3_requirements.txt
-
-# Install CPU-only JAX for the correct version
-pip install -U "jax[cpu]==0.4.33"
-
-# Verify
-python -c "import dreamerv3, embodied; import jax; print('OK'); print('devices:', jax.devices())"
-```
-
-</details>
-
-### 2.2 Sanity Checks
-
-```bash
-# Full pipeline diagnostic (obs quality, action space, termination, reward distribution)
-python scripts/diagnostic_env_check.py
-
-# Dreamer I/O contract check (50-step smoke test)
-python scripts/check_dreamer_env_io.py
-
-# Comprehensive Environment Integrity Test (Obs, Physics, Rewards)
-python tests/test_env_integrity.py
-```
-
-### 2.3 Train DreamerV3
-
-All tuned defaults are built into the script. No flags needed for a standard run.
-
-```bash
-# Smoke test (~minutes, good for validating setup)
-python scripts/train_dreamerv3_minigrid.py --run.steps 10000
-
-# If running on CPU, add `--jax.platform cpu`
-
-# Full stationary run (100k steps, ~30-60min on Colab GPU)
-python scripts/train_dreamerv3_minigrid.py
-
-# Add regime switching (after stationary baseline is solid)
-python scripts/train_dreamerv3_minigrid.py --env.steps_per_regime 15000
-
-# Revert to pixel-based observations (64×64 RGB)
-python scripts/train_dreamerv3_minigrid.py --env.symbolic False
-
-# To resume from the latest checkpoint:
-python scripts/train_dreamerv3_minigrid.py --resume --run.steps 200000
-```
-
-> [!NOTE]
-> When resuming, you must set `--run.steps` to a value *larger* than the steps already completed in the checkpoint, otherwise the training will terminate immediately.
-
-
-**Observation modes:**
-- **Symbolic (default):** unified One-Hot float tensor `(20, 8, 8)` → MLP encoder.
-    - **Unified Strategy:** Both PPO and DreamerV3 now see the exact same mathematically correct representation.
-    - **Encoding:** Object Type (11), Color (6), State (3) are one-hot encoded and concatenated.
-    - DreamerV3 receives this as a flattened vector `(1280,)`. PPO receives it as a `(20, 8, 8)` tensor.
-    - *Note: DreamerV3 automatically detects 1D inputs as vectors (MLP) and 3D inputs as images (CNN). By flattening to `(1280,)`, we ensure it uses the correct MLP encoder without applying image augmentations.*
-- **Pixel:** `(64, 64, 3)` uint8 RGB from `env.render()` → CNN encoder. Set `--env.symbolic False`.
-
-Both PPO and DreamerV3 use `FullyObsWrapper` for full 8×8 grid observability (no partial view).
-
-**Built-in defaults** (overridable via CLI):
-| Setting | Value | Rationale |
-|---|---|---|
-| `--configs` | `size12m` | 12M-param model (256 units) |
-| `--run.steps` | `100000` | Sanity run length |
-| `--run.envs` | `4` | Parallel envs for data diversity |
-| `--run.train_ratio` | `64` | Gradient steps per env step |
-| `--agent.imag_length` | `64` | Imagination horizon (256-step episodes) |
-| `--batch_size` | `16` | Replay batch size |
-| `--env.symbolic` | `True` | Symbolic obs (MLP) vs pixel obs (CNN) |
-
-A resolved config is automatically saved to `logdir/<run>/config_resolved.json`.
-
-### 2.4 Analyze Results
-
-```bash
-# Interactive analyzer with plots
-python scripts/analyze_runs.py
-
-# Or point directly at a run
-python scripts/analyze_runs.py logdir/<run_folder>
-
-# TensorBoard
-tensorboard --logdir logdir
-```

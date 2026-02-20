@@ -41,12 +41,12 @@ def train_ppo(
     anneal_lr: bool = True,
     resume_path: str | None = None,
 
-    intrinsic_coef: float = 500.0, # [NEW] Amplified Error Coefficient
-    intrinsic_reward_clip: float = 0.5, # [NEW] Cap for intrinsic reward
-    intrinsic_noise_threshold: float = 0.02, # [NEW] Hard Noise Gate
+    intrinsic_coef: float = 0.1,  # [NEW] Pure Proportional Coefficient
+    intrinsic_reward_clip: float = 0.1, # [NEW] Cap for intrinsic reward
     imagined_horizon: int = 5,    # [NEW] Dream length
     wm_lr: float = 1e-4,          # [NEW] Slower World Model
 ):
+
 
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
@@ -196,27 +196,19 @@ def train_ppo(
                 # We simply sum them. 
                 total_surprise = state_surprise + reward_surprise
                 
-                # [NEW] Hard Noise Gate Logic
-                # ---------------------------
-                # Absolute Novelty: If error > threshold, it's a signal. Else, it's noise.
-                # This ensures that during regime switches (high error), rewards stay high.
-                # Threshold default: 0.02
-                
-                # Create mask: 1.0 if surprise > threshold, 0.0 otherwise
-                noise_mask = (total_surprise > intrinsic_noise_threshold).float()
-                
-                # Apply mask
-                signal_surprise = total_surprise * noise_mask
+                # [NEW] Pure Proportional Reward Logic
+                # ------------------------------------
+                # No gates, no thresholds. Just a subtle "breadcrumb" signal.
+                # Coefficient is small (0.1) so 0.05 error -> 0.005 reward.
                 
                 # Compute reward
-                raw_intrinsic = signal_surprise * intrinsic_coef
+                raw_intrinsic = total_surprise * intrinsic_coef
                 
                 # 4. Clip to [0, max]
                 intrinsic_reward = torch.clamp(raw_intrinsic, 0.0, intrinsic_reward_clip)
  
                 # [NEW] Debug Logging
                 logger.scalar("debug/wm_raw_error_mean", total_surprise.mean().item(), global_step)
-                # logger.scalar("debug/wm_running_mean", running_mean_error, global_step) # Removed
                 logger.scalar("debug/intrinsic_reward_raw", raw_intrinsic.mean().item(), global_step)
 
 
@@ -363,36 +355,38 @@ def train_ppo(
             
         # 5. Bootstrap Value for the last step
         # The last trajectory item has 'next_obs' which is the state *after* the horizon
-        last_dream_obs = imagined_trajectories[-1]["next_obs"]
-        with torch.no_grad():
-            _, last_dream_value = model.forward(last_dream_obs)
+        if imagined_trajectories:
+            last_dream_obs = imagined_trajectories[-1]["next_obs"]
+            with torch.no_grad():
+                _, last_dream_value = model.forward(last_dream_obs)
+                
+            # 6. Compute GAE for Dream
+            dream_buffer.compute_returns_and_advantages(last_dream_value, cfg.gamma, cfg.gae_lambda)
             
-        # 6. Compute GAE for Dream
-        dream_buffer.compute_returns_and_advantages(last_dream_value, cfg.gamma, cfg.gae_lambda)
-        
-        # 7. Update PPO on Dream Data
-        # We use a reduced number of epochs (e.g., 1) to avoid over-optimizing on dreams
-        dream_stats = []
-        dream_minibatches = dream_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-        
-        for obs, actions, logprobs, advantages, returns, values, _, _ in dream_minibatches:
-            # We must ensure NO gradients flow to world model. 
-            # generate_imagined_trajectories uses 'torch.no_grad()' for world model forward, so we are safe.
-            # The 'obs' in dream_buffer are detached tensors.
+            # 7. Update PPO on Dream Data
+            # We use a reduced number of epochs (e.g., 1) to avoid over-optimizing on dreams
+            dream_stats = []
+            dream_minibatches = dream_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
             
-            ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-            stats = ppo_update(model, optimizer, [ppo_batch], cfg)
-            dream_stats.append(stats)
+            for obs, actions, logprobs, advantages, returns, values, _, _ in dream_minibatches:
+                # We must ensure NO gradients flow to world model. 
+                # generate_imagined_trajectories uses 'torch.no_grad()' for world model forward, so we are safe.
+                # The 'obs' in dream_buffer are detached tensors.
+                
+                ppo_batch = [obs, actions, logprobs, advantages, returns, values]
+                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
+                dream_stats.append(stats)
 
-        # Log Dream Stats
-        avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}
-        for k, v in avg_dream_stats.items():
-            logger.scalar(k, v, global_step)
-            
-        # [NEW] Log Dream Value/Return stats
-        if len(dream_stats) > 0:
-             logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), global_step)
-             logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), global_step)
+            # Log Dream Stats
+            if dream_stats:
+                avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}
+                for k, v in avg_dream_stats.items():
+                    logger.scalar(k, v, global_step)
+                
+            # [NEW] Log Dream Value/Return stats
+            if len(dream_stats) > 0:
+                 logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), global_step)
+                 logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), global_step)
 
         # -------------------------------
 

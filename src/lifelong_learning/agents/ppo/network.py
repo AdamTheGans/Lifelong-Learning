@@ -2,27 +2,28 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
+
 
 class CNNActorCritic(nn.Module):
     """
-    Stronger architecture for MiniGrid.
-    Expects One-Hot encoded input from environment wrapper.
-    Decouples Actor and Critic heads for better convergence.
+    Actor-Critic network for MiniGrid with One-Hot encoded observations.
+
+    Architecture:
+        - Shared 3-layer CNN encoder (input channels → 32 → 64 → 64)
+        - Decoupled Actor head (policy logits) and Critic head (state value)
+
+    Input:  (B, C, H, W) one-hot tensor from OneHotPartialObsWrapper
+    Output: (logits, value)
     """
 
     def __init__(self, obs_shape: tuple[int, int, int], n_actions: int):
         super().__init__()
-        # obs_shape is now (20, H, W) -> pre-encoded one-hot
         self.c, self.h, self.w = obs_shape
-        
-        # Input is already One-Hot encoded by wrapper
-        input_channels = self.c
 
-        # Shared Feature Extractor
+        # Shared CNN feature extractor
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
+            nn.Conv2d(self.c, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -31,69 +32,63 @@ class CNNActorCritic(nn.Module):
             nn.Flatten(),
         )
 
-        # Compute flat size
         with torch.no_grad():
-            # Dummy input to calculate size
-            dummy = torch.zeros(1, input_channels, self.h, self.w)
+            dummy = torch.zeros(1, self.c, self.h, self.w)
             flat_size = self.encoder(dummy).shape[1]
 
-        # Decoupled Heads
-        # Actor Head
+        # Actor head (policy)
         self.actor_head = nn.Sequential(
             nn.Linear(flat_size, 256),
             nn.ReLU(),
             nn.Linear(256, n_actions)
         )
 
-        # Critic Head
+        # Critic head (value function)
         self.critic_head = nn.Sequential(
             nn.Linear(flat_size, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
 
-        # Initialization
+        # Weight initialization
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
+        """Orthogonal init with role-specific gains for output layers."""
         if isinstance(m, (nn.Linear, nn.Conv2d)):
             nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        
-        # [FIX] Specific Init for Heads
-        # Actor: gain 0.01 (Near uniform policy at start)
+
+        # Actor output: gain=0.01 → near-uniform initial policy
         for layer in self.actor_head:
             if isinstance(layer, nn.Linear):
-                if layer == self.actor_head[-1]:
-                    nn.init.orthogonal_(layer.weight, gain=0.01)
-                else:
-                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                gain = 0.01 if layer == self.actor_head[-1] else np.sqrt(2)
+                nn.init.orthogonal_(layer.weight, gain=gain)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
 
-        # Critic: gain 1.0 (Standard for value function)
+        # Critic output: gain=1.0 → standard for value function
         for layer in self.critic_head:
             if isinstance(layer, nn.Linear):
-                if layer == self.critic_head[-1]:
-                    nn.init.orthogonal_(layer.weight, gain=1.0)
-                else:
-                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                gain = 1.0 if layer == self.critic_head[-1] else np.sqrt(2)
+                nn.init.orthogonal_(layer.weight, gain=gain)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
 
     def forward(self, obs: torch.Tensor):
-        # Input is already float one-hot, just pass to encoder
         features = self.encoder(obs)
         return self.actor_head(features), self.critic_head(features).squeeze(-1)
 
     def act(self, obs: torch.Tensor):
+        """Sample an action and return (action, log_prob, entropy, value)."""
         logits, value = self.forward(obs)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value
 
     def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor):
+        """Evaluate given actions and return (log_prob, entropy, value)."""
         logits, value = self.forward(obs)
         dist = torch.distributions.Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value

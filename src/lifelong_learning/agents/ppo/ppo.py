@@ -7,8 +7,8 @@ import torch.nn as nn
 
 @dataclass
 class PPOConfig:
-    total_timesteps: int = 500_000   # Increased slightly
-    num_envs: int = 16               # Increased for stability
+    total_timesteps: int = 500_000
+    num_envs: int = 16
     num_steps: int = 128
     update_epochs: int = 4
     minibatch_size: int = 256
@@ -19,7 +19,7 @@ class PPOConfig:
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5
-    lr: float = 3e-4        # Slightly higher starting LR since we decay it now
+    lr: float = 3e-4
     max_grad_norm: float = 0.5
 
     seed: int = 0
@@ -34,8 +34,8 @@ def ppo_update(
     cfg: PPOConfig,
 ):
     """
-    Performs PPO updates for one rollout buffer.
-    Returns logging scalars.
+    Performs one round of PPO clipped updates over the given minibatches.
+    Returns averaged logging scalars.
     """
     total_pg, total_v, total_ent, total_loss = 0.0, 0.0, 0.0, 0.0
     n = 0
@@ -45,13 +45,12 @@ def ppo_update(
         logratio = new_logprobs - old_logprobs
         ratio = torch.exp(logratio)
 
-        # Policy loss (clipped)
+        # Clipped policy loss
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef)
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-        # Value loss
-        # [FIX] Value Clipping (Standard PPO)
+        # Clipped value loss (prevents large value function updates)
         new_values = new_values.view(-1)
         if cfg.clip_coef > 0:
             v_clipped = old_values + torch.clamp(
@@ -65,7 +64,7 @@ def ppo_update(
         else:
             v_loss = 0.5 * (returns - new_values).pow(2).mean()
 
-        # Entropy
+        # Entropy bonus (encourages exploration)
         ent_loss = entropy.mean()
 
         loss = pg_loss - cfg.ent_coef * ent_loss + cfg.vf_coef * v_loss

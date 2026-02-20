@@ -23,11 +23,11 @@ We use a custom **8x8 MiniGrid** environment with two colored squares (Goals).
 ### 1. Simple World Model
 A lightweight, feed-forward MLP (not CNN/RNN) designed for Symbolic (One-Hot) observations.
 - **Input**:
-    - **State**: Flattened One-Hot Tensor (20x8x8 → Vector).
+    - **State**: Flattened One-Hot Tensor (21x8x8 → Vector).
     - **Action**: Learned Embedding (dim=32).
 - **Network**: Concatenates [State, Action] → 2-layer MLP → Heads.
 - **Outputs**:
-    - **Next State**: Logits for Cross-Entropy Loss (predicts next One-Hot grid).
+    - **Next State**: Logits for Cross-Entropy Loss (predicts next One-Hot grid, 21 channels).
     - **Reward**: Scalar prediction.
 - **Key Feature**: `discretize_state` — forcing predicted states back into crisp 0/1 One-Hot vectors to prevent "blurry dreams."
 

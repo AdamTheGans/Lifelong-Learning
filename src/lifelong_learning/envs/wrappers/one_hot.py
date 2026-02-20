@@ -4,14 +4,17 @@ from gymnasium.spaces import Box
 
 class OneHotPartialObsWrapper(gym.ObservationWrapper):
     """
-    Wrapper to convert MiniGrid 'image' observation (H, W, 3) into a One-Hot encoded 
-    float tensor (20, H, W).
-    
+    Converts MiniGrid 'image' observation (H, W, 3) into a one-hot float tensor (21, H, W).
+
+    Channels breakdown:
+        - 11 object types  (Empty, Wall, Floor, Door, Key, Ball, Box, Goal, Lava, Agent, ...)
+        -  6 colors        (Red, Green, Blue, Purple, Yellow, Grey)
+        -  4 states        (Open, Closed, Locked + agent direction)
+        = 21 total channels
+
     Args:
-        env: The environment to wrap
-        dict_mode (bool): If True, returns observation as a Dict {'image': ...}.
-                          If False, returns just the image tensor (Box).
-                          Default True.
+        env: The environment to wrap.
+        dict_mode: If True, returns {'image': tensor}. If False, returns tensor directly.
     """
     def __init__(self, env, dict_mode=True):
         super().__init__(env)
@@ -24,10 +27,7 @@ class OneHotPartialObsWrapper(gym.ObservationWrapper):
         
         self.total_channels = self.num_objs + self.num_cols + self.num_states
         
-        # Get old shape (H, W, 3)
         h, w, c = env.observation_space['image'].shape
-        
-        # New shape: (20, H, W)
         new_space = Box(
             low=0.0, 
             high=1.0, 

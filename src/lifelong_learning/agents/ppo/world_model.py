@@ -5,19 +5,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
 class SimpleWorldModel(nn.Module):
     """
-    A lightweight World Model valid for PPO sidekick duties.
-    Predicts Next State and Reward from (State, Action).
-    
+    Lightweight feed-forward World Model for symbolic (One-Hot) observations.
+
+    Predicts next state and reward from (state, action).
+
     Architecture:
-    - State Encoder: Flatten -> Linear -> ReLU
-    - Action Embedding: Embedding
-    - Core: Concat(State, Action) -> MLP -> ReLU
-    - Heads:
-        - Next State: Linear -> Reshape to (C, H, W)
-        - Reward: Linear -> Scalar
+        - State encoder: Flatten → Linear → ReLU
+        - Action embedding: Embedding(n_actions, 32)
+        - Core: Concat([state, action_emb]) → 2-layer MLP
+        - Heads:
+            - Next State: Linear → reshape to (C, H, W) logits
+            - Reward: Linear → scalar
     """
+
     def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256):
         super().__init__()
         self.obs_shape = obs_shape
@@ -25,18 +28,15 @@ class SimpleWorldModel(nn.Module):
         self.n_actions = n_actions
         self.flat_obs_dim = self.c * self.h * self.w
 
-        # Action Embedding
-        self.action_emb = nn.Embedding(original_count := n_actions, embedding_dim := 32)
+        self.action_emb = nn.Embedding(n_actions, 32)
 
-        # Joint Encoder
         self.encoder = nn.Sequential(
-            nn.Linear(self.flat_obs_dim + embedding_dim, hidden_dim),
+            nn.Linear(self.flat_obs_dim + 32, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
 
-        # Heads
         self.next_state_head = nn.Linear(hidden_dim, self.flat_obs_dim)
         self.reward_head = nn.Linear(hidden_dim, 1)
 
@@ -52,120 +52,79 @@ class SimpleWorldModel(nn.Module):
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor):
         """
-        obs: (B, C, H, W)
-        action: (B,) int
-        
+        Args:
+            obs:    (B, C, H, W) one-hot observation
+            action: (B,) integer actions
+
         Returns:
-            next_obs_pred: (B, C, H, W) logits (unnormalized scores)
-            reward_pred: (B,)
+            next_obs_pred: (B, C, H, W) logits (for CrossEntropy loss)
+            reward_pred:   (B,) scalar reward prediction
         """
         B = obs.shape[0]
-        
-        # Flatten Obs
         flat_obs = obs.reshape(B, -1)
-        
-        # Embed Action
         act_emb = self.action_emb(action)
-        
-        # Concat
         x = torch.cat([flat_obs, act_emb], dim=1)
-        
-        # Encode
         features = self.encoder(x)
-        
-        # Predict
+
         next_obs_flat = self.next_state_head(features)
         reward_pred = self.reward_head(features).squeeze(-1)
-        
-        # Reshape next_obs
         next_obs_pred = next_obs_flat.reshape(B, self.c, self.h, self.w)
-        
+
         return next_obs_pred, reward_pred
 
     def discretize_state(self, continuous_obs: torch.Tensor) -> torch.Tensor:
         """
-        Converts continuous World Model outputs back into a valid One-Hot encoded state.
-        
+        Convert continuous WM output back into a valid one-hot state.
+
+        Takes argmax along the channel dimension and re-encodes as one-hot,
+        preventing "blurry dreams" from accumulating prediction noise.
+
         Args:
-            continuous_obs: (B, C, H, W) float tensor
-            
+            continuous_obs: (B, C, H, W) float logits
         Returns:
-            discrete_obs: (B, C, H, W) float tensor (containing only 0.0 and 1.0)
+            discrete_obs: (B, C, H, W) float tensor containing only 0.0 and 1.0
         """
-        # 1. Identify the most likely channel (category) for each pixel
-        # shape: (B, H, W)
-        max_indices = torch.argmax(continuous_obs, dim=1)
-        
-        # 2. Convert back to One-Hot
-        # shape: (B, H, W, C)
-        one_hot = F.one_hot(max_indices, num_classes=self.c)
-        
-        # 3. Permute back to (B, C, H, W) and float
-        # shape: (B, C, H, W)
-        discrete_obs = one_hot.permute(0, 3, 1, 2).float()
-        
+        max_indices = torch.argmax(continuous_obs, dim=1)          # (B, H, W)
+        one_hot = F.one_hot(max_indices, num_classes=self.c)       # (B, H, W, C)
+        discrete_obs = one_hot.permute(0, 3, 1, 2).float()        # (B, C, H, W)
         return discrete_obs
 
     def generate_imagined_trajectories(
-        self, 
-        policy_net: nn.Module, 
-        start_states: torch.Tensor, 
+        self,
+        policy_net: nn.Module,
+        start_states: torch.Tensor,
         horizon: int
     ) -> list[dict]:
         """
-        Generates imagined trajectories using the World Model and Policy.
-        
+        Roll out imagined trajectories using the WM as a simulator (Dyna-style).
+
+        The policy selects actions, the WM predicts next states/rewards, and
+        states are discretized each step to maintain valid one-hot encoding.
+        All operations are under no_grad — PPO treats imagined data the same
+        as real data (fixed collection, then update).
+
         Args:
-            policy_net: The PPO Actor-Critic network
-            start_states: (B, C, H, W) tensor from the real buffer
-            horizon: Int, number of steps to dream
-            
+            policy_net:   PPO Actor-Critic network
+            start_states: (B, C, H, W) seed states sampled from the replay buffer
+            horizon:      number of imagination steps
+
         Returns:
-            list of transition dicts: {
-                'obs': (B, ...), 
-                'actions': (B,), 
-                'logprobs': (B,), 
-                'rewards': (B,), 
-                'dones': (B,), 
-                'values': (B,), 
-                'next_obs': (B, ...)
-            }
+            List of transition dicts, one per timestep:
+                {obs, actions, logprobs, rewards, dones, values, next_obs}
         """
         trajectories = []
         curr_obs = start_states
-        
-        # We process 'horizon' steps
+
         for _ in range(horizon):
-            # 1. Action Selection (Policy)
-            # Note: distinct from real env step, we use the policy on the *imagined* observation
-            # We must ensure gradients flow through the policy for PPO, but NOT through the world model
-            # For the *input* to the policy, we treat it as ground truth state.
             with torch.no_grad():
-                # We typically don't backprop through the *generation* of the data for PPO 
-                # (PPO assumes fixed data collection).
-                # So we can run this completely in no_grad for data generation efficiency, 
-                # OR we might want gradients for solving differentiable planning?
-                # User request: "gradients are strictly blocked from updating the World Model's weights".
-                # Standard Dyna-PPO: Collect imagined data (no grad), then train PPO on it (grad).
                 action, logprob, _, value = policy_net.act(curr_obs)
-            
-            # 2. World Model Prediction
-            # We need the prediction to advance the state
-            # For "Dyna", we treat the World Model as an Environment.
-            # We do NOT propagate gradients from the policy loss into the World Model.
-            # So this forward pass is also effectively no_grad or detached.
-            with torch.no_grad():
                 next_obs_pred, reward_pred = self.forward(curr_obs, action)
-            
-            # 3. Handle Hallucinations (Discrete State Enforcement)
-            # This is crucial for the "Symbolic" environment consistency
+
             next_obs_discrete = self.discretize_state(next_obs_pred)
-            
-            # 4. Store transition
-            # [FIX] termination heuristic: In DualGoal, reward > 0 means goal reached (done)
-            # We use a threshold of 0.5 for stability.
+
+            # Termination heuristic: reward > 0.5 implies goal reached
             dones = (reward_pred > 0.5).float()
-            
+
             trajectories.append({
                 "obs": curr_obs,
                 "actions": action,
@@ -175,8 +134,7 @@ class SimpleWorldModel(nn.Module):
                 "values": value,
                 "next_obs": next_obs_discrete
             })
-            
-            # 5. Advance
+
             curr_obs = next_obs_discrete
-            
+
         return trajectories

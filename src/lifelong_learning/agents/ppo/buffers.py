@@ -6,7 +6,10 @@ import torch
 
 class RolloutBuffer:
     """
-    Stores (T, N) rollout for PPO, then computes GAE advantages and returns.
+    Fixed-size rollout buffer for PPO with GAE-Lambda advantage estimation.
+
+    Stores transitions in (T, N) layout where T = num_steps and N = num_envs.
+    Also stores next_obs for World Model supervised training.
     """
 
     def __init__(self, num_steps: int, num_envs: int, obs_shape, device: torch.device):
@@ -21,7 +24,7 @@ class RolloutBuffer:
         self.rewards = torch.zeros((num_steps, num_envs), device=device)
         self.dones = torch.zeros((num_steps, num_envs), device=device)
         self.values = torch.zeros((num_steps, num_envs), device=device)
-        self.next_obs = torch.zeros((num_steps, num_envs) + obs_shape, device=device) # [NEW] For World Model
+        self.next_obs = torch.zeros((num_steps, num_envs) + obs_shape, device=device)
 
         self.advantages = torch.zeros((num_steps, num_envs), device=device)
         self.returns = torch.zeros((num_steps, num_envs), device=device)
@@ -31,7 +34,7 @@ class RolloutBuffer:
     def add(self, obs, actions, logprobs, rewards, dones, values, next_obs):
         t = self.step
         self.obs[t].copy_(obs)
-        self.next_obs[t].copy_(next_obs) # [NEW]
+        self.next_obs[t].copy_(next_obs)
         self.actions[t].copy_(actions)
         self.logprobs[t].copy_(logprobs)
         self.rewards[t].copy_(rewards)
@@ -40,16 +43,13 @@ class RolloutBuffer:
         self.step += 1
 
     def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float):
-        # GAE-Lambda
+        """Compute GAE-Lambda advantages and discounted returns."""
         last_adv = torch.zeros(self.num_envs, device=self.device)
         for t in reversed(range(self.num_steps)):
             if t == self.num_steps - 1:
-                # If this was the last step of the buffer, we check if IT was terminal.
                 next_nonterminal = 1.0 - self.dones[t]
                 next_values = last_value
             else:
-                # We must use dones[t] to mask the transition from t -> t+1.
-                # The original code erroneously used dones[t+1].
                 next_nonterminal = 1.0 - self.dones[t]
                 next_values = self.values[t + 1]
 
@@ -60,22 +60,25 @@ class RolloutBuffer:
         self.returns = self.advantages + self.values
 
     def get_minibatches(self, minibatch_size: int, shuffle: bool = True):
-        # Flatten (T, N) -> (T*N)
+        """
+        Flatten (T, N) → (T*N) and yield minibatches.
+
+        Yields:
+            (obs, actions, logprobs, advantages, returns, values, next_obs, rewards)
+        """
         T, N = self.num_steps, self.num_envs
         batch_size = T * N
 
         b_obs = self.obs.reshape((batch_size,) + self.obs_shape)
-        b_next_obs = self.next_obs.reshape((batch_size,) + self.obs_shape) # [NEW]
+        b_next_obs = self.next_obs.reshape((batch_size,) + self.obs_shape)
         b_actions = self.actions.reshape(batch_size)
         b_logprobs = self.logprobs.reshape(batch_size)
         b_advantages = self.advantages.reshape(batch_size)
         b_returns = self.returns.reshape(batch_size)
         b_values = self.values.reshape(batch_size)
+        b_rewards = self.rewards.reshape(batch_size)
 
-        b_rewards = self.rewards.reshape(batch_size) # [NEW]
-        b_dones = self.dones.reshape(batch_size) # [NEW] (might as well)
-
-        # Normalize advantage
+        # Normalize advantages
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         idxs = np.arange(batch_size)

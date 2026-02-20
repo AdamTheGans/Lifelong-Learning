@@ -9,3 +9,12 @@ package-dir = {"" = "src"}
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Ignore pkg_resources deprecation warning from pygame
+    "ignore:pkg_resources is deprecated:DeprecationWarning",
+    
+    # Ignore gym env override warning
+    "ignore:.*Overriding environment.*:UserWarning",
+]

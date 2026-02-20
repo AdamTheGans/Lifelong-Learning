@@ -30,7 +30,7 @@ def main():
     p.add_argument("--mode", type=str, default="dyna", choices=["dyna", "passive"], help="'dyna' (WM + curiosity) or 'passive' (baseline PPO)")
     p.add_argument("--intrinsic_coef", type=float, default=0.015, help="Coefficient for intrinsic curiosity reward")
     p.add_argument("--intrinsic_reward_clip", type=float, default=0.1, help="Max intrinsic reward per step")
-    p.add_argument("--imagined_horizon", type=int, default=5, help="Length of imagined trajectories")
+    p.add_argument("--imagined_horizon", type=int, default=10, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model learning rate")
 
     args = p.parse_args()

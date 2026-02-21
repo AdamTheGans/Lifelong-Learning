@@ -68,6 +68,16 @@ Training occurs in three phases per update:
     - Training: Maintain a library of WMs. When a regime switch is detected (high surprise), spin up a new WM or retrieve a matching old one.
     - Dreaming: PPO practices on *all* known WMs in the library, preventing catastrophic forgetting of the policy.
 
+### 5. Meta-RL Hyperparameter Controller ("The Brain")
+- **Idea**: A second RL agent (the "Brain") observes training signals from the inner Dyna-PPO (surprise, success rate, losses, etc.) and learns to dynamically adjust hyperparameters (lr, entropy coef, intrinsic curiosity coef, imagined horizon) to maximize recovery speed after regime switches.
+- **Architecture**:
+    - The inner training loop is wrapped as a Gymnasium environment (`MetaEnv`).
+    - Brain observes a 15-dim signal vector every N inner updates.
+    - Brain outputs relative HP adjustments (multiplicative scaling) as continuous actions.
+    - Brain is trained via PPO on the meta-MDP with reward = Δ success_rate + α·Δ return − β·failure_rate.
+- **Key Files**: `src/lifelong_learning/agents/brain/`, `scripts/train_brain.py`
+- **Status**: [x] Implemented (awaiting experimental validation).
+
 ## Metrics & Evaluation
 - **Recovery usage**: Steps to reach optimal performance after a regime switch.
 - **Retained performance**: Zero-shot performance when returning to a known regime.

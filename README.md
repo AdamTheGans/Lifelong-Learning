@@ -111,3 +111,35 @@ To resume training from a checkpoint:
 python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 1500000 --run_name ppo_stationary --resume_path checkpoints/ppo_stationary_update170.pt
 ```
 *Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*
+
+---
+
+## Part 2: Meta-RL Hyperparameter Controller ("The Brain")
+
+A second RL agent that learns to adjust the Dyna-PPO agent's hyperparameters (learning rate, entropy coefficient, intrinsic curiosity coefficient, imagined dream horizon) in real-time to maximize recovery speed after regime switches.
+
+### 2.1 Smoke Test
+
+```bash
+python scripts/train_brain.py \
+    --inner_total_timesteps 50000 \
+    --inner_steps_per_regime 5000 \
+    --brain_episodes 2 \
+    --decision_interval 5 \
+    --run_name brain_smoke_test
+```
+
+### 2.2 Full Training
+
+```bash
+# Train Brain with regime switching
+python scripts/train_brain.py \
+    --inner_total_timesteps 250000 \
+    --inner_steps_per_regime 15000 \
+    --brain_episodes 50 \
+    --decision_interval 10 \
+    --run_name brain_full_run
+
+# View Brain + inner agent tensorboard logs
+tensorboard --logdir runs
+```

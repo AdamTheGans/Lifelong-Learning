@@ -13,6 +13,7 @@ import time
 import numpy as np
 import torch
 import gymnasium as gym
+from dataclasses import dataclass, field
 from collections import deque
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
@@ -24,7 +25,66 @@ from lifelong_learning.utils.logger import TBLogger
 from lifelong_learning.envs.make_env import make_env
 
 
-def train_ppo(
+# =========================================================================
+# Inner Training State (exposed for Meta-RL "Brain" controller)
+# =========================================================================
+
+@dataclass
+class InnerTrainState:
+    """
+    Mutable state of the inner Dyna-PPO training loop.
+
+    Exposed so the Brain meta-agent can:
+      1. Read training signals (stats, counters)
+      2. Write hyperparameter adjustments (lr, ent_coef, intrinsic_coef, imagined_horizon)
+    """
+    # --- Models & optimizers ---
+    model: CNNActorCritic = field(repr=False)
+    optimizer: torch.optim.Adam = field(repr=False)
+    world_model: SimpleWorldModel = field(repr=False)
+    wm_optimizer: torch.optim.Adam = field(repr=False)
+    buffer: RolloutBuffer = field(repr=False)
+
+    # --- Environments ---
+    envs: gym.vector.VectorEnv = field(repr=False)
+    obs_shape: tuple = field(default=())
+    n_actions: int = 0
+    num_envs: int = 16
+
+    # --- Config (mutable hyperparams the Brain can adjust) ---
+    cfg: PPOConfig = field(default_factory=PPOConfig)
+    intrinsic_coef: float = 0.1
+    intrinsic_reward_clip: float = 0.1
+    imagined_horizon: int = 5
+    anneal_lr: bool = True
+
+    # --- Counters ---
+    global_step: int = 0
+    current_update: int = 0
+    num_updates: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    # --- Live tensors ---
+    obs_t: torch.Tensor = field(default=None, repr=False)
+    device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+
+    # --- Per-env episode trackers ---
+    running_returns: np.ndarray = field(default=None, repr=False)
+    running_lengths: np.ndarray = field(default=None, repr=False)
+
+    # --- Outcome tracking ---
+    outcome_window: deque = field(default_factory=lambda: deque(maxlen=100))
+
+    # --- Logger ---
+    logger: TBLogger = field(default=None, repr=False)
+    run_name: str = ""
+
+    # --- Checkpointing ---
+    save_dir: str = "checkpoints"
+    save_every_updates: int = 50
+
+
+def init_inner_training(
     env_id: str,
     cfg: PPOConfig,
     *,
@@ -40,23 +100,21 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
-):
+) -> InnerTrainState:
     """
-    Main Dyna-PPO training loop.
+    Initialize all components of the Dyna-PPO inner training loop.
 
-    Each update cycle has three phases:
-        A) Collect real experience (with intrinsic curiosity reward)
-        B) Train World Model on real transitions (supervised)
-        C) Generate imagined trajectories and update policy on dreams
+    Returns an InnerTrainState that can be driven step-by-step via
+    run_inner_update(), or used internally by train_ppo().
     """
 
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
     # Environment Setup
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
 
     def make_thunk(i: int):
         def thunk():
@@ -74,9 +132,9 @@ def train_ppo(
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
     # Model & Optimizer Setup
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
 
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
@@ -85,9 +143,9 @@ def train_ppo(
     wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
     # Resume from Checkpoint
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
 
     start_global_step = 0
     if resume_path is not None and os.path.exists(resume_path):
@@ -115,9 +173,9 @@ def train_ppo(
             start_global_step = ckpt["global_step"]
             print(f"Resuming from global_step={start_global_step}")
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
     # Logging & Tracking
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------------------
 
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
@@ -131,196 +189,248 @@ def train_ppo(
     num_updates = cfg.total_timesteps // (num_envs * cfg.num_steps)
     global_step = start_global_step
     start_update = global_step // (num_envs * cfg.num_steps) + 1
-    start_time = time.time()
 
-    # Manual episode stats (per-env accumulators)
-    running_returns = np.zeros(num_envs)
-    running_lengths = np.zeros(num_envs, dtype=int)
+    return InnerTrainState(
+        model=model,
+        optimizer=optimizer,
+        world_model=world_model,
+        wm_optimizer=wm_optimizer,
+        buffer=buffer,
+        envs=envs,
+        obs_shape=obs_shape,
+        n_actions=n_actions,
+        num_envs=num_envs,
+        cfg=cfg,
+        intrinsic_coef=intrinsic_coef,
+        intrinsic_reward_clip=intrinsic_reward_clip,
+        imagined_horizon=imagined_horizon,
+        anneal_lr=anneal_lr,
+        global_step=global_step,
+        current_update=start_update,
+        num_updates=num_updates,
+        start_time=time.time(),
+        obs_t=obs_t,
+        device=device,
+        running_returns=np.zeros(num_envs),
+        running_lengths=np.zeros(num_envs, dtype=int),
+        outcome_window=deque(maxlen=100),
+        logger=logger,
+        run_name=run_name,
+        save_dir=save_dir,
+        save_every_updates=save_every_updates,
+    )
 
-    # Rolling window for outcome tracking (good goal / bad goal / timeout)
-    outcome_window = deque(maxlen=100)
 
-    print(f"Training on {device} with {num_envs} envs for {num_updates} updates (starting from update {start_update}).")
+# =========================================================================
+# Single Update Step (the core unit the Brain calls)
+# =========================================================================
 
-    # =========================================================================
-    # Helper Functions
-    # =========================================================================
+def run_inner_update(state: InnerTrainState) -> dict:
+    """
+    Run ONE Dyna-PPO update cycle (collect → train WM → dream → PPO update).
 
-    def collect_real_experience(global_step):
-        """Phase A: Interact with real environments and collect transitions."""
-        nonlocal obs_t, running_returns, running_lengths
+    Mutates `state` in place (global_step, current_update, obs_t, etc.)
+    and returns a stats dict with all signals the Brain needs.
 
-        episodic_intrinsic_rewards = []
-        episodic_intrinsic_rewards_max = []
+    Returns:
+        dict with keys like:
+          - "mean_episodic_return", "success_rate", "failure_rate"
+          - "mean_surprise", "wm_loss_state", "wm_loss_reward"
+          - "policy_entropy", "policy_loss", "value_loss"
+          - "current_lr", "current_ent_coef", "current_intrinsic_coef"
+          - "current_imagined_horizon", "global_step", "done"
+    """
 
-        for t in range(cfg.num_steps):
-            global_step += num_envs
+    s = state  # alias
+    update = s.current_update
 
-            with torch.no_grad():
-                action, logprob, entropy, value = model.act(obs_t)
-                pred_next_obs, pred_reward = world_model(obs_t, action)
+    if update > s.num_updates:
+        return {"done": True, "global_step": s.global_step}
 
-            next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
-            done = np.logical_or(terminated, truncated)
+    # -----------------------------------------------------------------
+    # Learning rate annealing
+    # -----------------------------------------------------------------
+    if s.anneal_lr:
+        frac = 1.0 - (update - 1.0) / s.num_updates
+        lrnow = frac * s.cfg.lr
+        s.optimizer.param_groups[0]["lr"] = lrnow
+    else:
+        lrnow = s.optimizer.param_groups[0]["lr"]
 
-            # Handle autoreset: use final_observation for surprise calc on done envs
-            real_next_obs = next_obs.copy()
-            if "final_observation" in infos:
-                # Use _final_observation mask if available, or assume all done envs have it
-                final_obs_mask = infos.get("_final_observation", done)
-                for i, is_final in enumerate(final_obs_mask):
-                    if is_final and i < len(infos["final_observation"]):
-                         real_next_obs[i] = infos["final_observation"][i]
-            
-            real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
+    s.buffer.reset()
 
-            # Compute intrinsic reward (surprise signal)
-            with torch.no_grad():
-                # State surprise: CrossEntropy between predicted and actual one-hot
-                target_indices = torch.argmax(real_next_obs_t, dim=1)  # (B, H, W)
-                state_loss = torch.nn.functional.cross_entropy(
-                    pred_next_obs, target_indices, reduction='none'
-                )  # (B, H, W)
-                state_surprise = state_loss.mean(dim=[1, 2])  # (B,)
+    # =====================================================================
+    # Phase A: Collect real experience
+    # =====================================================================
 
-                logger.scalar("debug/raw_cross_entropy_loss", state_surprise.mean().item(), global_step)
+    episodic_intrinsic_rewards = []
+    episodic_intrinsic_rewards_max = []
+    episodic_returns_this_update = []
 
-                # Reward surprise: MSE between predicted and actual reward
-                real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
-                reward_surprise = torch.nn.functional.mse_loss(
-                    pred_reward, real_reward_t, reduction='none'
-                )  # (B,)
+    for t in range(s.cfg.num_steps):
+        s.global_step += s.num_envs
 
-                # Combined surprise → intrinsic reward (zero in passive mode)
-                if cfg.mode == "passive":
-                    total_surprise = torch.zeros_like(state_surprise)
-                else:
-                    total_surprise = state_surprise + reward_surprise
+        with torch.no_grad():
+            action, logprob, entropy, value = s.model.act(s.obs_t)
+            pred_next_obs, pred_reward = s.world_model(s.obs_t, action)
 
-                # Pure proportional: scale by coefficient and clip
-                raw_intrinsic = total_surprise * intrinsic_coef
-                intrinsic_reward = torch.clamp(raw_intrinsic, 0.0, intrinsic_reward_clip)
+        next_obs, reward, terminated, truncated, infos = s.envs.step(action.cpu().numpy())
+        done = np.logical_or(terminated, truncated)
 
-                # Debug logging
-                logger.scalar("debug/wm_raw_error_mean", total_surprise.mean().item(), global_step)
-                logger.scalar("debug/intrinsic_reward_raw", raw_intrinsic.mean().item(), global_step)
+        # Handle autoreset: use final_observation for surprise calc on done envs
+        real_next_obs = next_obs.copy()
+        if "final_observation" in infos:
+            final_obs_mask = infos.get("_final_observation", done)
+            for i, is_final in enumerate(final_obs_mask):
+                if is_final and i < len(infos["final_observation"]):
+                     real_next_obs[i] = infos["final_observation"][i]
 
-                episodic_intrinsic_rewards.append(intrinsic_reward.mean().item())
-                episodic_intrinsic_rewards_max.append(intrinsic_reward.max().item())
+        real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=s.device)
 
-            # Update per-env episode trackers
-            running_returns += reward
-            running_lengths += 1
+        # Compute intrinsic reward (surprise signal)
+        with torch.no_grad():
+            target_indices = torch.argmax(real_next_obs_t, dim=1)
+            state_loss = torch.nn.functional.cross_entropy(
+                pred_next_obs, target_indices, reduction='none'
+            )
+            state_surprise = state_loss.mean(dim=[1, 2])
 
-            # Store transition (extrinsic + intrinsic reward)
-            total_reward = torch.tensor(reward, dtype=torch.float32, device=device) + intrinsic_reward
+            s.logger.scalar("debug/raw_cross_entropy_loss", state_surprise.mean().item(), s.global_step)
 
-            buffer.add(
-                obs=obs_t,
-                actions=action,
-                logprobs=logprob,
-                rewards=total_reward,
-                dones=torch.tensor(done, dtype=torch.float32, device=device),
-                values=value,
-                next_obs=real_next_obs_t,
+            real_reward_t = torch.tensor(reward, dtype=torch.float32, device=s.device)
+            reward_surprise = torch.nn.functional.mse_loss(
+                pred_reward, real_reward_t, reduction='none'
             )
 
-            obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
+            if s.cfg.mode == "passive":
+                total_surprise = torch.zeros_like(state_surprise)
+            else:
+                total_surprise = state_surprise + reward_surprise
 
-            # Log finished episodes
-            if np.any(done):
-                done_indices = np.where(done)[0]
-                for i in done_indices:
-                    logger.scalar("charts/episodic_return", running_returns[i], global_step)
-                    logger.scalar("charts/episodic_length", running_lengths[i], global_step)
+            raw_intrinsic = total_surprise * s.intrinsic_coef
+            intrinsic_reward = torch.clamp(raw_intrinsic, 0.0, s.intrinsic_reward_clip)
 
-                    # Extract Goal Outcomes
-                    outcome = 0  # timeout/other
-                    
-                    # Safe access: default to 0.0 if key missing
-                    reached_good = infos["reached_good_goal"][i] if "reached_good_goal" in infos else 0.0
-                    reached_bad = infos["reached_bad_goal"][i] if "reached_bad_goal" in infos else 0.0
-                    # timed_out check can be inferred or explicit if key exists
-                    
-                    if reached_good > 0:
-                        outcome = 1  # success
-                    elif reached_bad > 0:
-                        outcome = -1  # failure
-                    
-                    outcome_window.append(outcome)
+            s.logger.scalar("debug/wm_raw_error_mean", total_surprise.mean().item(), s.global_step)
+            s.logger.scalar("debug/intrinsic_reward_raw", raw_intrinsic.mean().item(), s.global_step)
 
-                    if len(outcome_window) > 0:
-                        success_rate = sum(1 for x in outcome_window if x == 1) / len(outcome_window)
-                        failure_rate = sum(1 for x in outcome_window if x == -1) / len(outcome_window)
-                        timeout_rate = sum(1 for x in outcome_window if x == 0) / len(outcome_window)
+            episodic_intrinsic_rewards.append(intrinsic_reward.mean().item())
+            episodic_intrinsic_rewards_max.append(intrinsic_reward.max().item())
 
-                        logger.scalar("charts/success_rate", success_rate, global_step)
-                        logger.scalar("charts/failure_rate", failure_rate, global_step)
-                        logger.scalar("charts/timeout_rate", timeout_rate, global_step)
+        # Update per-env episode trackers
+        s.running_returns += reward
+        s.running_lengths += 1
 
-                    # Regime tracking
-                    if "regime_id" in infos:
-                        regime = infos["regime_id"][i]
-                        logger.scalar(f"charts/r_regime_{regime}", running_returns[i], global_step)
+        # Store transition (extrinsic + intrinsic reward)
+        total_reward = torch.tensor(reward, dtype=torch.float32, device=s.device) + intrinsic_reward
 
-                    running_returns[i] = 0
-                    running_lengths[i] = 0
-
-        return {
-            "episodic_intrinsic_rewards": episodic_intrinsic_rewards,
-            "episodic_intrinsic_rewards_max": episodic_intrinsic_rewards_max,
-            "global_step": global_step,
-            "buffer_rewards_mean": buffer.rewards.mean().item(),
-            "buffer_rewards_max": buffer.rewards.max().item(),
-            "buffer_rewards_std": buffer.rewards.std().item(),
-            "buffer_rewards_abs_mean": buffer.rewards.abs().mean().item(),
-        }
-
-    def update_world_model():
-        """Phase B: Supervised training on real transitions."""
-        wm_stats = []
-        for epoch in range(cfg.update_epochs):
-            minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, _, _, _, _, next_obs, rewards in minibatches:
-                pred_next_obs, pred_reward = world_model(obs, actions)
-
-                # State loss: CrossEntropy on one-hot → class indices
-                target_indices = torch.argmax(next_obs, dim=1)
-                loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
-
-                # Reward loss: MSE
-                loss_reward = torch.nn.functional.mse_loss(pred_reward, rewards)
-
-                wm_loss = loss_state + loss_reward
-
-                wm_optimizer.zero_grad()
-                wm_loss.backward()
-                wm_optimizer.step()
-
-                wm_stats.append({
-                    "world_model/loss_total": wm_loss.item(),
-                    "world_model/loss_state": loss_state.item(),
-                    "world_model/loss_reward": loss_reward.item(),
-                })
-        return wm_stats
-
-    def generate_dream_experience():
-        """Phase C: Generate imagined trajectories using WM as simulator."""
-        # Sample random start states from the real buffer
-        rand_time_idxs = torch.randint(0, cfg.num_steps, (num_envs,), device=device)
-        env_idxs = torch.arange(num_envs, device=device)
-        start_states = buffer.obs[rand_time_idxs, env_idxs]
-
-        # Roll out imagined trajectories
-        imagined_trajectories = world_model.generate_imagined_trajectories(
-            policy_net=model,
-            start_states=start_states,
-            horizon=imagined_horizon
+        s.buffer.add(
+            obs=s.obs_t,
+            actions=action,
+            logprobs=logprob,
+            rewards=total_reward,
+            dones=torch.tensor(done, dtype=torch.float32, device=s.device),
+            values=value,
+            next_obs=real_next_obs_t,
         )
 
-        # Build a dream buffer from the imagined data
-        dream_buffer = RolloutBuffer(imagined_horizon, num_envs, obs_shape, device)
-        for t, traj in enumerate(imagined_trajectories):
+        s.obs_t = torch.tensor(next_obs, dtype=torch.float32, device=s.device)
+
+        # Log finished episodes
+        if np.any(done):
+            done_indices = np.where(done)[0]
+            for i in done_indices:
+                s.logger.scalar("charts/episodic_return", s.running_returns[i], s.global_step)
+                s.logger.scalar("charts/episodic_length", s.running_lengths[i], s.global_step)
+                episodic_returns_this_update.append(s.running_returns[i])
+
+                # Extract Goal Outcomes
+                outcome = 0  # timeout/other
+                reached_good = infos["reached_good_goal"][i] if "reached_good_goal" in infos else 0.0
+                reached_bad = infos["reached_bad_goal"][i] if "reached_bad_goal" in infos else 0.0
+
+                if reached_good > 0:
+                    outcome = 1  # success
+                elif reached_bad > 0:
+                    outcome = -1  # failure
+
+                s.outcome_window.append(outcome)
+
+                if len(s.outcome_window) > 0:
+                    success_rate = sum(1 for x in s.outcome_window if x == 1) / len(s.outcome_window)
+                    failure_rate = sum(1 for x in s.outcome_window if x == -1) / len(s.outcome_window)
+                    timeout_rate = sum(1 for x in s.outcome_window if x == 0) / len(s.outcome_window)
+
+                    s.logger.scalar("charts/success_rate", success_rate, s.global_step)
+                    s.logger.scalar("charts/failure_rate", failure_rate, s.global_step)
+                    s.logger.scalar("charts/timeout_rate", timeout_rate, s.global_step)
+
+                if "regime_id" in infos:
+                    regime = infos["regime_id"][i]
+                    s.logger.scalar(f"charts/r_regime_{regime}", s.running_returns[i], s.global_step)
+
+                s.running_returns[i] = 0
+                s.running_lengths[i] = 0
+
+    # GAE computation
+    with torch.no_grad():
+        _, last_value = s.model.forward(s.obs_t)
+    s.buffer.compute_returns_and_advantages(last_value, s.cfg.gamma, s.cfg.gae_lambda)
+
+    # =====================================================================
+    # Phase B: Update policy on real data
+    # =====================================================================
+
+    update_stats = []
+    for epoch in range(s.cfg.update_epochs):
+        minibatches = s.buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
+        for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
+            ppo_batch = [obs, actions, logprobs, advantages, returns, values]
+            stats = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+            update_stats.append(stats)
+
+    # =====================================================================
+    # Phase C: Train World Model
+    # =====================================================================
+
+    wm_stats = []
+    for epoch in range(s.cfg.update_epochs):
+        minibatches = s.buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
+        for obs, actions, _, _, _, _, next_obs, rewards in minibatches:
+            pred_next_obs, pred_reward = s.world_model(obs, actions)
+            target_indices = torch.argmax(next_obs, dim=1)
+            loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
+            loss_reward = torch.nn.functional.mse_loss(pred_reward, rewards)
+            wm_loss = loss_state + loss_reward
+
+            s.wm_optimizer.zero_grad()
+            wm_loss.backward()
+            s.wm_optimizer.step()
+
+            wm_stats.append({
+                "world_model/loss_total": wm_loss.item(),
+                "world_model/loss_state": loss_state.item(),
+                "world_model/loss_reward": loss_reward.item(),
+            })
+
+    # =====================================================================
+    # Phase D: Dream & update policy on imagined data
+    # =====================================================================
+
+    dream_stats = []
+    dream_buffer = None
+    if s.imagined_horizon > 0:
+        rand_time_idxs = torch.randint(0, s.cfg.num_steps, (s.num_envs,), device=s.device)
+        env_idxs = torch.arange(s.num_envs, device=s.device)
+        start_states = s.buffer.obs[rand_time_idxs, env_idxs]
+
+        imagined_trajectories = s.world_model.generate_imagined_trajectories(
+            policy_net=s.model,
+            start_states=start_states,
+            horizon=s.imagined_horizon
+        )
+
+        dream_buffer = RolloutBuffer(s.imagined_horizon, s.num_envs, s.obs_shape, s.device)
+        for t_step, traj in enumerate(imagined_trajectories):
             dream_buffer.add(
                 obs=traj["obs"],
                 actions=traj["actions"],
@@ -331,126 +441,179 @@ def train_ppo(
                 next_obs=traj["next_obs"]
             )
 
-        # Bootstrap value for GAE computation
         if imagined_trajectories:
             last_dream_obs = imagined_trajectories[-1]["next_obs"]
             with torch.no_grad():
-                _, last_dream_value = model.forward(last_dream_obs)
+                _, last_dream_value = s.model.forward(last_dream_obs)
+            dream_buffer.compute_returns_and_advantages(last_dream_value, s.cfg.gamma, s.cfg.gae_lambda)
 
-            dream_buffer.compute_returns_and_advantages(last_dream_value, cfg.gamma, cfg.gae_lambda)
-
-        return dream_buffer, imagined_trajectories
-
-    def update_policy(target_buffer, epochs):
-        """Run PPO updates on a buffer (real or imagined) for N epochs."""
-        update_stats = []
-        for epoch in range(epochs):
-            minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+        for epoch in range(1):
+            minibatches = dream_buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
                 ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
-                update_stats.append(stats)
-        return update_stats
+                ds = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+                dream_stats.append(ds)
 
-    # =========================================================================
-    # Main Training Loop
-    # =========================================================================
+    # =====================================================================
+    # Logging
+    # =====================================================================
 
-    for update in range(start_update, num_updates + 1):
-        if anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = frac * cfg.lr
-            optimizer.param_groups[0]["lr"] = lrnow
-        else:
-            lrnow = cfg.lr
+    avg_stats = {k: np.mean([st[k] for st in update_stats]) for k in update_stats[0]} if update_stats else {}
+    avg_wm_stats = {k: np.mean([st[k] for st in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
 
-        buffer.reset()
+    for k, v in avg_stats.items():
+        s.logger.scalar(k, v, s.global_step)
+    for k, v in avg_wm_stats.items():
+        s.logger.scalar(k, v, s.global_step)
 
-        # Phase A: Collect real experience
-        collect_stats = collect_real_experience(global_step)
-        global_step = collect_stats["global_step"]
+    if dream_stats and dream_buffer is not None:
+        avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([ds[k] for ds in dream_stats]) for k in dream_stats[0]}
+        for k, v in avg_dream_stats.items():
+            s.logger.scalar(k, v, s.global_step)
+        s.logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), s.global_step)
+        s.logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), s.global_step)
 
-        with torch.no_grad():
-            _, last_value = model.forward(obs_t)
-        buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
+    mean_intrinsic = np.mean(episodic_intrinsic_rewards) if episodic_intrinsic_rewards else 0.0
+    max_intrinsic = np.max(episodic_intrinsic_rewards_max) if episodic_intrinsic_rewards_max else 0.0
+    buffer_rewards_abs_mean = s.buffer.rewards.abs().mean().item()
 
-        # Phase B: Update policy on real data
-        update_stats = update_policy(buffer, cfg.update_epochs)
+    s.logger.scalar("ppo/intrinsic_reward_mean", mean_intrinsic, s.global_step)
+    s.logger.scalar("ppo/intrinsic_reward_max", max_intrinsic, s.global_step)
 
-        # Phase C: Train World Model
-        wm_stats = update_world_model()
+    if buffer_rewards_abs_mean > 1e-6:
+        s.logger.scalar("ppo/intrinsic_reward_ratio", mean_intrinsic / buffer_rewards_abs_mean, s.global_step)
+    else:
+        s.logger.scalar("ppo/intrinsic_reward_ratio", 0.0, s.global_step)
 
-        # Phase D: Dream & update policy on imagined data (skipped in passive mode)
-        dream_stats = []
-        dream_buffer = None
-        if imagined_horizon > 0:
-            dream_buffer, _ = generate_dream_experience()
-            dream_stats = update_policy(dream_buffer, epochs=1)
+    s.logger.scalar("charts/learning_rate", lrnow, s.global_step)
+    s.logger.scalar("charts/heartbeat", s.global_step, s.global_step)
+    s.logger.scalar("charts/reward_step_mean", s.buffer.rewards.mean().item(), s.global_step)
+    s.logger.scalar("charts/reward_step_max", s.buffer.rewards.max().item(), s.global_step)
+    s.logger.scalar("charts/reward_step_std", s.buffer.rewards.std().item(), s.global_step)
 
-        # -----------------------------------------------------------------
-        # Logging
-        # -----------------------------------------------------------------
+    sps = int(s.global_step / max(1e-9, (time.time() - s.start_time)))
+    s.logger.scalar("charts/SPS", sps, s.global_step)
 
-        avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]} if update_stats else {}
-        avg_wm_stats = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
+    # Checkpointing
+    if update % s.save_every_updates == 0 or update == s.num_updates:
+        ckpt_path = os.path.join(s.save_dir, f"{s.run_name}_update{update}.pt")
+        torch.save(
+            {
+                "model_state_dict": s.model.state_dict(),
+                "optimizer_state_dict": s.optimizer.state_dict(),
+                "world_model_state_dict": s.world_model.state_dict(),
+                "wm_optimizer_state_dict": s.wm_optimizer.state_dict(),
+                "cfg": s.cfg.__dict__,
+                "global_step": s.global_step,
+            },
+            ckpt_path,
+        )
+        print(f"[save] {ckpt_path}")
 
-        for k, v in avg_stats.items():
-            logger.scalar(k, v, global_step)
+    if update % 10 == 0:
+        print(f"update {update}/{s.num_updates} | step={s.global_step} | SPS={sps}")
 
-        for k, v in avg_wm_stats.items():
-            logger.scalar(k, v, global_step)
+    s.current_update += 1
 
-        if dream_stats and dream_buffer is not None:
-            avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}
-            for k, v in avg_dream_stats.items():
-                logger.scalar(k, v, global_step)
+    # -----------------------------------------------------------------
+    # Build stats dict for the Brain
+    # -----------------------------------------------------------------
 
-            logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), global_step)
-            logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), global_step)
+    # Outcome rates from the rolling window
+    n_outcomes = len(s.outcome_window)
+    success_rate = sum(1 for x in s.outcome_window if x == 1) / max(n_outcomes, 1)
+    failure_rate = sum(1 for x in s.outcome_window if x == -1) / max(n_outcomes, 1)
 
-        # Intrinsic reward stats
-        episodic_intrinsic_rewards = collect_stats["episodic_intrinsic_rewards"]
-        episodic_intrinsic_rewards_max = collect_stats["episodic_intrinsic_rewards_max"]
+    mean_return = float(np.mean(episodic_returns_this_update)) if episodic_returns_this_update else 0.0
 
-        mean_intrinsic = np.mean(episodic_intrinsic_rewards) if episodic_intrinsic_rewards else 0.0
-        max_intrinsic = np.max(episodic_intrinsic_rewards_max) if episodic_intrinsic_rewards_max else 0.0
-        mean_total_abs = collect_stats["buffer_rewards_abs_mean"]
+    return {
+        "done": update >= s.num_updates,
+        "global_step": s.global_step,
+        "update": update,
 
-        logger.scalar("ppo/intrinsic_reward_mean", mean_intrinsic, global_step)
-        logger.scalar("ppo/intrinsic_reward_max", max_intrinsic, global_step)
+        # Performance signals
+        "mean_episodic_return": mean_return,
+        "success_rate": success_rate,
+        "failure_rate": failure_rate,
 
-        if mean_total_abs > 1e-6:
-            logger.scalar("ppo/intrinsic_reward_ratio", mean_intrinsic / mean_total_abs, global_step)
-        else:
-            logger.scalar("ppo/intrinsic_reward_ratio", 0.0, global_step)
+        # Surprise / world model signals
+        "mean_surprise": float(np.mean(episodic_intrinsic_rewards)) if episodic_intrinsic_rewards else 0.0,
+        "wm_loss_state": avg_wm_stats.get("world_model/loss_state", 0.0),
+        "wm_loss_reward": avg_wm_stats.get("world_model/loss_reward", 0.0),
 
-        logger.scalar("charts/learning_rate", lrnow, global_step)
-        logger.scalar("charts/heartbeat", global_step, global_step)
-        logger.scalar("charts/reward_step_mean", collect_stats["buffer_rewards_mean"], global_step)
-        logger.scalar("charts/reward_step_max", collect_stats["buffer_rewards_max"], global_step)
-        logger.scalar("charts/reward_step_std", collect_stats["buffer_rewards_std"], global_step)
+        # Policy signals
+        "policy_entropy": avg_stats.get("loss/entropy", 0.0),
+        "policy_loss": avg_stats.get("loss/policy", 0.0),
+        "value_loss": avg_stats.get("loss/value", 0.0),
 
-        sps = int(global_step / max(1e-9, (time.time() - start_time)))
-        logger.scalar("charts/SPS", sps, global_step)
+        # Current hyperparameter values
+        "current_lr": lrnow,
+        "current_ent_coef": s.cfg.ent_coef,
+        "current_intrinsic_coef": s.intrinsic_coef,
+        "current_imagined_horizon": s.imagined_horizon,
+    }
 
-        # Checkpointing
-        if update % save_every_updates == 0 or update == num_updates:
-            ckpt_path = os.path.join(save_dir, f"{run_name}_update{update}.pt")
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "world_model_state_dict": world_model.state_dict(),
-                    "wm_optimizer_state_dict": wm_optimizer.state_dict(),
-                    "cfg": cfg.__dict__,
-                    "global_step": global_step,
-                },
-                ckpt_path,
-            )
-            print(f"[save] {ckpt_path}")
 
-        if update % 10 == 0:
-            print(f"update {update}/{num_updates} | step={global_step} | SPS={sps}")
+def close_inner_training(state: InnerTrainState):
+    """Clean up environments and logger."""
+    state.envs.close()
+    if state.logger is not None:
+        state.logger.close()
 
-    envs.close()
-    logger.close()
+
+# =========================================================================
+# Original train_ppo() — now delegates to init/step functions
+# =========================================================================
+
+def train_ppo(
+    env_id: str,
+    cfg: PPOConfig,
+    *,
+    steps_per_regime: int | None = None,
+    episodes_per_regime: int | None = None,
+    start_regime: int = 0,
+    run_name: str | None = None,
+    save_dir: str = "checkpoints",
+    save_every_updates: int = 50,
+    anneal_lr: bool = True,
+    resume_path: str | None = None,
+    intrinsic_coef: float = 0.1,
+    intrinsic_reward_clip: float = 0.1,
+    imagined_horizon: int = 5,
+    wm_lr: float = 1e-4,
+):
+    """
+    Main Dyna-PPO training loop.
+
+    Each update cycle has three phases:
+        A) Collect real experience (with intrinsic curiosity reward)
+        B) Train World Model on real transitions (supervised)
+        C) Generate imagined trajectories and update policy on dreams
+    """
+
+    state = init_inner_training(
+        env_id=env_id,
+        cfg=cfg,
+        steps_per_regime=steps_per_regime,
+        episodes_per_regime=episodes_per_regime,
+        start_regime=start_regime,
+        run_name=run_name,
+        save_dir=save_dir,
+        save_every_updates=save_every_updates,
+        anneal_lr=anneal_lr,
+        resume_path=resume_path,
+        intrinsic_coef=intrinsic_coef,
+        intrinsic_reward_clip=intrinsic_reward_clip,
+        imagined_horizon=imagined_horizon,
+        wm_lr=wm_lr,
+    )
+
+    print(f"Training on {state.device} with {state.num_envs} envs "
+          f"for {state.num_updates} updates (starting from update {state.current_update}).")
+
+    while True:
+        stats = run_inner_update(state)
+        if stats["done"]:
+            break
+
+    close_inner_training(state)

@@ -28,13 +28,31 @@ class SimpleWorldModel(nn.Module):
         self.n_actions = n_actions
         self.flat_obs_dim = self.c * self.h * self.w
 
+        # CNN encoder — mirrors CNNActorCritic architecture
+        self.cnn = nn.Sequential(
+            nn.Conv2d(self.c, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # Dynamically compute CNN output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.c, self.h, self.w)
+            cnn_out_dim = self.cnn(dummy).shape[1]
+
+        # Action embedding (late fusion)
         self.action_emb = nn.Embedding(n_actions, 32)
 
-        self.encoder = nn.Sequential(
-            nn.Linear(self.flat_obs_dim + 32, hidden_dim),
+        # Fuse CNN features + action embedding → MLP trunk
+        self.trunk = nn.Sequential(
+            nn.Linear(cnn_out_dim + 32, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.ReLU(),
         )
 
         self.next_state_head = nn.Linear(hidden_dim, self.flat_obs_dim)
@@ -43,7 +61,7 @@ class SimpleWorldModel(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
             nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -61,10 +79,10 @@ class SimpleWorldModel(nn.Module):
             reward_pred:   (B,) scalar reward prediction
         """
         B = obs.shape[0]
-        flat_obs = obs.reshape(B, -1)
-        act_emb = self.action_emb(action)
-        x = torch.cat([flat_obs, act_emb], dim=1)
-        features = self.encoder(x)
+        cnn_features = self.cnn(obs)                          # (B, cnn_out_dim)
+        act_emb = self.action_emb(action)                     # (B, 32)
+        x = torch.cat([cnn_features, act_emb], dim=1)         # (B, cnn_out_dim + 32)
+        features = self.trunk(x)                               # (B, hidden_dim)
 
         next_obs_flat = self.next_state_head(features)
         reward_pred = self.reward_head(features).squeeze(-1)

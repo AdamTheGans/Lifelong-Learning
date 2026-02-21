@@ -21,11 +21,11 @@ We use a custom **8x8 MiniGrid** environment with two colored squares (Goals).
 > **Note on DreamerV3**: We initially attempted to use DreamerV3 (a powerful, JAX-based world model), but found it to be overkill for this simple grid environment. It was computationally heavy and difficult to tune for our specific symbolic observation needs. We pivoted to a custom, lightweight **Simple World Model** integrated directly into PPO.
 
 ### 1. Simple World Model
-A lightweight, feed-forward MLP (not CNN/RNN) designed for Symbolic (One-Hot) observations.
+A lightweight, CNN-based model designed for Symbolic (One-Hot) observations.
 - **Input**:
-    - **State**: Flattened One-Hot Tensor (21x8x8 → Vector).
-    - **Action**: Learned Embedding (dim=32).
-- **Network**: Concatenates [State, Action] → 2-layer MLP → Heads.
+    - **State**: One-Hot Tensor (21, 8, 8) processed by a 3-layer CNN (mirrors Actor-Critic encoder).
+    - **Action**: Learned Embedding (dim=32), concatenated after CNN (late fusion).
+- **Network**: CNN → Flatten → Concat [CNN features, Action Emb] → 2-layer MLP → Heads.
 - **Outputs**:
     - **Next State**: Logits for Cross-Entropy Loss (predicts next One-Hot grid, 21 channels).
     - **Reward**: Scalar prediction.

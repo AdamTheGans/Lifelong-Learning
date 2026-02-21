@@ -324,6 +324,17 @@ def plot_run(logdir, run_name):
             boundaries, max_step, True, output_path=out_file
         )
 
+    # 3. Success Rate vs Surprise
+    df_success = data.get(tag_map["success"])
+    if df_success is not None:
+        out_file = os.path.join("graphs", f"regime_analysis_success_rate_{run_name.replace(os.path.sep, '_')}.png")
+        plot_single_graph(
+            df_success, df_wm_rew_loss,
+            "Regime Analysis: Success Rate vs Surprise", "Success Rate",
+            'tab:green', 'tab:red',
+            boundaries, max_step, True, output_path=out_file
+        )
+
 
     # --- Generate Main Summary Plot (6 panels) ---
     fig = plt.figure(figsize=(20, 12))

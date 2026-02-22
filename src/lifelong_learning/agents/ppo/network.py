@@ -17,7 +17,7 @@ class CNNActorCritic(nn.Module):
     Output: (logits, value)
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, max_regimes: int = 10, regime_emb_dim: int = 16):
         super().__init__()
         self.c, self.h, self.w = obs_shape
 
@@ -32,9 +32,11 @@ class CNNActorCritic(nn.Module):
             nn.Flatten(),
         )
 
+        self.regime_embedding = nn.Embedding(max_regimes, regime_emb_dim)
+
         with torch.no_grad():
             dummy = torch.zeros(1, self.c, self.h, self.w)
-            flat_size = self.encoder(dummy).shape[1]
+            flat_size = self.encoder(dummy).shape[1] + regime_emb_dim
 
         # Actor head (policy)
         self.actor_head = nn.Sequential(
@@ -76,19 +78,23 @@ class CNNActorCritic(nn.Module):
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
 
-    def forward(self, obs: torch.Tensor):
+    def forward(self, obs: torch.Tensor, regime_id: torch.Tensor | None = None):
         features = self.encoder(obs)
-        return self.actor_head(features), self.critic_head(features).squeeze(-1)
+        if regime_id is None:
+            regime_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+        regime_emb = self.regime_embedding(regime_id)
+        fused_features = torch.cat([features, regime_emb], dim=1)
+        return self.actor_head(fused_features), self.critic_head(fused_features).squeeze(-1)
 
-    def act(self, obs: torch.Tensor):
+    def act(self, obs: torch.Tensor, regime_id: torch.Tensor | None = None):
         """Sample an action and return (action, log_prob, entropy, value)."""
-        logits, value = self.forward(obs)
+        logits, value = self.forward(obs, regime_id)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value
 
-    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor):
+    def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor, regime_id: torch.Tensor | None = None):
         """Evaluate given actions and return (log_prob, entropy, value)."""
-        logits, value = self.forward(obs)
+        logits, value = self.forward(obs, regime_id)
         dist = torch.distributions.Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value

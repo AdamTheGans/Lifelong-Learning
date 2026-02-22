@@ -40,8 +40,8 @@ def ppo_update(
     total_pg, total_v, total_ent, total_loss = 0.0, 0.0, 0.0, 0.0
     n = 0
 
-    for obs, actions, old_logprobs, advantages, returns, old_values in minibatches:
-        new_logprobs, entropy, new_values = model.evaluate_actions(obs, actions)
+    for obs, actions, old_logprobs, advantages, returns, old_values, regime_ids in minibatches:
+        new_logprobs, entropy, new_values = model.evaluate_actions(obs, actions, regime_ids)
         logratio = new_logprobs - old_logprobs
         ratio = torch.exp(logratio)
 

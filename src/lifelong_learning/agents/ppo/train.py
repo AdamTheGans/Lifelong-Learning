@@ -142,6 +142,9 @@ def train_ppo(
 
     print(f"Training on {device} with {num_envs} envs for {num_updates} updates (starting from update {start_update}).")
 
+    # Initialize global regime tracker (used throughout the update loop)
+    current_regime = torch.zeros(num_envs, dtype=torch.long, device=device)
+
     # =========================================================================
     # Helper Functions
     # =========================================================================
@@ -157,7 +160,7 @@ def train_ppo(
             global_step += num_envs
 
             with torch.no_grad():
-                action, logprob, entropy, value = model.act(obs_t)
+                action, logprob, entropy, value = model.act(obs_t, current_regime)
                 pred_next_obs, pred_reward = world_model(obs_t, action)
 
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
@@ -223,6 +226,7 @@ def train_ppo(
                 dones=torch.tensor(done, dtype=torch.float32, device=device),
                 values=value,
                 next_obs=real_next_obs_t,
+                regime_ids=current_regime,
             )
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
@@ -281,7 +285,7 @@ def train_ppo(
         wm_stats = []
         for epoch in range(cfg.update_epochs):
             minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, _, _, _, _, next_obs, rewards in minibatches:
+            for obs, actions, _, _, _, _, next_obs, rewards, _ in minibatches:
                 pred_next_obs, pred_reward = world_model(obs, actions)
 
                 # State loss: CrossEntropy on one-hot → class indices
@@ -328,7 +332,8 @@ def train_ppo(
                 rewards=traj["rewards"],
                 dones=traj["dones"],
                 values=traj["values"],
-                next_obs=traj["next_obs"]
+                next_obs=traj["next_obs"],
+                regime_ids=torch.zeros(num_envs, dtype=torch.long, device=device)
             )
 
         # Bootstrap value for GAE computation
@@ -346,8 +351,8 @@ def train_ppo(
         update_stats = []
         for epoch in range(epochs):
             minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
-                ppo_batch = [obs, actions, logprobs, advantages, returns, values]
+            for obs, actions, logprobs, advantages, returns, values, _, _, regime_ids in minibatches:
+                ppo_batch = [obs, actions, logprobs, advantages, returns, values, regime_ids]
                 stats = ppo_update(model, optimizer, [ppo_batch], cfg)
                 update_stats.append(stats)
         return update_stats
@@ -371,7 +376,7 @@ def train_ppo(
         global_step = collect_stats["global_step"]
 
         with torch.no_grad():
-            _, last_value = model.forward(obs_t)
+            _, last_value = model.forward(obs_t, current_regime)
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
         # Phase B: Update policy on real data

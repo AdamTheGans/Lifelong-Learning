@@ -111,7 +111,8 @@ class SimpleWorldModel(nn.Module):
         self,
         policy_net: nn.Module,
         start_states: torch.Tensor,
-        horizon: int
+        horizon: int,
+        regime_tensor: torch.Tensor
     ) -> list[dict]:
         """
         Roll out imagined trajectories using the WM as a simulator (Dyna-style).
@@ -135,7 +136,7 @@ class SimpleWorldModel(nn.Module):
 
         for _ in range(horizon):
             with torch.no_grad():
-                action, logprob, _, value = policy_net.act(curr_obs)
+                action, logprob, _, value = policy_net.act(curr_obs, regime_tensor)
                 next_obs_pred, reward_pred = self.forward(curr_obs, action)
 
             next_obs_discrete = self.discretize_state(next_obs_pred)

@@ -16,12 +16,12 @@ We use a custom **8x8 MiniGrid** environment with two colored squares (Goals).
 - **Actions**: Discrete(3) — Turn Left, Turn Right, Move Forward.
 - **Regime Switching**: The "correct" color swaps periodically (e.g., every 15k steps), causing the agent's policy to become outdated.
 
-## Current Architecture: Dyna-PPO with Simple World Model
+## Current Architecture: Dyna-PPO with Mixture of World Models
 
 > **Note on DreamerV3**: We initially attempted to use DreamerV3 (a powerful, JAX-based world model), but found it to be overkill for this simple grid environment. It was computationally heavy and difficult to tune for our specific symbolic observation needs. We pivoted to a custom, lightweight **Simple World Model** integrated directly into PPO.
 
-### 1. Simple World Model
-A lightweight, CNN-based model designed for Symbolic (One-Hot) observations.
+### 1. Mixture of World Models
+A dynamic ensemble of lightweight, CNN-based `SimpleWorldModel` instances designed for Symbolic (One-Hot) observations. It uses prediction error (surprise) to detect regime switches and spawn new models.
 - **Input**:
     - **State**: One-Hot Tensor (21, 8, 8) processed by a 3-layer CNN (mirrors Actor-Critic encoder).
     - **Action**: Learned Embedding (dim=32), concatenated after CNN (late fusion).
@@ -62,7 +62,7 @@ Training occurs in three phases per update:
     - Route based on prediction error (Surprise).
 
 ### 4. Future Direction B: Regime-Specific World Models (The "Library" Approach)
-- **Status**: [ ] In Progress (Phases 2/4 Complete). Context-aware PPO agent is in place. `mowm.py` manager class created to manage dynamic World Models via EMA prediction error. To be integrated into training next.
+- **Status**: [x] Complete. Context-aware PPO agent is in place. `MixtureOfWorldModels` manager class dynamically spawns and routes World Models via EMA prediction error. Successfully integrated into the training loop and tested.
 - **Idea**: Explicitly learn distinct World Models for different regimes and "route" the PPO agent to the correct one using an EMA-scaled Surprise Threshold.
 - **Mechanism**:
     - Usage: PPO receives a `REGIME_ID` input (latent or explicit) via an embedding layer.

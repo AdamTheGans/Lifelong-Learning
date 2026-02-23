@@ -18,6 +18,7 @@ from collections import deque
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+from lifelong_learning.agents.ppo.mowm import MixtureOfWorldModels
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
@@ -81,8 +82,8 @@ def train_ppo(
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
-    world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
-    wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
+    world_model = MixtureOfWorldModels(obs_shape, n_actions).to(device)
+    wm_optimizers = [torch.optim.Adam(world_model.models[0].parameters(), lr=wm_lr)]
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
     # -------------------------------------------------------------------------
@@ -102,14 +103,30 @@ def train_ppo(
             print("WARNING: Optimizer state not found in checkpoint.")
 
         if "world_model_state_dict" in ckpt:
-            world_model.load_state_dict(ckpt["world_model_state_dict"])
+            wm_state = ckpt["world_model_state_dict"]
+            num_models = 1 + max([int(k.split('.')[1]) for k in wm_state.keys() if k.startswith('models.')] + [-1])
+            while len(world_model.models) < num_models:
+                new_model = SimpleWorldModel(obs_shape, n_actions, world_model.hidden_dim).to(device)
+                world_model.models.append(new_model)
+            world_model.load_state_dict(wm_state)
             print("World Model state loaded.")
         else:
             print("WARNING: World Model state not found in checkpoint.")
 
-        if "wm_optimizer_state_dict" in ckpt:
-            wm_optimizer.load_state_dict(ckpt["wm_optimizer_state_dict"])
-            print("World Model Optimizer state loaded.")
+        if "wm_optimizers_state_dict" in ckpt:
+            wm_optimizers = []
+            for i, opt_state in enumerate(ckpt["wm_optimizers_state_dict"]):
+                opt = torch.optim.Adam(world_model.models[i].parameters(), lr=wm_lr)
+                opt.load_state_dict(opt_state)
+                wm_optimizers.append(opt)
+            print("World Model Optimizers state loaded.")
+        elif "wm_optimizer_state_dict" in ckpt:
+            wm_optimizers[0].load_state_dict(ckpt["wm_optimizer_state_dict"])
+            print("Legacy World Model Optimizer state loaded.")
+
+        if "mowm_state" in ckpt:
+            world_model.active_regime_id = ckpt["mowm_state"]["active_regime_id"]
+            world_model.ema_loss = ckpt["mowm_state"]["ema_loss"]
 
         if "global_step" in ckpt:
             start_global_step = ckpt["global_step"]
@@ -161,7 +178,7 @@ def train_ppo(
 
             with torch.no_grad():
                 action, logprob, entropy, value = model.act(obs_t, current_regime)
-                pred_next_obs, pred_reward = world_model(obs_t, action)
+                pred_next_obs, pred_reward = world_model(obs_t, action, world_model.active_regime_id)
 
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
@@ -176,6 +193,15 @@ def train_ppo(
                          real_next_obs[i] = infos["final_observation"][i]
             
             real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
+
+            # Infer best regime and check spawn
+            best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t)
+            did_spawn = world_model.check_and_spawn(lowest_loss)
+            if did_spawn:
+                wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+            
+            # Update the current_regime tensor for the buffer and for next step's policy
+            current_regime.fill_(world_model.active_regime_id)
 
             # Compute intrinsic reward (surprise signal)
             with torch.no_grad():
@@ -283,29 +309,50 @@ def train_ppo(
     def update_world_model():
         """Phase B: Supervised training on real transitions."""
         wm_stats = []
+        epoch_losses = []
+        active_id = world_model.active_regime_id
+        active_model = world_model.models[active_id]
+        active_opt = wm_optimizers[active_id]
+
         for epoch in range(cfg.update_epochs):
             minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, _, _, _, _, next_obs, rewards, _ in minibatches:
-                pred_next_obs, pred_reward = world_model(obs, actions)
+            for obs, actions, _, _, _, _, next_obs, rewards, regime_ids in minibatches:
+                mask = (regime_ids == active_id)
+                if not mask.any():
+                    continue
+
+                m_obs = obs[mask]
+                m_actions = actions[mask]
+                m_next_obs = next_obs[mask]
+                m_rewards = rewards[mask]
+
+                pred_next_obs, pred_reward = active_model(m_obs, m_actions)
 
                 # State loss: CrossEntropy on one-hot → class indices
-                target_indices = torch.argmax(next_obs, dim=1)
+                target_indices = torch.argmax(m_next_obs, dim=1)
                 loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
 
                 # Reward loss: MSE
-                loss_reward = torch.nn.functional.mse_loss(pred_reward, rewards)
+                loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards)
 
                 wm_loss = loss_state + loss_reward
 
-                wm_optimizer.zero_grad()
+                active_opt.zero_grad()
                 wm_loss.backward()
-                wm_optimizer.step()
+                active_opt.step()
+
+                epoch_losses.append(wm_loss.item())
 
                 wm_stats.append({
                     "world_model/loss_total": wm_loss.item(),
                     "world_model/loss_state": loss_state.item(),
                     "world_model/loss_reward": loss_reward.item(),
                 })
+
+        if epoch_losses:
+            avg_loss = sum(epoch_losses) / len(epoch_losses)
+            world_model.update_ema(avg_loss)
+
         return wm_stats
 
     def generate_dream_experience():
@@ -315,11 +362,19 @@ def train_ppo(
         env_idxs = torch.arange(num_envs, device=device)
         start_states = buffer.obs[rand_time_idxs, env_idxs]
 
+        if torch.rand(1).item() < 0.5:
+            dream_regime_id = world_model.active_regime_id
+        else:
+            dream_regime_id = torch.randint(0, len(world_model.models), (1,)).item()
+            
+        dream_regime_tensor = torch.full((num_envs,), dream_regime_id, dtype=torch.long, device=device)
+
         # Roll out imagined trajectories
-        imagined_trajectories = world_model.generate_imagined_trajectories(
+        imagined_trajectories = world_model.models[dream_regime_id].generate_imagined_trajectories(
             policy_net=model,
             start_states=start_states,
-            horizon=imagined_horizon
+            horizon=imagined_horizon,
+            regime_tensor=dream_regime_tensor
         )
 
         # Build a dream buffer from the imagined data
@@ -333,14 +388,14 @@ def train_ppo(
                 dones=traj["dones"],
                 values=traj["values"],
                 next_obs=traj["next_obs"],
-                regime_ids=torch.zeros(num_envs, dtype=torch.long, device=device)
+                regime_ids=dream_regime_tensor
             )
 
         # Bootstrap value for GAE computation
         if imagined_trajectories:
             last_dream_obs = imagined_trajectories[-1]["next_obs"]
             with torch.no_grad():
-                _, last_dream_value = model.forward(last_dream_obs)
+                _, last_dream_value = model.forward(last_dream_obs, dream_regime_tensor)
 
             dream_buffer.compute_returns_and_advantages(last_dream_value, cfg.gamma, cfg.gae_lambda)
 
@@ -441,12 +496,17 @@ def train_ppo(
         # Checkpointing
         if update % save_every_updates == 0 or update == num_updates:
             ckpt_path = os.path.join(save_dir, f"{run_name}_update{update}.pt")
+            wm_opts_state = [opt.state_dict() for opt in wm_optimizers]
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "world_model_state_dict": world_model.state_dict(),
-                    "wm_optimizer_state_dict": wm_optimizer.state_dict(),
+                    "wm_optimizers_state_dict": wm_opts_state,
+                    "mowm_state": {
+                        "active_regime_id": world_model.active_regime_id,
+                        "ema_loss": world_model.ema_loss,
+                    },
                     "cfg": cfg.__dict__,
                     "global_step": global_step,
                 },

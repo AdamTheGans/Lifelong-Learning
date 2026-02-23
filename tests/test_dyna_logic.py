@@ -11,7 +11,7 @@ class MockPolicy(nn.Module):
         super().__init__()
         self.action_dim = action_dim
 
-    def act(self, obs):
+    def act(self, obs, regime_tensor=None):
         B = obs.shape[0]
         actions = torch.randint(0, self.action_dim, (B,))
         logprobs = torch.randn(B)
@@ -61,8 +61,9 @@ class TestDynaLogic(unittest.TestCase):
         B = 4
         horizon = 5
         start_states = torch.randn(B, *self.obs_shape)
+        regime_tensor = torch.zeros(B, dtype=torch.long)
 
-        traj = self.wm.generate_imagined_trajectories(self.policy, start_states, horizon)
+        traj = self.wm.generate_imagined_trajectories(self.policy, start_states, horizon, regime_tensor)
 
         self.assertEqual(len(traj), horizon)
 

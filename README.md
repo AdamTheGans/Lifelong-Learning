@@ -41,9 +41,10 @@ Lifelong-Learning/
 
 ## Part 1: Dyna-PPO Baseline
 
-The active training pipeline uses **Dyna-PPO**, which augments a standard PPO agent with a `SimpleWorldModel` sidekick. The World Model provides:
-1. **Intrinsic Curiosity**: Reward augmentation based on prediction error (surprise).
-2. **Dreaming**: Generates imagined trajectories to train the policy on latent/predicted transitions (Dyna-style).
+The active training pipeline uses **Dyna-PPO**, which augments a standard PPO agent with a **Mixture of World Models (MoWM)** sidekick. The MoWM provides:
+1. **Context Routing**: Dynamically detects regime changes via surprise (prediction error) spikes and spawns or routes to specialized world models.
+2. **Intrinsic Curiosity**: Reward augmentation based on prediction error.
+3. **Dreaming**: Generates imagined trajectories across different regimes to train the policy on latent/predicted transitions, preventing catastrophic forgetting.
 
 ### 1.1 Install (use a venv if you wish)
 

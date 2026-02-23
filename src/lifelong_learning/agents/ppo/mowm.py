@@ -25,6 +25,7 @@ class MixtureOfWorldModels(nn.Module):
         # Status variables
         self.active_regime_id = 0
         self.ema_losses = [1.0]
+        self.best_emas = [1.0]
         self.ema_history = [collections.deque([1.0], maxlen=10)]
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
@@ -55,6 +56,7 @@ class MixtureOfWorldModels(nn.Module):
         """
         idx = self.active_regime_id
         self.ema_losses[idx] = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_losses[idx])
+        self.best_emas[idx] = min(self.best_emas[idx], self.ema_losses[idx])
         self.ema_history[idx].append(self.ema_losses[idx])
 
         if self.ema_losses[idx] < self.mastery_loss_threshold:
@@ -96,7 +98,7 @@ class MixtureOfWorldModels(nn.Module):
                 
             # Only find the lowest loss if we aren't bypassing via newborn stickiness
             if global_step >= self.force_active_until:
-                relative_loss = loss / max(self.ema_losses[i], self.ema_epsilon)
+                relative_loss = loss / max(self.best_emas[i], self.ema_epsilon)
                 if i != self.active_regime_id:
                     relative_loss *= self.switch_penalty
 
@@ -149,7 +151,7 @@ class MixtureOfWorldModels(nn.Module):
                 self.surprise_window.clear()
                 return False
 
-        ratio = smoothed_loss / max(self.ema_losses[best_regime_id], self.ema_epsilon)
+        ratio = smoothed_loss / max(self.best_emas[best_regime_id], self.ema_epsilon)
         
         if ratio > self.surprise_threshold:
             # Instantiate a new world model
@@ -165,6 +167,7 @@ class MixtureOfWorldModels(nn.Module):
             # Update internal tracking variables
             self.active_regime_id = len(self.models) - 1
             self.ema_losses.append(smoothed_loss)  # Set EMA for the new regime baseline
+            self.best_emas.append(smoothed_loss)
             self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
             self.has_mastered.append(False)
             self.steps_under_threshold.append(0)

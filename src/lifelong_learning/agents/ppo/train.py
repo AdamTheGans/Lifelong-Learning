@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 import gymnasium as gym
-from collections import deque
+from collections import deque, defaultdict
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
@@ -132,6 +132,12 @@ def train_ppo(
                 # Backwards compatibility
                 world_model.ema_losses = [ckpt["mowm_state"]["ema_loss"]] * len(world_model.models)
             
+            if "best_emas" in ckpt["mowm_state"]:
+                world_model.best_emas = ckpt["mowm_state"]["best_emas"]
+            else:
+                # Backwards compatibility
+                world_model.best_emas = list(world_model.ema_losses)
+            
             if "ema_history" in ckpt["mowm_state"]:
                 # Convert list of lists back to list of deques
                 world_model.ema_history = [deque(h, maxlen=10) for h in ckpt["mowm_state"]["ema_history"]]
@@ -183,6 +189,9 @@ def train_ppo(
 
     # Initialize global regime tracker (used throughout the update loop)
     current_regime = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    # State reservoir for generative replay
+    state_reservoir = defaultdict(lambda: deque(maxlen=1000))
 
     # =========================================================================
     # Helper Functions
@@ -281,6 +290,10 @@ def train_ppo(
                 next_obs=real_next_obs_t,
                 regime_ids=current_regime,
             )
+
+            # Add to state reservoir
+            env_idx = np.random.randint(num_envs)
+            state_reservoir[world_model.active_regime_id].append(obs_t[env_idx].clone().cpu())
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
@@ -383,19 +396,24 @@ def train_ppo(
 
         return wm_stats
 
-    def generate_dream_experience():
+    def generate_dream_experience(reservoir, min_states=16):
         """Phase C: Generate imagined trajectories using WM as simulator."""
-        # Sample random start states from the real buffer
-        rand_time_idxs = torch.randint(0, cfg.num_steps, (num_envs,), device=device)
-        env_idxs = torch.arange(num_envs, device=device)
-        start_states = buffer.obs[rand_time_idxs, env_idxs]
-
         if torch.rand(1).item() < 0.5:
             dream_regime_id = world_model.active_regime_id
         else:
             dream_regime_id = torch.randint(0, len(world_model.models), (1,)).item()
             
         dream_regime_tensor = torch.full((num_envs,), dream_regime_id, dtype=torch.long, device=device)
+
+        # Sample start states from reservoir if available, else fallback to real buffer
+        if len(reservoir[dream_regime_id]) >= min_states:
+            res_list = list(reservoir[dream_regime_id])
+            idxs = np.random.choice(len(res_list), num_envs, replace=True)
+            start_states = torch.stack([res_list[i] for i in idxs]).to(device)
+        else:
+            rand_time_idxs = torch.randint(0, cfg.num_steps, (num_envs,), device=device)
+            env_idxs = torch.arange(num_envs, device=device)
+            start_states = buffer.obs[rand_time_idxs, env_idxs]
 
         # Roll out imagined trajectories
         imagined_trajectories = world_model.models[dream_regime_id].generate_imagined_trajectories(
@@ -429,15 +447,58 @@ def train_ppo(
 
         return dream_buffer, imagined_trajectories
 
-    def update_policy(target_buffer, epochs):
-        """Run PPO updates on a buffer (real or imagined) for N epochs."""
+    def update_policy(buffers, epochs):
+        """Run PPO updates on multiple buffers (real and/or imagined) for N epochs."""
+        if not isinstance(buffers, list):
+            buffers = [buffers]
+            
         update_stats = []
         for epoch in range(epochs):
-            minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, logprobs, advantages, returns, values, _, _, regime_ids in minibatches:
-                ppo_batch = [obs, actions, logprobs, advantages, returns, values, regime_ids]
+            all_obs, all_actions, all_logprobs, all_advantages = [], [], [], []
+            all_returns, all_values, all_regime_ids = [], [], []
+            
+            for buf in buffers:
+                batch_size = buf.num_steps * buf.num_envs
+                b_obs = buf.obs.reshape((batch_size,) + buf.obs_shape)
+                b_actions = buf.actions.reshape(batch_size)
+                b_logprobs = buf.logprobs.reshape(batch_size)
+                
+                b_advantages = buf.advantages.reshape(batch_size)
+                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+                
+                b_returns = buf.returns.reshape(batch_size)
+                b_values = buf.values.reshape(batch_size)
+                b_regime_ids = buf.regime_ids.reshape(batch_size)
+                
+                all_obs.append(b_obs)
+                all_actions.append(b_actions)
+                all_logprobs.append(b_logprobs)
+                all_advantages.append(b_advantages)
+                all_returns.append(b_returns)
+                all_values.append(b_values)
+                all_regime_ids.append(b_regime_ids)
+                
+            c_obs = torch.cat(all_obs, dim=0)
+            c_actions = torch.cat(all_actions, dim=0)
+            c_logprobs = torch.cat(all_logprobs, dim=0)
+            c_advantages = torch.cat(all_advantages, dim=0)
+            c_returns = torch.cat(all_returns, dim=0)
+            c_values = torch.cat(all_values, dim=0)
+            c_regime_ids = torch.cat(all_regime_ids, dim=0)
+            
+            total_size = c_obs.size(0)
+            idxs = np.arange(total_size)
+            np.random.shuffle(idxs)
+            
+            for start in range(0, total_size, cfg.minibatch_size):
+                mb = idxs[start:start + cfg.minibatch_size]
+                ppo_batch = [
+                    c_obs[mb], c_actions[mb], c_logprobs[mb], c_advantages[mb], 
+                    c_returns[mb], c_values[mb], c_regime_ids[mb]
+                ]
                 stats = ppo_update(model, optimizer, [ppo_batch], cfg)
                 update_stats.append(stats)
+                
         return update_stats
 
     # =========================================================================
@@ -462,18 +523,20 @@ def train_ppo(
             _, last_value = model.forward(obs_t, current_regime)
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
-        # Phase B: Update policy on real data
-        update_stats = update_policy(buffer, cfg.update_epochs)
-
-        # Phase C: Train World Model
+        # Phase B: Train World Model (trains on freshly collected buffer)
         wm_stats = update_world_model()
 
-        # Phase D: Dream & update policy on imagined data (skipped in passive mode)
-        dream_stats = []
-        dream_buffer = None
-        if imagined_horizon > 0:
-            dream_buffer, _ = generate_dream_experience()
-            dream_stats = update_policy(dream_buffer, epochs=1)
+        # Phase C: Dream and build mixed buffers (skipped in passive mode)
+        dream_buffers = []
+        if cfg.mode == "dyna" and imagined_horizon > 0:
+            num_dream_rollouts = max(1, cfg.num_steps // imagined_horizon)
+            for _ in range(num_dream_rollouts):
+                db, _ = generate_dream_experience(state_reservoir)
+                dream_buffers.append(db)
+
+        # Phase D: Update policy on mixed real + imagined data
+        buffers_to_train = [buffer] + dream_buffers
+        update_stats = update_policy(buffers_to_train, cfg.update_epochs)
 
         # -----------------------------------------------------------------
         # Logging
@@ -500,13 +563,11 @@ def train_ppo(
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
         logger.scalar("mowm/spawn_occurred", float(collect_stats["spawn_occurred"]), global_step)
 
-        if dream_stats and dream_buffer is not None:
-            avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}
-            for k, v in avg_dream_stats.items():
-                logger.scalar(k, v, global_step)
-
-            logger.scalar("ppo/imagined_value_mean", dream_buffer.values.mean().item(), global_step)
-            logger.scalar("ppo/imagined_return_mean", dream_buffer.returns.mean().item(), global_step)
+        if dream_buffers:
+            avg_dream_val = np.mean([db.values.mean().item() for db in dream_buffers])
+            avg_dream_ret = np.mean([db.returns.mean().item() for db in dream_buffers])
+            logger.scalar("ppo/imagined_value_mean", avg_dream_val, global_step)
+            logger.scalar("ppo/imagined_return_mean", avg_dream_ret, global_step)
 
         # Intrinsic reward stats
         episodic_intrinsic_rewards = collect_stats["episodic_intrinsic_rewards"]
@@ -546,6 +607,7 @@ def train_ppo(
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
                         "ema_losses": world_model.ema_losses,
+                        "best_emas": world_model.best_emas,
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,

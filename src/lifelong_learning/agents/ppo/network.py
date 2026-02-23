@@ -17,13 +17,14 @@ class CNNActorCritic(nn.Module):
     Output: (logits, value)
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, max_regimes: int = 10, regime_emb_dim: int = 16):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, max_regimes: int = 10):
         super().__init__()
         self.c, self.h, self.w = obs_shape
+        self.max_regimes = max_regimes
 
         # Shared CNN feature extractor
         self.encoder = nn.Sequential(
-            nn.Conv2d(self.c, 32, kernel_size=3, padding=1),
+            nn.Conv2d(self.c + self.max_regimes, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -32,11 +33,9 @@ class CNNActorCritic(nn.Module):
             nn.Flatten(),
         )
 
-        self.regime_embedding = nn.Embedding(max_regimes, regime_emb_dim)
-
         with torch.no_grad():
-            dummy = torch.zeros(1, self.c, self.h, self.w)
-            flat_size = self.encoder(dummy).shape[1] + regime_emb_dim
+            dummy = torch.zeros(1, self.c + self.max_regimes, self.h, self.w)
+            flat_size = self.encoder(dummy).shape[1]
 
         # Actor head (policy)
         self.actor_head = nn.Sequential(
@@ -79,12 +78,21 @@ class CNNActorCritic(nn.Module):
                     nn.init.zeros_(layer.bias)
 
     def forward(self, obs: torch.Tensor, regime_id: torch.Tensor | None = None):
-        features = self.encoder(obs)
+        B = obs.shape[0]
         if regime_id is None:
-            regime_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
-        regime_emb = self.regime_embedding(regime_id)
-        fused_features = torch.cat([features, regime_emb], dim=1)
-        return self.actor_head(fused_features), self.critic_head(fused_features).squeeze(-1)
+            regime_id = torch.zeros(B, dtype=torch.long, device=obs.device)
+            
+        # One-hot encode regime_id: (B,) -> (B, max_regimes)
+        regime_one_hot = torch.nn.functional.one_hot(regime_id, num_classes=self.max_regimes).float()
+        
+        # Spatial Broadcast: (B, max_regimes) -> (B, max_regimes, H, W)
+        regime_spatial = regime_one_hot.view(B, self.max_regimes, 1, 1).expand(-1, -1, self.h, self.w)
+        
+        # Concatenate along channel dimension
+        fused_obs = torch.cat([obs, regime_spatial], dim=1)
+        
+        features = self.encoder(fused_obs)
+        return self.actor_head(features), self.critic_head(features).squeeze(-1)
 
     def act(self, obs: torch.Tensor, regime_id: torch.Tensor | None = None):
         """Sample an action and return (action, log_prob, entropy, value)."""

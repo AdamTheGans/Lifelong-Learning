@@ -276,7 +276,8 @@ def plot_run(logdir, run_name):
         "step_rew": "charts/reward_step_mean",
         "mowm_active": "mowm/active_regime_id",
         "mowm_num": "mowm/num_regimes",
-        "mowm_ema": "mowm/ema_loss",
+        "mowm_ema_old": "mowm/ema_loss",
+        "mowm_ema_active": "mowm/ema_loss_active",
         "mowm_avg": "mowm/epoch_avg_loss",
         "mowm_spawn": "mowm/spawn_occurred"
     }
@@ -471,8 +472,9 @@ def plot_run(logdir, run_name):
     # --- Generate Additional Separate Plots ---
     
     # 4. MoWM Surprise vs EMA Threshold
-    if tag_map["mowm_ema"] in data and tag_map["mowm_avg"] in data:
-        df_ema = data[tag_map["mowm_ema"]]
+    ema_key = tag_map["mowm_ema_active"] if tag_map["mowm_ema_active"] in data else tag_map.get("mowm_ema_old")
+    if ema_key and ema_key in data and tag_map["mowm_avg"] in data:
+        df_ema = data[ema_key]
         df_avg = data[tag_map["mowm_avg"]]
         
         fig2, ax_ema = plt.subplots(figsize=(14, 7))

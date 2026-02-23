@@ -20,6 +20,10 @@ def test_mowm_spawning_logic():
     assert abs(mowm.ema_losses[0] - 0.1) < 1e-4
     assert len(mowm.models) == 1
     
+    # Fill the EMA history with the baseline so slope = 0.0
+    for _ in range(10):
+        mowm.ema_history[0].append(0.1)
+    
     # 3. Test a normal fluctuation (e.g. loss jumping to 0.4)
     # Threshold is 5.0, so 0.4 / 0.1 = 4.0 < 5.0 (Should NOT spawn)
     # Must fill the surprise window to trigger a check

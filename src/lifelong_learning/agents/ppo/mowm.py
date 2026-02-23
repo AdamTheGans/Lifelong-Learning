@@ -25,6 +25,7 @@ class MixtureOfWorldModels(nn.Module):
         # Status variables
         self.active_regime_id = 0
         self.ema_losses = [1.0]
+        self.ema_history = [collections.deque([1.0], maxlen=10)]
         
         # Hyperparameters
         self.ema_alpha = 0.05
@@ -36,6 +37,7 @@ class MixtureOfWorldModels(nn.Module):
         self.surprise_window_size = 100      # Smooth surprise across 100 transitions
         self.switch_penalty = 1.2            # Hysteresis stickiness penalty
         self.ema_epsilon = 1e-5              # Denominator safety avoids div by zero
+        self.max_ema_growth = 0.10           # Trend-Aware Spawning: Max relative growth
         
         # State tracking
         self.force_active_until = 0
@@ -48,6 +50,7 @@ class MixtureOfWorldModels(nn.Module):
         and not during inference or spawn checks, to keep the baseline stable during surprise spikes.
         """
         self.ema_losses[self.active_regime_id] = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_losses[self.active_regime_id])
+        self.ema_history[self.active_regime_id].append(self.ema_losses[self.active_regime_id])
 
     def infer_regime(
         self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor, global_step: int
@@ -119,6 +122,15 @@ class MixtureOfWorldModels(nn.Module):
             
         smoothed_loss = sum(self.surprise_window) / len(self.surprise_window)
 
+        # False Spawn Guard: Policy Shift Check (Trend-Aware Spawning)
+        # If the EMA baseline is already rising rapidly, the agent is exploring and we should block spawns.
+        history = self.ema_history[best_regime_id]
+        if len(history) == history.maxlen:
+            relative_growth = (history[-1] - history[0]) / max(history[0], self.ema_epsilon)
+            if relative_growth > self.max_ema_growth:
+                self.surprise_window.clear()
+                return False
+
         ratio = smoothed_loss / max(self.ema_losses[best_regime_id], self.ema_epsilon)
         
         if ratio > self.surprise_threshold:
@@ -135,6 +147,7 @@ class MixtureOfWorldModels(nn.Module):
             # Update internal tracking variables
             self.active_regime_id = len(self.models) - 1
             self.ema_losses.append(smoothed_loss)  # Set EMA for the new regime baseline
+            self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
             self.force_active_until = global_step + self.newborn_grace_period
             self.surprise_window.clear()
             

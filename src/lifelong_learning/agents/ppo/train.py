@@ -131,6 +131,13 @@ def train_ppo(
             elif "ema_loss" in ckpt["mowm_state"]:
                 # Backwards compatibility
                 world_model.ema_losses = [ckpt["mowm_state"]["ema_loss"]] * len(world_model.models)
+            
+            if "ema_history" in ckpt["mowm_state"]:
+                # Convert list of lists back to list of deques
+                world_model.ema_history = [deque(h, maxlen=10) for h in ckpt["mowm_state"]["ema_history"]]
+            else:
+                # Backwards compatibility
+                world_model.ema_history = [deque([ema], maxlen=10) for ema in world_model.ema_losses]
 
             if "force_active_until" in ckpt["mowm_state"]:
                 world_model.force_active_until = ckpt["mowm_state"]["force_active_until"]
@@ -531,6 +538,7 @@ def train_ppo(
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
                         "ema_losses": world_model.ema_losses,
+                        "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "force_active_until": world_model.force_active_until,
                     },
                     "cfg": cfg.__dict__,

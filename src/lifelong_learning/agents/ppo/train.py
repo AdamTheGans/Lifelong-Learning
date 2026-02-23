@@ -196,11 +196,14 @@ def train_ppo(
             real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
 
             # Infer best regime and check spawn
-            best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t)
+            real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
+            best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t)
             did_spawn = world_model.check_and_spawn(lowest_loss)
             if did_spawn:
                 wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
                 spawn_occurred = True
+            else:
+                world_model.active_regime_id = best_id
             
             # Update the current_regime tensor for the buffer and for next step's policy
             current_regime.fill_(world_model.active_regime_id)

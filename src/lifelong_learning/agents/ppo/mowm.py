@@ -26,7 +26,7 @@ class MixtureOfWorldModels(nn.Module):
         self.ema_loss = 1.0
         
         # Hyperparameters
-        self.ema_alpha = 0.01
+        self.ema_alpha = 0.05
         self.surprise_threshold = 5.0
 
     def update_ema(self, current_loss: float):
@@ -37,7 +37,7 @@ class MixtureOfWorldModels(nn.Module):
         """
         self.ema_loss = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_loss)
 
-    def infer_regime(self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor) -> tuple[int, float]:
+    def infer_regime(self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor) -> tuple[int, float]:
         """
         Evaluates a transition across all models and returns the ID of the best fitting regime
         and its corresponding lowest loss.
@@ -51,9 +51,13 @@ class MixtureOfWorldModels(nn.Module):
 
         for i, model in enumerate(self.models):
             with torch.no_grad():
-                next_obs_pred, _ = model(state, action)
-                # Compute cross-entropy loss
-                loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
+                next_obs_pred, pred_reward = model(state, action)
+                # Compute cross-entropy loss for state
+                state_loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
+                # Compute MSE loss for reward
+                reward_loss = F.mse_loss(pred_reward, reward).item()
+                # Total surprise
+                loss = state_loss + reward_loss
                 
             if loss < lowest_loss:
                 lowest_loss = loss

@@ -12,7 +12,8 @@ Lifelong-Learning/
 │   ├── agents/ppo/
 │   │   ├── train.py            # Core training loop (Dyna-PPO logic)
 │   │   ├── ppo.py              # PPO loss and update function
-│   │   ├── network.py          # Actor-Critic network architecture
+│   │   ├── network.py          # Context-aware Actor-Critic network (accepts regime_id)
+│   │   ├── mowm.py             # Mixture of World Models manager (handles regime switching)
 │   │   ├── world_model.py      # Simple World Model (predicts state/reward)
 │   │   └── buffers.py          # Rollout buffer with GAE
 │   ├── envs/

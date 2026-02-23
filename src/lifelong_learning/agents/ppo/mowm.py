@@ -1,0 +1,94 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+
+class MixtureOfWorldModels(nn.Module):
+    """
+    Manager class for a mixture of SimpleWorldModels to support Continuous Learning.
+    Dynamically spawns new world models when the prediction error (surprise) for a transition
+    exceeds a dynamically tracked threshold (EMA).
+    """
+
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256):
+        super().__init__()
+        self.obs_shape = obs_shape
+        self.n_actions = n_actions
+        self.hidden_dim = hidden_dim
+
+        # Initialize with a single world model
+        initial_model = SimpleWorldModel(obs_shape, n_actions, hidden_dim)
+        self.models = nn.ModuleList([initial_model])
+        
+        # State variables
+        self.active_regime_id = 0
+        self.ema_loss = 1.0
+        
+        # Hyperparameters
+        self.ema_alpha = 0.01
+        self.surprise_threshold = 5.0
+
+    def update_ema(self, current_loss: float):
+        """
+        Updates the exponential moving average of the loss.
+        Note: This should ONLY be called externally during the training loop of the active world model,
+        and not during inference or spawn checks, to keep the baseline stable during surprise spikes.
+        """
+        self.ema_loss = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_loss)
+
+    def infer_regime(self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor) -> tuple[int, float]:
+        """
+        Evaluates a transition across all models and returns the ID of the best fitting regime
+        and its corresponding lowest loss.
+        """
+        best_regime_id = 0
+        lowest_loss = float('inf')
+
+        # Convert next_state (B, C, H, W) float to class indices (B, H, W) for CE Loss
+        # Assuming next_state is one-hot or normalized probabilities
+        next_state_indices = torch.argmax(next_state, dim=1)
+
+        for i, model in enumerate(self.models):
+            with torch.no_grad():
+                next_obs_pred, _ = model(state, action)
+                # Compute cross-entropy loss
+                loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
+                
+            if loss < lowest_loss:
+                lowest_loss = loss
+                best_regime_id = i
+                
+        return best_regime_id, lowest_loss
+
+    def check_and_spawn(self, lowest_loss: float) -> bool:
+        """
+        Checks if the lowest available loss constitutes a surprise based on the dynamic EMA.
+        If so, spawns a new SimpleWorldModel to handle the new regime safely.
+        """
+        # The 0.1 prevents division by zero / micro-spike explosions
+        ratio = lowest_loss / max(self.ema_loss, 0.1)
+        
+        if ratio > self.surprise_threshold:
+            # Instantiate a new world model
+            new_model = SimpleWorldModel(self.obs_shape, self.n_actions, self.hidden_dim)
+            
+            # CRITICAL: Prevent PyTorch Device Trap by placing the new model on the same device
+            device = next(self.models[0].parameters()).device
+            new_model = new_model.to(device)
+            
+            # Append it to the mixture of experts
+            self.models.append(new_model)
+            
+            # Update internal tracking variables
+            self.active_regime_id = len(self.models) - 1
+            self.ema_loss = lowest_loss  # Reset EMA for the new regime baseline
+            
+            return True
+        return False
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor, regime_id: int):
+        """
+        Routes the forward pass to the specific world model determined by the given regime_id.
+        """
+        return self.models[regime_id](state, action)

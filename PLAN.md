@@ -62,9 +62,10 @@ Training occurs in three phases per update:
     - Route based on prediction error (Surprise).
 
 ### 4. Future Direction B: Regime-Specific World Models (The "Library" Approach)
-- **Idea**: Explicitly learn distinct World Models for different regimes and "route" the PPO agent to the correct one.
+- **Status**: [ ] In Progress (Phases 2/4 Complete). Context-aware PPO agent is in place. `mowm.py` manager class created to manage dynamic World Models via EMA prediction error. To be integrated into training next.
+- **Idea**: Explicitly learn distinct World Models for different regimes and "route" the PPO agent to the correct one using an EMA-scaled Surprise Threshold.
 - **Mechanism**:
-    - Usage: PPO receives a `REGIME_ID` input (latent or explicit).
+    - Usage: PPO receives a `REGIME_ID` input (latent or explicit) via an embedding layer.
     - Training: Maintain a library of WMs. When a regime switch is detected (high surprise), spin up a new WM or retrieve a matching old one.
     - Dreaming: PPO practices on *all* known WMs in the library, preventing catastrophic forgetting of the policy.
 

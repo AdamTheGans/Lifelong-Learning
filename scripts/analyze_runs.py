@@ -480,7 +480,10 @@ def plot_run(logdir, run_name):
         ax_ema.set_xlabel("Global Steps", fontsize=12)
         ax_ema.set_ylabel("Loss", fontsize=12)
         
-        ax_ema.plot(df_ema['step'], df_ema['value'], c='navy', lw=2, label="EMA Loss (Threshold)")
+        # Calculate the true threshold matching mowm.check_and_spawn logic
+        true_threshold = np.maximum(df_ema['value'], 0.1) * 5.0
+        
+        ax_ema.plot(df_ema['step'], true_threshold, c='navy', lw=2, label="True Threshold (max(EMA, 0.1) * 5.0)")
         ax_ema.plot(df_avg['step'], df_avg['value'], c='crimson', lw=1, alpha=0.7, label="Epoch Avg Loss (Surprise)")
         
         if tag_map["mowm_spawn"] in data:

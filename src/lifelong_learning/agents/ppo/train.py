@@ -126,7 +126,12 @@ def train_ppo(
 
         if "mowm_state" in ckpt:
             world_model.active_regime_id = ckpt["mowm_state"]["active_regime_id"]
-            world_model.ema_loss = ckpt["mowm_state"]["ema_loss"]
+            if "ema_losses" in ckpt["mowm_state"]:
+                world_model.ema_losses = ckpt["mowm_state"]["ema_losses"]
+            elif "ema_loss" in ckpt["mowm_state"]:
+                # Backwards compatibility
+                world_model.ema_losses = [ckpt["mowm_state"]["ema_loss"]] * len(world_model.models)
+
             if "force_active_until" in ckpt["mowm_state"]:
                 world_model.force_active_until = ckpt["mowm_state"]["force_active_until"]
 
@@ -200,7 +205,7 @@ def train_ppo(
             # Infer best regime and check spawn
             real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
             best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
-            did_spawn = world_model.check_and_spawn(lowest_loss, global_step)
+            did_spawn = world_model.check_and_spawn(lowest_loss, best_id, global_step)
             if did_spawn:
                 wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
                 spawn_occurred = True
@@ -471,8 +476,11 @@ def train_ppo(
         # MoWM metrics
         logger.scalar("mowm/active_regime_id", world_model.active_regime_id, global_step)
         logger.scalar("mowm/num_regimes", len(world_model.models), global_step)
-        logger.scalar("mowm/ema_loss", world_model.ema_loss, global_step)
+        logger.scalar("mowm/ema_loss_active", world_model.ema_losses[world_model.active_regime_id], global_step)
         
+        for i, ema_l in enumerate(world_model.ema_losses):
+            logger.scalar(f"mowm/ema_loss_model_{i}", ema_l, global_step)
+            
         avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
         logger.scalar("mowm/spawn_occurred", float(collect_stats["spawn_occurred"]), global_step)
@@ -522,7 +530,7 @@ def train_ppo(
                     "wm_optimizers_state_dict": wm_opts_state,
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
-                        "ema_loss": world_model.ema_loss,
+                        "ema_losses": world_model.ema_losses,
                         "force_active_until": world_model.force_active_until,
                     },
                     "cfg": cfg.__dict__,

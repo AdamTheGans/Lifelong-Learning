@@ -14,7 +14,7 @@ def test_mowm_spawning_logic():
 
     # 2. Simulate standard learning (EMA drops to ~0.1)
     for _ in range(1000):
-        mowm.update_ema(0.1)
+        mowm.update_ema(0.1, steps_added=10)
     
     # After 1000 steps with alpha=0.05, EMA should be very close to 0.1
     assert abs(mowm.ema_losses[0] - 0.1) < 1e-4

@@ -138,6 +138,14 @@ def train_ppo(
             else:
                 # Backwards compatibility
                 world_model.ema_history = [deque([ema], maxlen=10) for ema in world_model.ema_losses]
+            
+            if "has_mastered" in ckpt["mowm_state"]:
+                world_model.has_mastered = ckpt["mowm_state"]["has_mastered"]
+                world_model.steps_under_threshold = ckpt["mowm_state"]["steps_under_threshold"]
+            else:
+                # Backwards compatibility: Assume models initialized before this feature have already mastered
+                world_model.has_mastered = [True] * len(world_model.models)
+                world_model.steps_under_threshold = [world_model.mastery_buffer_steps] * len(world_model.models)
 
             if "force_active_until" in ckpt["mowm_state"]:
                 world_model.force_active_until = ckpt["mowm_state"]["force_active_until"]
@@ -371,7 +379,7 @@ def train_ppo(
 
         if epoch_losses:
             avg_loss = sum(epoch_losses) / len(epoch_losses)
-            world_model.update_ema(avg_loss)
+            world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps)
 
         return wm_stats
 
@@ -539,6 +547,8 @@ def train_ppo(
                         "active_regime_id": world_model.active_regime_id,
                         "ema_losses": world_model.ema_losses,
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
+                        "has_mastered": world_model.has_mastered,
+                        "steps_under_threshold": world_model.steps_under_threshold,
                         "force_active_until": world_model.force_active_until,
                     },
                     "cfg": cfg.__dict__,

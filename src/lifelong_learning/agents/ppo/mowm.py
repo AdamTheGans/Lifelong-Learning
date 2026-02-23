@@ -26,6 +26,8 @@ class MixtureOfWorldModels(nn.Module):
         self.active_regime_id = 0
         self.ema_losses = [1.0]
         self.ema_history = [collections.deque([1.0], maxlen=10)]
+        self.has_mastered = [False]
+        self.steps_under_threshold = [0]
         
         # Hyperparameters
         self.ema_alpha = 0.05
@@ -38,19 +40,29 @@ class MixtureOfWorldModels(nn.Module):
         self.switch_penalty = 1.2            # Hysteresis stickiness penalty
         self.ema_epsilon = 1e-5              # Denominator safety avoids div by zero
         self.max_ema_growth = 0.10           # Trend-Aware Spawning: Max relative growth
+        self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
+        self.mastery_buffer_steps = 5000     # Mastery Prerequisite: Continuous steps required below threshold
         
         # State tracking
         self.force_active_until = 0
         self.surprise_window = collections.deque(maxlen=self.surprise_window_size)
 
-    def update_ema(self, current_loss: float):
+    def update_ema(self, current_loss: float, steps_added: int = 0):
         """
         Updates the exponential moving average of the loss.
         Note: This should ONLY be called externally during the training loop of the active world model,
         and not during inference or spawn checks, to keep the baseline stable during surprise spikes.
         """
-        self.ema_losses[self.active_regime_id] = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_losses[self.active_regime_id])
-        self.ema_history[self.active_regime_id].append(self.ema_losses[self.active_regime_id])
+        idx = self.active_regime_id
+        self.ema_losses[idx] = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_losses[idx])
+        self.ema_history[idx].append(self.ema_losses[idx])
+
+        if self.ema_losses[idx] < self.mastery_loss_threshold:
+            self.steps_under_threshold[idx] += steps_added
+            if self.steps_under_threshold[idx] >= self.mastery_buffer_steps:
+                self.has_mastered[idx] = True
+        else:
+            self.steps_under_threshold[idx] = 0
 
     def infer_regime(
         self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor, global_step: int
@@ -108,6 +120,12 @@ class MixtureOfWorldModels(nn.Module):
         Checks if the lowest available loss constitutes a surprise based on the dynamic EMA.
         Includes safeguards for global grace period, newborn grace period, and sequence smoothing.
         """
+        # Mastery Prerequisite Guard
+        # We cannot spawn a new model if the current regime hasn't fully mastered the environment yet.
+        if not self.has_mastered[self.active_regime_id]:
+            self.surprise_window.clear()
+            return False
+
         # Global Step 0 Grace Guard & Newborn Stickiness Guard
         if global_step < self.global_grace_period or global_step < self.force_active_until:
             self.surprise_window.clear()
@@ -148,6 +166,8 @@ class MixtureOfWorldModels(nn.Module):
             self.active_regime_id = len(self.models) - 1
             self.ema_losses.append(smoothed_loss)  # Set EMA for the new regime baseline
             self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
+            self.has_mastered.append(False)
+            self.steps_under_threshold.append(0)
             self.force_active_until = global_step + self.newborn_grace_period
             self.surprise_window.clear()
             

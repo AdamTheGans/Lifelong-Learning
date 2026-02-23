@@ -172,6 +172,7 @@ def train_ppo(
 
         episodic_intrinsic_rewards = []
         episodic_intrinsic_rewards_max = []
+        spawn_occurred = False
 
         for t in range(cfg.num_steps):
             global_step += num_envs
@@ -199,6 +200,7 @@ def train_ppo(
             did_spawn = world_model.check_and_spawn(lowest_loss)
             if did_spawn:
                 wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                spawn_occurred = True
             
             # Update the current_regime tensor for the buffer and for next step's policy
             current_regime.fill_(world_model.active_regime_id)
@@ -304,6 +306,7 @@ def train_ppo(
             "buffer_rewards_max": buffer.rewards.max().item(),
             "buffer_rewards_std": buffer.rewards.std().item(),
             "buffer_rewards_abs_mean": buffer.rewards.abs().mean().item(),
+            "spawn_occurred": spawn_occurred,
         }
 
     def update_world_model():
@@ -459,6 +462,15 @@ def train_ppo(
 
         for k, v in avg_wm_stats.items():
             logger.scalar(k, v, global_step)
+
+        # MoWM metrics
+        logger.scalar("mowm/active_regime_id", world_model.active_regime_id, global_step)
+        logger.scalar("mowm/num_regimes", len(world_model.models), global_step)
+        logger.scalar("mowm/ema_loss", world_model.ema_loss, global_step)
+        
+        avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
+        logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
+        logger.scalar("mowm/spawn_occurred", float(collect_stats["spawn_occurred"]), global_step)
 
         if dream_stats and dream_buffer is not None:
             avg_dream_stats = {f"ppo/imagined_{k.split('/')[-1]}": np.mean([s[k] for s in dream_stats]) for k in dream_stats[0]}

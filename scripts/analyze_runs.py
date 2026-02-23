@@ -82,7 +82,7 @@ def detect_switches(data):
 
     # Calculate rolling mean of regime label (0 or 1)
     window_size = 20
-    combined["smoothed_regime"] = combined["regime"].rolling(window=window_size, center=True).mean()
+    combined["smoothed_regime"] = combined["regime"].rolling(window=window_size, center=True, min_periods=1).mean()
     
     # Find crossings of 0.5
     combined["pred_regime"] = (combined["smoothed_regime"] > 0.5).astype(int)
@@ -92,15 +92,17 @@ def detect_switches(data):
     switch_points = combined[combined["switch"] == 1]
     switches = switch_points["step"].tolist()
     
-    # Clean up close duplicates
+    # Clean up close duplicates and fake switches at the very end
     if not switches:
         return None
         
     cleaned_switches = []
+    max_step = combined["step"].max()
     if switches:
-        cleaned_switches.append(switches[0])
+        if switches[0] < max_step - 5000:
+            cleaned_switches.append(switches[0])
         for s in switches[1:]:
-            if s - cleaned_switches[-1] > 5000: # Minimum regime length heuristic
+            if s - cleaned_switches[-1] > 5000 and s < max_step - 5000: # Minimum regime length heuristic
                 cleaned_switches.append(s)
                 
     return cleaned_switches
@@ -271,7 +273,12 @@ def plot_run(logdir, run_name):
         "intrinsic_ratio": "ppo/intrinsic_reward_ratio",
         "regime0": "charts/r_regime_0",
         "regime1": "charts/r_regime_1",
-        "step_rew": "charts/reward_step_mean"
+        "step_rew": "charts/reward_step_mean",
+        "mowm_active": "mowm/active_regime_id",
+        "mowm_num": "mowm/num_regimes",
+        "mowm_ema": "mowm/ema_loss",
+        "mowm_avg": "mowm/epoch_avg_loss",
+        "mowm_spawn": "mowm/spawn_occurred"
     }
     
     data = load_data_from_logdir(logdir, list(tag_map.values()))
@@ -296,6 +303,13 @@ def plot_run(logdir, run_name):
         # Just 0 to max
         boundaries = [0, max_step]
 
+    # Ground truth regime values based on boundaries
+    def get_true_regime(step):
+        for i, b in enumerate(boundaries[:-1]):
+            if step >= b and step < boundaries[i+1]:
+                return i % 2
+        return (len(boundaries) - 2) % 2
+
     # --- Generate Separate Regime Plots ---
     # Ensure graphs directory exists
     os.makedirs("graphs", exist_ok=True)
@@ -308,7 +322,7 @@ def plot_run(logdir, run_name):
         out_file = os.path.join("graphs", f"regime_analysis_step_reward_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_step_rew, df_wm_rew_loss,
-            "Regime Analysis: Step Reward vs Surprise", "Mean Step Reward",
+            f"Regime Analysis: Step Reward vs Surprise\n{run_name}", "Mean Step Reward",
             'tab:green', 'tab:red',
             boundaries, max_step, False, output_path=out_file
         )
@@ -319,7 +333,7 @@ def plot_run(logdir, run_name):
         out_file = os.path.join("graphs", f"regime_analysis_episodic_return_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_eps_ret, df_wm_rew_loss,
-            "Regime Analysis: Episodic Return vs Surprise", "Episodic Return",
+            f"Regime Analysis: Episodic Return vs Surprise\n{run_name}", "Episodic Return",
             'tab:blue', 'tab:red',
             boundaries, max_step, True, output_path=out_file
         )
@@ -330,7 +344,7 @@ def plot_run(logdir, run_name):
         out_file = os.path.join("graphs", f"regime_analysis_success_rate_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_success, df_wm_rew_loss,
-            "Regime Analysis: Success Rate vs Surprise", "Success Rate",
+            f"Regime Analysis: Success Rate vs Surprise\n{run_name}", "Success Rate",
             'tab:green', 'tab:red',
             boundaries, max_step, True, output_path=out_file
         )
@@ -415,21 +429,78 @@ def plot_run(logdir, run_name):
     ax5.set_title("World Model Losses (Log)")
     ax5.legend(fontsize=8)
 
-    # Panel 6: Episodic Return vs Surprise (Regime Analysis) — Duplicate of separate plot
+    # Panel 6: MoWM Regime Tracking
     ax6 = fig.add_subplot(2, 3, 6)
-    if df_eps_ret is not None:
-        plot_single_graph(
-            df_eps_ret, df_wm_rew_loss, 
-            "Regime Analysis: Episodic Return vs Surprise",
-            "Episodic Return",
-            'tab:blue', 'tab:red',
-            boundaries, max_step, True, 
-            ax=ax6
-        )
+    if tag_map["mowm_active"] in data and tag_map["mowm_num"] in data:
+        df_active = data[tag_map["mowm_active"]]
+        df_num = data[tag_map["mowm_num"]]
+        
+        # Plot true regime for comparison (very thick & transparent to prevent hiding predicted lines)
+        steps = np.linspace(0, max_step, 10000)
+        true_regimes = [get_true_regime(s) for s in steps]
+        line_true, = ax6.plot(steps, true_regimes, c="gray", lw=8, alpha=0.3, drawstyle='steps-post', label="True Regime (0/1)")
+
+        # Plot predicted regime
+        line_pred, = ax6.plot(df_active['step'], df_active['value'], c="purple", lw=1.5, drawstyle='steps-post', label="Predicted Regime (active_id)")
+        
+        ax6.set_title("MoWM Regime Tracking")
+        ax6.set_xlabel("Global Steps")
+        ax6.set_ylabel("Regime ID", color="purple")
+        max_active = int(df_active['value'].max()) if not df_active.empty else 1
+        ax6.set_yticks(range(max_active + 2))
+        ax6.tick_params(axis='y', labelcolor="purple")
+        ax6.grid(True, axis='y', linestyle='--', alpha=0.4)
+        
+        # Plot new regime spawns on a secondary Y-axis (twinx)
+        ax6_right = ax6.twinx()
+        line_spawns, = ax6_right.plot(df_num['step'], df_num['value'] - 1, c="green", lw=2, ls=":", drawstyle='steps-post', label="New Regime Spawns")
+        ax6_right.set_ylabel("Spawns Count", color="green")
+        max_spawns = int((df_num['value'] - 1).max()) if not df_num.empty else 1
+        ax6_right.set_yticks(range(max_spawns + 2))
+        ax6_right.tick_params(axis='y', labelcolor="green")
+        
+        # Combine legends
+        lines = [line_true, line_pred, line_spawns]
+        labels = [l.get_label() for l in lines]
+        ax6.legend(lines, labels, fontsize=8, loc='upper left')
     else:
-        ax6.text(0.5, 0.5, "No Episodic Return Data", ha='center', va='center')
+        ax6.text(0.5, 0.5, "No MoWM Data\n(Metrics missing in old runs)", ha='center', va='center', color='gray')
 
     plt.tight_layout()
+
+    # --- Generate Additional Separate Plots ---
+    
+    # 4. MoWM Surprise vs EMA Threshold
+    if tag_map["mowm_ema"] in data and tag_map["mowm_avg"] in data:
+        df_ema = data[tag_map["mowm_ema"]]
+        df_avg = data[tag_map["mowm_avg"]]
+        
+        fig2, ax_ema = plt.subplots(figsize=(14, 7))
+        ax_ema.set_title(f"MoWM Surprise metrics: EMA vs Epoch Avg Loss\n{run_name}", fontsize=14)
+        ax_ema.set_xlabel("Global Steps", fontsize=12)
+        ax_ema.set_ylabel("Loss", fontsize=12)
+        
+        ax_ema.plot(df_ema['step'], df_ema['value'], c='navy', lw=2, label="EMA Loss (Threshold)")
+        ax_ema.plot(df_avg['step'], df_avg['value'], c='crimson', lw=1, alpha=0.7, label="Epoch Avg Loss (Surprise)")
+        
+        if tag_map["mowm_spawn"] in data:
+            df_spawn = data[tag_map["mowm_spawn"]]
+            spawn_x = df_spawn[df_spawn['value'] == 1.0]['step']
+            if not spawn_x.empty:
+                for x in spawn_x:
+                    ax_ema.axvline(x, color='black', ls=':', lw=1, alpha=0.5)
+                # dummy line for legend
+                ax_ema.plot([], [], color='black', ls=':', lw=1, label="Spawn Event")
+        
+        ax_ema.set_yscale('log')
+        ax_ema.legend(loc='upper right')
+        ax_ema.grid(True, linestyle='--', alpha=0.5)
+        
+        out_file2 = os.path.join("graphs", f"mowm_surprise_metrics_{run_name.replace(os.path.sep, '_')}.png")
+        plt.tight_layout()
+        plt.savefig(out_file2, dpi=150)
+        plt.close(fig2)
+        print(f"  📊 Saved MoWM Surprise metrics plot to: {out_file2}")
     
     # Save Main Figure
     out_path = os.path.join("graphs", f"analysis_{run_name.replace(os.path.sep, '_')}.png")

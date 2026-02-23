@@ -62,7 +62,7 @@ Training occurs in three phases per update:
     - Route based on prediction error (Surprise).
 
 ### 4. Future Direction B: Regime-Specific World Models (The "Library" Approach)
-- **Status**: [x] Complete. Context-aware PPO agent is in place. `MixtureOfWorldModels` manager class dynamically spawns and routes World Models via EMA prediction error. Successfully integrated into the training loop and tested.
+- **Status**: [ ] In Testing. Context-aware PPO agent is in place. `MixtureOfWorldModels` manager class dynamically spawns and routes World Models via EMA prediction error. Successfully integrated into the training loop and tested.
 - **Idea**: Explicitly learn distinct World Models for different regimes and "route" the PPO agent to the correct one using an EMA-scaled Surprise Threshold.
 - **Mechanism**:
     - Usage: PPO receives a `REGIME_ID` input (latent or explicit) via an embedding layer.

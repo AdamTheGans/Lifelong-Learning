@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import collections
 
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
 
@@ -21,13 +22,22 @@ class MixtureOfWorldModels(nn.Module):
         initial_model = SimpleWorldModel(obs_shape, n_actions, hidden_dim)
         self.models = nn.ModuleList([initial_model])
         
-        # State variables
+        # Status variables
         self.active_regime_id = 0
         self.ema_loss = 1.0
         
         # Hyperparameters
         self.ema_alpha = 0.05
         self.surprise_threshold = 5.0
+        
+        # MoWM Routing Fixes
+        self.global_grace_period = 20000     # No spawns before this step
+        self.newborn_grace_period = 10000    # Force active regime after spawn
+        self.surprise_window_size = 100      # Smooth surprise across 100 transitions
+        
+        # State tracking
+        self.force_active_until = 0
+        self.surprise_window = collections.deque(maxlen=self.surprise_window_size)
 
     def update_ema(self, current_loss: float):
         """
@@ -37,13 +47,20 @@ class MixtureOfWorldModels(nn.Module):
         """
         self.ema_loss = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_loss)
 
-    def infer_regime(self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor) -> tuple[int, float]:
+    def infer_regime(
+        self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor, global_step: int
+    ) -> tuple[int, float]:
         """
         Evaluates a transition across all models and returns the ID of the best fitting regime
-        and its corresponding lowest loss.
+        and its corresponding lowest loss. Handles newborn stickiness to force training.
         """
-        best_regime_id = 0
-        lowest_loss = float('inf')
+        # Newborn stickiness bypass: if in grace period, stick with active model
+        if global_step < self.force_active_until:
+            best_regime_id = self.active_regime_id
+            lowest_loss = float('inf')  # Value doesn't matter, we bypass routing and spawning
+        else:
+            best_regime_id = 0
+            lowest_loss = float('inf')
 
         # Convert next_state (B, C, H, W) float to class indices (B, H, W) for CE Loss
         # Assuming next_state is one-hot or normalized probabilities
@@ -59,19 +76,43 @@ class MixtureOfWorldModels(nn.Module):
                 # Total surprise
                 loss = state_loss + reward_loss
                 
-            if loss < lowest_loss:
-                lowest_loss = loss
-                best_regime_id = i
+            # Only find the lowest loss if we aren't bypassing via newborn stickiness
+            if global_step >= self.force_active_until:
+                if loss < lowest_loss:
+                    lowest_loss = loss
+                    best_regime_id = i
+                
+        # If bypassing, calculate just the active model's loss to return
+        if global_step < self.force_active_until:
+            with torch.no_grad():
+                next_obs_pred, pred_reward = self.models[self.active_regime_id](state, action)
+                state_loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
+                reward_loss = F.mse_loss(pred_reward, reward).item()
+                lowest_loss = state_loss + reward_loss
                 
         return best_regime_id, lowest_loss
 
-    def check_and_spawn(self, lowest_loss: float) -> bool:
+    def check_and_spawn(self, lowest_loss: float, global_step: int) -> bool:
         """
         Checks if the lowest available loss constitutes a surprise based on the dynamic EMA.
-        If so, spawns a new SimpleWorldModel to handle the new regime safely.
+        Includes safeguards for global grace period, newborn grace period, and sequence smoothing.
         """
+        # Global Step 0 Grace Guard & Newborn Stickiness Guard
+        if global_step < self.global_grace_period or global_step < self.force_active_until:
+            self.surprise_window.clear()
+            return False
+            
+        # Surprise Smoothing
+        self.surprise_window.append(lowest_loss)
+        
+        # Wait until window is full before making spawn decisions
+        if len(self.surprise_window) < self.surprise_window_size:
+            return False
+            
+        smoothed_loss = sum(self.surprise_window) / len(self.surprise_window)
+
         # The 0.1 prevents division by zero / micro-spike explosions
-        ratio = lowest_loss / max(self.ema_loss, 0.1)
+        ratio = smoothed_loss / max(self.ema_loss, 0.1)
         
         if ratio > self.surprise_threshold:
             # Instantiate a new world model
@@ -86,7 +127,9 @@ class MixtureOfWorldModels(nn.Module):
             
             # Update internal tracking variables
             self.active_regime_id = len(self.models) - 1
-            self.ema_loss = lowest_loss  # Reset EMA for the new regime baseline
+            self.ema_loss = smoothed_loss  # Reset EMA for the new regime baseline
+            self.force_active_until = global_step + self.newborn_grace_period
+            self.surprise_window.clear()
             
             return True
         return False

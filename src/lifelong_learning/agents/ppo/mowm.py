@@ -34,7 +34,7 @@ class MixtureOfWorldModels(nn.Module):
 
         # Hyperparameters
         self.ema_alpha = 0.05
-        self.anomaly_threshold = 2.0  # Absolute loss magnitude required to trigger a spawn
+        self.anomaly_threshold = 0.20  # Absolute loss magnitude required to trigger a spawn
         
         # MoWM Routing Fixes
         self.global_grace_period = 20000     # No spawns before this step

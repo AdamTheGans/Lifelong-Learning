@@ -580,7 +580,8 @@ def train_ppo(
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
         if cfg.mode == "dyna" and imagined_horizon > 0:
-            num_dream_rollouts = int(max(1, cfg.num_steps // imagined_horizon) * dreaming_ratio)
+            current_dreaming_ratio = 1.0 if len(world_model.models) > 1 else 0.25
+            num_dream_rollouts = int(max(1, cfg.num_steps // imagined_horizon) * current_dreaming_ratio)
             if num_dream_rollouts > 0:
                 for _ in range(num_dream_rollouts):
                     db, _ = generate_dream_experience(state_reservoir)

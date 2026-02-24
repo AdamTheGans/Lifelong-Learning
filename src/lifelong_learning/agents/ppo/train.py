@@ -98,7 +98,6 @@ def train_ppo(
         world_model.models.append(new_model)
         
         world_model.ema_losses.append(1.0)
-        world_model.best_emas.append(1.0)
         world_model.routing_emas.append(1.0)
         world_model.ema_history.append(deque([1.0], maxlen=10))
         world_model.has_mastered.append(False)
@@ -151,13 +150,7 @@ def train_ppo(
                 world_model.ema_losses = ckpt["mowm_state"]["ema_losses"]
             elif "ema_loss" in ckpt["mowm_state"]:
                 # Backwards compatibility
-                world_model.ema_losses = [ckpt["mowm_state"]["ema_loss"]] * len(world_model.models)
-            
-            if "best_emas" in ckpt["mowm_state"]:
-                world_model.best_emas = ckpt["mowm_state"]["best_emas"]
-            else:
-                # Backwards compatibility
-                world_model.best_emas = list(world_model.ema_losses)
+                world_model.ema_alpha = ckpt["mowm_state"]["ema_alpha"]
             
             if "routing_emas" in ckpt["mowm_state"]:
                 world_model.routing_emas = ckpt["mowm_state"]["routing_emas"]
@@ -666,9 +659,8 @@ def train_ppo(
                     "wm_optimizers_state_dict": wm_opts_state,
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
-                        "ema_losses": world_model.ema_losses,
-                        "best_emas": world_model.best_emas,
                         "routing_emas": world_model.routing_emas,
+                        "ema_alpha": world_model.ema_alpha,
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,

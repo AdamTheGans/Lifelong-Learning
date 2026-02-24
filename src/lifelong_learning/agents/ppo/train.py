@@ -41,6 +41,9 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
+    dreaming_ratio: float = 1.0,
+    disable_reservoir: bool = False,
+    global_advantage_norm: bool = False,
 ):
     """
     Main Dyna-PPO training loop.
@@ -291,9 +294,10 @@ def train_ppo(
                 regime_ids=current_regime,
             )
 
-            # Add to state reservoir
-            env_idx = np.random.randint(num_envs)
-            state_reservoir[world_model.active_regime_id].append(obs_t[env_idx].clone().cpu())
+            # Add to state reservoir conditionally
+            if not disable_reservoir:
+                env_idx = np.random.randint(num_envs)
+                state_reservoir[world_model.active_regime_id].append(obs_t[env_idx].clone().cpu())
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
@@ -464,7 +468,8 @@ def train_ppo(
                 b_logprobs = buf.logprobs.reshape(batch_size)
                 
                 b_advantages = buf.advantages.reshape(batch_size)
-                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+                if not global_advantage_norm:
+                    b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
                 
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
@@ -485,6 +490,9 @@ def train_ppo(
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)
+
+            if global_advantage_norm:
+                c_advantages = (c_advantages - c_advantages.mean()) / (c_advantages.std() + 1e-8)
             
             total_size = c_obs.size(0)
             idxs = np.arange(total_size)
@@ -529,10 +537,11 @@ def train_ppo(
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
         if cfg.mode == "dyna" and imagined_horizon > 0:
-            num_dream_rollouts = max(1, cfg.num_steps // imagined_horizon)
-            for _ in range(num_dream_rollouts):
-                db, _ = generate_dream_experience(state_reservoir)
-                dream_buffers.append(db)
+            num_dream_rollouts = int(max(1, cfg.num_steps // imagined_horizon) * dreaming_ratio)
+            if num_dream_rollouts > 0:
+                for _ in range(num_dream_rollouts):
+                    db, _ = generate_dream_experience(state_reservoir)
+                    dream_buffers.append(db)
 
         # Phase D: Update policy on mixed real + imagined data
         buffers_to_train = [buffer] + dream_buffers

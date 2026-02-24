@@ -33,6 +33,11 @@ def main():
     p.add_argument("--imagined_horizon", type=int, default=10, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model learning rate")
 
+    # Ablation Flags
+    p.add_argument("--dreaming_ratio", type=float, default=1.0, help="Multiplier for the number of dream rollouts. Set to 0.0 to disable dreaming.")
+    p.add_argument("--disable_reservoir", action="store_true", help="Disables the state reservoir, forcing dreams to start from the current real rollout buffer.")
+    p.add_argument("--global_advantage_norm", action="store_true", help="Normalizes advantages concatenated across all buffers rather than independently.")
+
     args = p.parse_args()
 
     # In passive mode, disable curiosity and dreaming
@@ -67,6 +72,9 @@ def main():
         imagined_horizon=imagined_horizon,
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
+        dreaming_ratio=args.dreaming_ratio,
+        disable_reservoir=args.disable_reservoir,
+        global_advantage_norm=args.global_advantage_norm,
     )
 
 

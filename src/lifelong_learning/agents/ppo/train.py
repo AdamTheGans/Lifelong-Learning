@@ -42,6 +42,7 @@ def train_ppo(
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
     dreaming_ratio: float = 0.25,
+    oracle_mode: bool = False,
 ):
     """
     Main Dyna-PPO training loop.
@@ -86,6 +87,23 @@ def train_ppo(
     world_model = MixtureOfWorldModels(obs_shape, n_actions).to(device)
     wm_optimizers = [torch.optim.Adam(world_model.models[0].parameters(), lr=wm_lr)]
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
+
+    # -------------------------------------------------------------------------
+    # Oracle Mode Initialization
+    # -------------------------------------------------------------------------
+    if oracle_mode:
+        dreaming_ratio = 0.0
+        # Give the MoWM a second world model immediately
+        new_model = SimpleWorldModel(obs_shape, n_actions, world_model.hidden_dim).to(device)
+        world_model.models.append(new_model)
+        
+        world_model.ema_losses.append(1.0)
+        world_model.best_emas.append(1.0)
+        world_model.ema_history.append(deque([1.0], maxlen=10))
+        world_model.has_mastered.append(False)
+        world_model.steps_under_threshold.append(0)
+        
+        wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
 
     # -------------------------------------------------------------------------
     # Resume from Checkpoint
@@ -231,13 +249,17 @@ def train_ppo(
 
             # Infer best regime and check spawn
             real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
-            best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
-            did_spawn = world_model.check_and_spawn(lowest_loss, best_id, global_step)
-            if did_spawn:
-                wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
-                spawn_occurred = True
+            if oracle_mode:
+                true_regime = infos["regime_id"][0]
+                world_model.active_regime_id = true_regime
             else:
-                world_model.active_regime_id = best_id
+                best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
+                did_spawn = world_model.check_and_spawn(lowest_loss, best_id, global_step)
+                if did_spawn:
+                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                    spawn_occurred = True
+                else:
+                    world_model.active_regime_id = best_id
             
             # Update the current_regime tensor for the buffer and for next step's policy
             current_regime.fill_(world_model.active_regime_id)
@@ -359,52 +381,64 @@ def train_ppo(
 
     def update_world_model():
         """Phase B: Supervised training on real transitions."""
-        wm_stats = []
-        epoch_losses = []
         active_id = world_model.active_regime_id
-        active_model = world_model.models[active_id]
-        active_opt = wm_optimizers[active_id]
+        # In Oracle mode, train both models because they may both appear in the buffer frequently
+        model_ids_to_train = [0, 1] if oracle_mode else [active_id]
+        
+        active_wm_stats = []
+        for m_id in model_ids_to_train:
+            wm_stats = []
+            epoch_losses = []
+            m_model = world_model.models[m_id]
+            m_opt = wm_optimizers[m_id]
 
-        for epoch in range(cfg.update_epochs):
-            minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            for obs, actions, _, _, _, _, next_obs, rewards, regime_ids in minibatches:
-                mask = (regime_ids == active_id)
-                if not mask.any():
-                    continue
+            for epoch in range(cfg.update_epochs):
+                minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+                for obs, actions, _, _, _, _, next_obs, rewards, regime_ids in minibatches:
+                    mask = (regime_ids == m_id)
+                    if not mask.any():
+                        continue
 
-                m_obs = obs[mask]
-                m_actions = actions[mask]
-                m_next_obs = next_obs[mask]
-                m_rewards = rewards[mask]
+                    m_obs = obs[mask]
+                    m_actions = actions[mask]
+                    m_next_obs = next_obs[mask]
+                    m_rewards = rewards[mask]
 
-                pred_next_obs, pred_reward = active_model(m_obs, m_actions)
+                    pred_next_obs, pred_reward = m_model(m_obs, m_actions)
 
-                # State loss: CrossEntropy on one-hot → class indices
-                target_indices = torch.argmax(m_next_obs, dim=1)
-                loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
+                    # State loss: CrossEntropy on one-hot → class indices
+                    target_indices = torch.argmax(m_next_obs, dim=1)
+                    loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
 
-                # Reward loss: MSE
-                loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards)
+                    # Reward loss: MSE
+                    loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards)
 
-                wm_loss = loss_state + loss_reward
+                    wm_loss = loss_state + loss_reward
 
-                active_opt.zero_grad()
-                wm_loss.backward()
-                active_opt.step()
+                    m_opt.zero_grad()
+                    wm_loss.backward()
+                    m_opt.step()
 
-                epoch_losses.append(wm_loss.item())
+                    epoch_losses.append(wm_loss.item())
 
-                wm_stats.append({
-                    "world_model/loss_total": wm_loss.item(),
-                    "world_model/loss_state": loss_state.item(),
-                    "world_model/loss_reward": loss_reward.item(),
-                })
+                    wm_stats.append({
+                        "world_model/loss_total": wm_loss.item(),
+                        "world_model/loss_state": loss_state.item(),
+                        "world_model/loss_reward": loss_reward.item(),
+                    })
 
-        if epoch_losses:
-            avg_loss = sum(epoch_losses) / len(epoch_losses)
-            world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps)
+            if epoch_losses:
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                # Temporarily swap active_regime_id to update the right EMA
+                original_id = world_model.active_regime_id
+                world_model.active_regime_id = m_id
+                world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps)
+                world_model.active_regime_id = original_id
+                
+            if m_id == active_id:
+                active_wm_stats = wm_stats
 
-        return wm_stats
+        return active_wm_stats if active_wm_stats else [{"world_model/loss_total": 0.0, "world_model/loss_state": 0.0, "world_model/loss_reward": 0.0}]
 
     def generate_dream_experience(reservoir, min_states=16):
         """Phase C: Generate imagined trajectories using WM as simulator."""

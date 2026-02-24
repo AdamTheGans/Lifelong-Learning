@@ -35,6 +35,9 @@ def main():
 
     # Configurable Defaults
     p.add_argument("--dreaming_ratio", type=float, default=0.25, help="Multiplier for the number of dream rollouts. Set to 0.0 to disable dreaming. Default: 0.25")
+    
+    # Oracle Baseline
+    p.add_argument("--oracle", action="store_true", default=False, help="Enable Oracle Baseline mode (perfect routing, frequent interleaving, no dreaming)")
 
     args = p.parse_args()
 
@@ -43,6 +46,10 @@ def main():
         print("Running in PASSIVE mode (No curiosity, No dreaming).")
         intrinsic_coef = 0.0
         imagined_horizon = 0
+    elif args.oracle:
+        print(f"Running in ORACLE mode (Perfect routing, no dreaming).")
+        intrinsic_coef = args.intrinsic_coef
+        imagined_horizon = args.imagined_horizon
     else:
         print(f"Running in DYNA mode (intrinsic_coef={args.intrinsic_coef}, horizon={args.imagined_horizon}).")
         intrinsic_coef = args.intrinsic_coef
@@ -71,6 +78,7 @@ def main():
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
         dreaming_ratio=args.dreaming_ratio,
+        oracle_mode=args.oracle,
     )
 
 

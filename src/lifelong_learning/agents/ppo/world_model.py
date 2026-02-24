@@ -63,6 +63,10 @@ class SimpleWorldModel(nn.Module):
             self.reward_heads.append(nn.Linear(hidden_dim, 1))
         self.active_head = 0
 
+        # EMA-smoothed losses per head (prevents routing flicker)
+        self.head_ema_losses: list[float] = [float('inf')] * num_initial_heads
+        self.ema_alpha = 0.3  # blend factor: higher = more reactive
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -123,6 +127,7 @@ class SimpleWorldModel(nn.Module):
         nn.init.zeros_(reward_head.bias)
         self.state_heads.append(state_head)
         self.reward_heads.append(reward_head)
+        self.head_ema_losses.append(float('inf'))  # new head starts with no history
         return len(self.state_heads) - 1
 
     def select_best_head(self, obs: torch.Tensor, actions: torch.Tensor,
@@ -148,13 +153,31 @@ class SimpleWorldModel(nn.Module):
 
             loss_state = F.cross_entropy(pred_state, target_indices)
             loss_reward = F.mse_loss(pred_reward, rewards)
-            total = (loss_state + loss_reward).item()
+            raw_loss = (loss_state + loss_reward).item()
 
-            if total < best_loss:
-                best_loss = total
+            # Update EMA
+            if self.head_ema_losses[i] == float('inf'):
+                self.head_ema_losses[i] = raw_loss
+            else:
+                self.head_ema_losses[i] = (
+                    self.ema_alpha * raw_loss +
+                    (1 - self.ema_alpha) * self.head_ema_losses[i]
+                )
+
+            if self.head_ema_losses[i] < best_loss:
+                best_loss = self.head_ema_losses[i]
                 best_idx = i
 
         return best_idx, best_loss
+
+    def freeze_inactive_heads(self):
+        """Freeze all heads except the active one to prevent gradient waste."""
+        for i in range(len(self.state_heads)):
+            requires_grad = (i == self.active_head)
+            for p in self.state_heads[i].parameters():
+                p.requires_grad = requires_grad
+            for p in self.reward_heads[i].parameters():
+                p.requires_grad = requires_grad
 
     def generate_imagined_trajectories(
         self,

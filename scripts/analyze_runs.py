@@ -158,7 +158,7 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
 
     # 1. Plot Left Axis (Main Metric)
     if do_smoothing and len(df_main) > 50:
-        smooth_window = 20
+        smooth_window = 50
         # Ensure we don't crash if len < window
         vals_smooth = df_main['value'].rolling(window=min(smooth_window, len(df_main)), min_periods=1).mean()
         line1, = ax.plot(df_main['step'], vals_smooth, color=main_color, alpha=0.9, linewidth=1.5, label=f"{ylabel} (Smoothed)")
@@ -241,6 +241,10 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
                 ax.text(start + (end-start)/2, y_max, f"Regime {regime_idx % 2}", 
                          ha='center', va='bottom', fontsize=8, fontweight='bold', color='gray')
 
+        # Vertical dashed lines at switch points
+        for switch_step in regime_boundaries[1:-1]:  # skip 0 and max_step
+            ax.axvline(switch_step, color='black', linestyle='--', linewidth=1.0, alpha=0.6, zorder=2)
+
     if return_fig:
         plt.tight_layout()
         if output_path:
@@ -271,7 +275,10 @@ def plot_run(logdir, run_name):
         "intrinsic_ratio": "ppo/intrinsic_reward_ratio",
         "regime0": "charts/r_regime_0",
         "regime1": "charts/r_regime_1",
-        "step_rew": "charts/reward_step_mean"
+        "step_rew": "charts/reward_step_mean",
+        "active_head": "world_model/active_head",
+        "num_heads": "world_model/num_heads",
+        "best_head_loss": "world_model/best_head_loss",
     }
     
     data = load_data_from_logdir(logdir, list(tag_map.values()))
@@ -298,7 +305,7 @@ def plot_run(logdir, run_name):
 
     # --- Generate Separate Regime Plots ---
     # Ensure graphs directory exists
-    unique_folder = "graphs_" + run_name.replace(os.path.sep, '_')
+    unique_folder = "graphs/" + run_name.replace(os.path.sep, '_')
     os.makedirs(unique_folder, exist_ok=True)
 
     # 1. Step Reward vs Surprise
@@ -310,7 +317,7 @@ def plot_run(logdir, run_name):
         plot_single_graph(
             df_step_rew, df_wm_rew_loss,
             "Regime Analysis: Step Reward vs Surprise", "Mean Step Reward",
-            'tab:green', 'tab:red',
+            'tab:blue', 'tab:orange',
             boundaries, max_step, False, output_path=out_file
         )
 
@@ -325,16 +332,84 @@ def plot_run(logdir, run_name):
             boundaries, max_step, True, output_path=out_file
         )
 
-    # 3. Success Rate vs Surprise
+    # 3. Success Rate vs Surprise (with failure rate overlay)
     df_success = data.get(tag_map["success"])
+    df_failure = data.get(tag_map["failure"])
     if df_success is not None:
         out_file = os.path.join(unique_folder, f"regime_analysis_success_rate_{run_name.replace(os.path.sep, '_')}.png")
-        plot_single_graph(
-            df_success, df_wm_rew_loss,
-            "Regime Analysis: Success Rate vs Surprise", "Success Rate",
-            'tab:green', 'tab:red',
-            boundaries, max_step, True, output_path=out_file
-        )
+        fig_sr, ax_sr = plt.subplots(figsize=(14, 7))
+        ax_sr.set_title("Regime Analysis: Success & Failure Rate vs Surprise", fontsize=16, pad=20)
+        ax_sr.grid(True, linestyle='--', alpha=0.5)
+
+        # Success rate (green)
+        smooth_success = df_success['value'].rolling(window=50, min_periods=1).mean()
+        ax_sr.plot(df_success['step'], smooth_success, color='tab:green', alpha=0.9, linewidth=1.5, label='Success Rate')
+        ax_sr.plot(df_success['step'], df_success['value'], color='tab:green', alpha=0.15, linewidth=0.5)
+
+        # Failure rate (red overlay)
+        if df_failure is not None and not df_failure.empty:
+            smooth_failure = df_failure['value'].rolling(window=50, min_periods=1).mean()
+            ax_sr.plot(df_failure['step'], smooth_failure, color='tab:red', alpha=0.9, linewidth=1.5, label='Failure Rate')
+            ax_sr.plot(df_failure['step'], df_failure['value'], color='tab:red', alpha=0.15, linewidth=0.5)
+
+        ax_sr.set_ylabel("Rate", fontsize=12)
+        ax_sr.set_xlabel("Global Steps", fontsize=12)
+        ax_sr.set_ylim(0, 1.0)  # Fixed y-axis range
+        ax_sr.legend(fontsize=10)
+        ax_sr.axhline(0, color='black', linewidth=0.8, alpha=0.3, zorder=1)
+
+        # WM loss on right axis
+        ax_sr2 = ax_sr.twinx()
+        if df_wm_rew_loss is not None and not df_wm_rew_loss.empty:
+            ax_sr2.plot(df_wm_rew_loss['step'], df_wm_rew_loss['value'], color='tab:pink', alpha=0.5, linewidth=1.0, label='WM Loss (Raw)')
+            ax_sr2.set_ylabel("WM Loss (Raw)", color='tab:pink', fontsize=12)
+            ax_sr2.tick_params(axis='y', labelcolor='tab:pink')
+
+        # Regime shading + vertical lines
+        regime_colors = ['#e6f5ff', '#fff5e6']
+        if boundaries:
+            for i in range(len(boundaries) - 1):
+                start = boundaries[i]
+                end = boundaries[i+1]
+                if start >= max_step: break
+                if end > max_step: end = max_step
+                ax_sr.axvspan(start, end, color=regime_colors[i % 2], alpha=0.5, zorder=0)
+            for switch_step in boundaries[1:-1]:
+                ax_sr.axvline(switch_step, color='black', linestyle='--', linewidth=1.0, alpha=0.6, zorder=2)
+
+        plt.tight_layout()
+        plt.savefig(out_file, dpi=150)
+        plt.close(fig_sr)
+        print(f"  📊 Saved separate plot to: {out_file}")
+
+    # 4. Active Head over time (step function)
+    df_active_head = data.get(tag_map["active_head"])
+    if df_active_head is not None and not df_active_head.empty:
+        out_file = os.path.join(unique_folder, f"active_head_{run_name.replace(os.path.sep, '_')}.png")
+        fig_ah, ax_ah = plt.subplots(figsize=(14, 4))
+        ax_ah.set_title("Active World Model Head", fontsize=16, pad=20)
+        ax_ah.step(df_active_head['step'], df_active_head['value'], color='tab:purple', linewidth=2.0, where='post')
+        ax_ah.set_ylabel("Head Index", fontsize=12)
+        ax_ah.set_xlabel("Global Steps", fontsize=12)
+        ax_ah.set_yticks(range(int(df_active_head['value'].max()) + 1))
+        ax_ah.grid(True, linestyle='--', alpha=0.5)
+
+        # Regime shading + vertical lines
+        regime_colors = ['#e6f5ff', '#fff5e6']
+        if boundaries:
+            for i in range(len(boundaries) - 1):
+                start = boundaries[i]
+                end = boundaries[i+1]
+                if start >= max_step: break
+                if end > max_step: end = max_step
+                ax_ah.axvspan(start, end, color=regime_colors[i % 2], alpha=0.5, zorder=0)
+            for switch_step in boundaries[1:-1]:
+                ax_ah.axvline(switch_step, color='black', linestyle='--', linewidth=1.0, alpha=0.6, zorder=2)
+
+        plt.tight_layout()
+        plt.savefig(out_file, dpi=150)
+        plt.close(fig_ah)
+        print(f"  📊 Saved active head plot to: {out_file}")
 
 
     # --- Generate Main Summary Plot (6 panels) ---

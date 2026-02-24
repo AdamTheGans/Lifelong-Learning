@@ -393,6 +393,9 @@ def train_ppo(
                 print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold})")
             world_model.active_head = best_head
 
+        # Freeze inactive heads to prevent gradient waste
+        world_model.freeze_inactive_heads()
+
         logger.scalar("world_model/active_head", world_model.active_head, global_step)
         logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)
         logger.scalar("world_model/best_head_loss", best_loss, global_step)
@@ -407,8 +410,20 @@ def train_ppo(
         dream_stats = []
         dream_buffer = None
         if imagined_horizon > 0:
+            # Dream on the ACTIVE head first
             dream_buffer, _ = generate_dream_experience()
             dream_stats = update_policy(dream_buffer, epochs=1)
+
+            # Cross-regime dreaming: dream on all OTHER heads too
+            saved_head = world_model.active_head
+            for head_idx in range(len(world_model.state_heads)):
+                if head_idx == saved_head:
+                    continue
+                world_model.active_head = head_idx
+                cross_dream_buffer, _ = generate_dream_experience()
+                cross_stats = update_policy(cross_dream_buffer, epochs=1)
+                dream_stats.extend(cross_stats)
+            world_model.active_head = saved_head  # restore
 
         # -----------------------------------------------------------------
         # Logging

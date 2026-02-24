@@ -321,6 +321,7 @@ def train_ppo(
                 actions=action,
                 logprobs=logprob,
                 rewards=total_reward,
+                extrinsic_rewards=torch.tensor(reward, dtype=torch.float32, device=device),
                 dones=torch.tensor(done, dtype=torch.float32, device=device),
                 values=value,
                 next_obs=real_next_obs_t,
@@ -405,7 +406,7 @@ def train_ppo(
 
             for epoch in range(cfg.update_epochs):
                 minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-                for obs, actions, _, _, _, _, next_obs, rewards, regime_ids in minibatches:
+                for obs, actions, _, _, _, _, next_obs, rewards, extrinsic_rewards, regime_ids in minibatches:
                     mask = (regime_ids == m_id)
                     if not mask.any():
                         continue
@@ -413,7 +414,7 @@ def train_ppo(
                     m_obs = obs[mask]
                     m_actions = actions[mask]
                     m_next_obs = next_obs[mask]
-                    m_rewards = rewards[mask]
+                    m_rewards = extrinsic_rewards[mask]
 
                     pred_next_obs, pred_reward = m_model(m_obs, m_actions)
 
@@ -462,7 +463,7 @@ def train_ppo(
         # Grab exactly one minibatch to act as a representative sample of the current transition distribution
         minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
         try:
-            shadow_obs, shadow_acts, _, _, _, _, shadow_next, shadow_rews, _ = next(minibatches)
+            shadow_obs, shadow_acts, _, _, _, _, shadow_next, shadow_rews, shadow_ext_rews, _ = next(minibatches)
         except StopIteration:
             pass # Failsafe if buffer completely empty
         else:
@@ -471,7 +472,7 @@ def train_ppo(
                 for i, model in enumerate(world_model.models):
                     p_next, p_rew = model(shadow_obs, shadow_acts)
                     l_s = torch.nn.functional.cross_entropy(p_next, shadow_targets, reduction='none').mean(dim=[1,2])
-                    l_r = torch.nn.functional.mse_loss(p_rew, shadow_rews, reduction='none')
+                    l_r = torch.nn.functional.mse_loss(p_rew, shadow_ext_rews, reduction='none')
                     shadow_loss = (l_s + l_r).mean().item() # We log mean() for smooth telemetry visibility
                     # Inject it into active_wm_stats so it's guaranteed to be logged
                     if active_wm_stats:
@@ -517,6 +518,7 @@ def train_ppo(
                 actions=traj["actions"],
                 logprobs=traj["logprobs"],
                 rewards=traj["rewards"],
+                extrinsic_rewards=traj["rewards"],
                 dones=traj["dones"],
                 values=traj["values"],
                 next_obs=traj["next_obs"],
@@ -550,6 +552,10 @@ def train_ppo(
                 b_logprobs = buf.logprobs.reshape(batch_size)
                 
                 b_advantages = buf.advantages.reshape(batch_size)
+                std = b_advantages.std()
+                if std < 1e-6:
+                    std = torch.tensor(1.0, device=b_advantages.device)
+                b_advantages = (b_advantages - b_advantages.mean()) / (std + 1e-8)
                 
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
@@ -567,7 +573,6 @@ def train_ppo(
             c_actions = torch.cat(all_actions, dim=0)
             c_logprobs = torch.cat(all_logprobs, dim=0)
             c_advantages = torch.cat(all_advantages, dim=0)
-            c_advantages = (c_advantages - c_advantages.mean()) / (c_advantages.std() + 1e-8)
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)

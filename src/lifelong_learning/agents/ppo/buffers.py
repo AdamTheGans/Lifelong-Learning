@@ -22,6 +22,7 @@ class RolloutBuffer:
         self.actions = torch.zeros((num_steps, num_envs), device=device, dtype=torch.long)
         self.logprobs = torch.zeros((num_steps, num_envs), device=device)
         self.rewards = torch.zeros((num_steps, num_envs), device=device)
+        self.extrinsic_rewards = torch.zeros((num_steps, num_envs), device=device)
         self.dones = torch.zeros((num_steps, num_envs), device=device)
         self.values = torch.zeros((num_steps, num_envs), device=device)
         self.next_obs = torch.zeros((num_steps, num_envs) + obs_shape, device=device)
@@ -32,13 +33,14 @@ class RolloutBuffer:
 
         self.step = 0
 
-    def add(self, obs, actions, logprobs, rewards, dones, values, next_obs, regime_ids):
+    def add(self, obs, actions, logprobs, rewards, extrinsic_rewards, dones, values, next_obs, regime_ids):
         t = self.step
         self.obs[t].copy_(obs)
         self.next_obs[t].copy_(next_obs)
         self.actions[t].copy_(actions)
         self.logprobs[t].copy_(logprobs)
         self.rewards[t].copy_(rewards)
+        self.extrinsic_rewards[t].copy_(extrinsic_rewards)
         self.dones[t].copy_(dones)
         self.values[t].copy_(values)
         self.regime_ids[t].copy_(regime_ids)
@@ -79,6 +81,7 @@ class RolloutBuffer:
         b_returns = self.returns.reshape(batch_size)
         b_values = self.values.reshape(batch_size)
         b_rewards = self.rewards.reshape(batch_size)
+        b_extrinsic_rewards = self.extrinsic_rewards.reshape(batch_size)
         b_regime_ids = self.regime_ids.reshape(batch_size)
 
         # Normalize advantages
@@ -90,7 +93,7 @@ class RolloutBuffer:
 
         for start in range(0, batch_size, minibatch_size):
             mb = idxs[start:start + minibatch_size]
-            yield b_obs[mb], b_actions[mb], b_logprobs[mb], b_advantages[mb], b_returns[mb], b_values[mb], b_next_obs[mb], b_rewards[mb], b_regime_ids[mb]
+            yield b_obs[mb], b_actions[mb], b_logprobs[mb], b_advantages[mb], b_returns[mb], b_values[mb], b_next_obs[mb], b_rewards[mb], b_extrinsic_rewards[mb], b_regime_ids[mb]
 
     def reset(self):
         self.step = 0

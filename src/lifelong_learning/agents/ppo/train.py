@@ -99,6 +99,7 @@ def train_ppo(
         
         world_model.ema_losses.append(1.0)
         world_model.best_emas.append(1.0)
+        world_model.routing_emas.append(1.0)
         world_model.ema_history.append(deque([1.0], maxlen=10))
         world_model.has_mastered.append(False)
         world_model.steps_under_threshold.append(0)
@@ -156,6 +157,11 @@ def train_ppo(
             else:
                 # Backwards compatibility
                 world_model.best_emas = list(world_model.ema_losses)
+            
+            if "routing_emas" in ckpt["mowm_state"]:
+                world_model.routing_emas = ckpt["mowm_state"]["routing_emas"]
+            else:
+                world_model.routing_emas = list(world_model.ema_losses)
             
             if "ema_history" in ckpt["mowm_state"]:
                 # Convert list of lists back to list of deques
@@ -600,9 +606,11 @@ def train_ppo(
         logger.scalar("mowm/active_regime_id", world_model.active_regime_id, global_step)
         logger.scalar("mowm/num_regimes", len(world_model.models), global_step)
         logger.scalar("mowm/ema_loss_active", world_model.ema_losses[world_model.active_regime_id], global_step)
+        logger.scalar("mowm/routing_ema_active", world_model.routing_emas[world_model.active_regime_id], global_step)
         
         for i, ema_l in enumerate(world_model.ema_losses):
             logger.scalar(f"mowm/ema_loss_model_{i}", ema_l, global_step)
+            logger.scalar(f"mowm/routing_ema_model_{i}", world_model.routing_emas[i], global_step)
             
         avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
@@ -653,6 +661,7 @@ def train_ppo(
                         "active_regime_id": world_model.active_regime_id,
                         "ema_losses": world_model.ema_losses,
                         "best_emas": world_model.best_emas,
+                        "routing_emas": world_model.routing_emas,
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,

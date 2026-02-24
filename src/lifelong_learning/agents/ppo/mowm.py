@@ -29,7 +29,8 @@ class MixtureOfWorldModels(nn.Module):
         self.ema_history = [collections.deque([1.0], maxlen=10)]
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
-        
+        self.routing_emas = [1.0]
+
         # Hyperparameters
         self.ema_alpha = 0.05
         self.surprise_threshold = 5.0
@@ -38,7 +39,7 @@ class MixtureOfWorldModels(nn.Module):
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.surprise_window_size = 100      # Smooth surprise across 100 transitions
-        self.switch_penalty = 1.2            # Hysteresis stickiness penalty
+        self.routing_hysteresis = 0.85       # Hysteresis stickiness multiplier (challenger < active * 0.85)
         self.ema_epsilon = 1e-5              # Denominator safety avoids div by zero
         self.max_ema_growth = 0.10           # Trend-Aware Spawning: Max relative growth
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -73,19 +74,11 @@ class MixtureOfWorldModels(nn.Module):
         Evaluates a transition across all models and returns the ID of the best fitting regime
         and its corresponding lowest loss. Handles newborn stickiness to force training.
         """
-        # Newborn stickiness bypass: if in grace period, stick with active model
-        if global_step < self.force_active_until:
-            best_regime_id = self.active_regime_id
-            best_raw_loss = float('inf')  # Value doesn't matter, we bypass routing and spawning
-        else:
-            best_regime_id = 0
-            lowest_relative_loss = float('inf')
-            best_raw_loss = 0.0
-
         # Convert next_state (B, C, H, W) float to class indices (B, H, W) for CE Loss
         # Assuming next_state is one-hot or normalized probabilities
         next_state_indices = torch.argmax(next_state, dim=1)
 
+        raw_losses = []
         for i, model in enumerate(self.models):
             with torch.no_grad():
                 next_obs_pred, pred_reward = model(state, action)
@@ -95,25 +88,28 @@ class MixtureOfWorldModels(nn.Module):
                 reward_loss = F.mse_loss(pred_reward, reward).item()
                 # Total surprise
                 loss = state_loss + reward_loss
+                raw_losses.append(loss)
                 
-            # Only find the lowest loss if we aren't bypassing via newborn stickiness
-            if global_step >= self.force_active_until:
-                relative_loss = loss / max(self.best_emas[i], self.ema_epsilon)
-                if i != self.active_regime_id:
-                    relative_loss *= self.switch_penalty
+            # Update routing EMA unconditionally for all regimes to maintain a parallel inference track
+            self.routing_emas[i] = (self.ema_alpha * loss) + ((1 - self.ema_alpha) * self.routing_emas[i])
 
-                if relative_loss < lowest_relative_loss:
-                    lowest_relative_loss = relative_loss
-                    best_regime_id = i
-                    best_raw_loss = loss
-                
-        # If bypassing, calculate just the active model's loss to return
+        # Newborn stickiness bypass: if in grace period, stick with active model
         if global_step < self.force_active_until:
-            with torch.no_grad():
-                next_obs_pred, pred_reward = self.models[self.active_regime_id](state, action)
-                state_loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
-                reward_loss = F.mse_loss(pred_reward, reward).item()
-                best_raw_loss = state_loss + reward_loss
+            best_regime_id = self.active_regime_id
+            best_raw_loss = raw_losses[self.active_regime_id]
+        else:
+            best_regime_id = self.active_regime_id
+            best_raw_loss = raw_losses[self.active_regime_id]
+            lowest_routing_ema = self.routing_emas[self.active_regime_id]
+            
+            # Hysteresis routing: only switch if a challenger clearly beats the active regime's routing EMA
+            for i in range(len(self.models)):
+                if i != self.active_regime_id:
+                    if self.routing_emas[i] < (self.routing_emas[self.active_regime_id] * self.routing_hysteresis):
+                        if self.routing_emas[i] < lowest_routing_ema:
+                            lowest_routing_ema = self.routing_emas[i]
+                            best_regime_id = i
+                            best_raw_loss = raw_losses[i]
                 
         return best_regime_id, best_raw_loss
 
@@ -167,6 +163,7 @@ class MixtureOfWorldModels(nn.Module):
             # Update internal tracking variables
             self.active_regime_id = len(self.models) - 1
             self.ema_losses.append(smoothed_loss)  # Set EMA for the new regime baseline
+            self.routing_emas.append(smoothed_loss) # Seed routing EMA
             self.best_emas.append(smoothed_loss)
             self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
             self.has_mastered.append(False)

@@ -442,6 +442,7 @@ def train_ppo(
 
                     wm_stats.append({
                         "world_model/loss_total": wm_loss_mean.item(),
+                        "world_model/loss_max": batch_max_loss,
                         "world_model/loss_state": loss_state_mean.item(),
                         "world_model/loss_reward": loss_reward_mean.item(),
                     })
@@ -650,7 +651,9 @@ def train_ppo(
             logger.scalar(f"mowm/has_mastered_model_{i}", float(world_model.has_mastered[i]), global_step)
             
         avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
+        avg_max_loss = avg_wm_stats.get("world_model/loss_max", avg_total_loss)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
+        logger.scalar("mowm/epoch_avg_max_loss", avg_max_loss, global_step)
         logger.scalar("mowm/spawn_occurred", float(collect_stats["spawn_occurred"]), global_step)
 
         if dream_buffers:

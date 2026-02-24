@@ -278,7 +278,8 @@ def plot_run(logdir, run_name):
         "mowm_num": "mowm/num_regimes",
         "mowm_ema_old": "mowm/ema_loss",
         "mowm_ema_active": "mowm/ema_loss_active",
-        "mowm_avg": "mowm/epoch_avg_loss",
+        "mowm_avg": "mowm/epoch_avg_max_loss",    # The new correct max-loss surprise metric
+        "mowm_avg_fallback": "mowm/epoch_avg_loss", # Left for backwards compatibility with older runs
         "mowm_spawn": "mowm/spawn_occurred",
         "mowm_mastery0": "mowm/has_mastered_model_0",
         "mowm_mastery1": "mowm/has_mastered_model_1"
@@ -507,9 +508,13 @@ def plot_run(logdir, run_name):
     
     # 4. MoWM Surprise vs EMA Threshold
     ema_key = tag_map["mowm_ema_active"] if tag_map["mowm_ema_active"] in data else tag_map.get("mowm_ema_old")
-    if ema_key and ema_key in data and tag_map["mowm_avg"] in data:
+    
+    # Try to find the new max-loss metric, otherwise fallback to old average loss
+    avg_key = tag_map["mowm_avg"] if tag_map["mowm_avg"] in data and not data[tag_map["mowm_avg"]].empty else tag_map["mowm_avg_fallback"]
+    
+    if ema_key and ema_key in data and avg_key in data:
         df_ema = data[ema_key]
-        df_avg = data[tag_map["mowm_avg"]]
+        df_avg = data[avg_key]
         
         fig2, ax_ema = plt.subplots(figsize=(14, 7))
         ax_ema.set_title(f"MoWM Surprise metrics: EMA vs Epoch Avg Loss\n{run_name}", fontsize=14)

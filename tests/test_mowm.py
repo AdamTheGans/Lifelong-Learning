@@ -25,7 +25,7 @@ def test_mowm_spawning_logic():
         mowm.ema_history[0].append(0.1)
     
     # 3. Test a normal fluctuation (e.g. loss jumping to 0.4)
-    # Threshold is 2.0. 0.4 < 2.0 (Should NOT spawn)
+    # Threshold is 0.5 (EMA 0.1 * 5). 0.4 < 0.5 (Should NOT spawn)
     # Must fill the surprise window to trigger a check
     for _ in range(mowm.surprise_window_size):
         did_spawn = mowm.check_and_spawn(raw_losses=[0.4], best_regime_id=0, global_step=global_step)
@@ -35,7 +35,7 @@ def test_mowm_spawning_logic():
     assert len(mowm.models) == 1
 
     # 4. Simulate a sudden Regime Switch (Loss spikes to 3.0)
-    # 3.0 > 2.0 (Should spawn!)
+    # 3.0 > 0.5 (Should spawn!)
     
     # We must clear the queue manually because the previous test filled it with 0.4s.
     mowm.surprise_window.clear()

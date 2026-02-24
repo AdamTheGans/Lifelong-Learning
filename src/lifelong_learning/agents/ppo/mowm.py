@@ -34,7 +34,8 @@ class MixtureOfWorldModels(nn.Module):
 
         # Hyperparameters
         self.ema_alpha = 0.05
-        self.anomaly_threshold = 0.20  # Absolute loss magnitude required to trigger a spawn
+        self.anomaly_floor = 0.05  # Absolute minimum for the EMA used in dynamic threshold calculation
+        self.anomaly_multiplier = 5.0  # Multiplier for the dynamic threshold
         
         # MoWM Routing Fixes
         self.global_grace_period = 20000     # No spawns before this step
@@ -172,12 +173,15 @@ class MixtureOfWorldModels(nn.Module):
         # Collective Ignorance Check
         # Are there any models in the collective that are NOT surprised?
         all_surprised = True
+        
+        dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
+        
         for i in range(len(self.models)):
             # Active model: sluggish 100-step SMA prevents false spawns from micro-fluctuations.
             # Inactive models: responsive routing_ema rapidly blocks false spawns when a veteran wakes up.
             metric = smoothed_losses[i] if i == self.active_regime_id else self.routing_emas[i]
             
-            if metric <= self.anomaly_threshold:
+            if metric <= dynamic_threshold:
                 all_surprised = False
                 break
         

@@ -75,10 +75,11 @@ class MixtureOfWorldModels(nn.Module):
 
     def infer_regime(
         self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor, global_step: int
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float, list[float]]:
         """
-        Evaluates a transition across all models and returns the ID of the best fitting regime
-        and its corresponding lowest loss. Handles newborn stickiness to force training.
+        Evaluates a transition across all models and returns the ID of the best fitting regime,
+        its corresponding lowest loss, and a list of all raw losses for the collective ignorance check.
+        Handles newborn stickiness and mastery lock-in to force training.
         """
         # Convert next_state (B, C, H, W) float to class indices (B, H, W) for CE Loss
         # Assuming next_state is one-hot or normalized probabilities
@@ -131,32 +132,28 @@ class MixtureOfWorldModels(nn.Module):
                             best_regime_id = i
                             best_raw_loss = raw_losses[i]
                 
-        return best_regime_id, best_raw_loss
+        return best_regime_id, best_raw_loss, raw_losses
 
-    def check_and_spawn(self, lowest_loss: float, best_regime_id: int, global_step: int) -> bool:
+    def check_and_spawn(self, raw_losses: list[float], best_regime_id: int, global_step: int) -> bool:
         """
-        Checks if the lowest available loss constitutes a surprise based on the dynamic EMA.
+        Checks if the entire collective of models represents a high surprise.
+        Only spawns a new model if EVERY existing model exceeds the dynamic EMA surprise threshold.
         Includes safeguards for global grace period, newborn grace period, and sequence smoothing.
         """
-        # Mastery Prerequisite Guard
-        # We cannot spawn a new model if the current regime hasn't fully mastered the environment yet.
-        if not self.has_mastered[self.active_regime_id]:
-            self.surprise_window.clear()
-            return False
-
         # Global Step 0 Grace Guard & Newborn Stickiness Guard
         if global_step < self.global_grace_period or global_step < self.force_active_until:
             self.surprise_window.clear()
             return False
             
-        # Surprise Smoothing
-        self.surprise_window.append(lowest_loss)
+        # Collective Surprise Smoothing
+        self.surprise_window.append(raw_losses)
         
         # Wait until window is full before making spawn decisions
         if len(self.surprise_window) < self.surprise_window_size:
             return False
             
-        smoothed_loss = sum(self.surprise_window) / len(self.surprise_window)
+        # Calculate smoothed loss for EVERY model
+        smoothed_losses = [sum(losses[i] for losses in self.surprise_window) / len(self.surprise_window) for i in range(len(self.models))]
 
         # False Spawn Guard: Policy Shift Check (Trend-Aware Spawning)
         # If the EMA baseline is already rising rapidly, the agent is exploring and we should block spawns.
@@ -167,9 +164,16 @@ class MixtureOfWorldModels(nn.Module):
                 self.surprise_window.clear()
                 return False
 
-        ratio = smoothed_loss / max(self.best_emas[best_regime_id], self.ema_epsilon)
+        # Collective Ignorance Check
+        # Are there any models in the collective that are NOT surprised?
+        all_surprised = True
+        for i in range(len(self.models)):
+            ratio = smoothed_losses[i] / max(self.best_emas[i], self.ema_epsilon)
+            if ratio <= self.surprise_threshold:
+                all_surprised = False
+                break
         
-        if ratio > self.surprise_threshold:
+        if all_surprised:
             # Instantiate a new world model
             new_model = SimpleWorldModel(self.obs_shape, self.n_actions, self.hidden_dim)
             
@@ -180,12 +184,15 @@ class MixtureOfWorldModels(nn.Module):
             # Append it to the mixture of experts
             self.models.append(new_model)
             
+            # Use the active model's smoothed loss as the seed for the new baseline
+            new_baseline = smoothed_losses[self.active_regime_id]
+
             # Update internal tracking variables
             self.active_regime_id = len(self.models) - 1
-            self.ema_losses.append(smoothed_loss)  # Set EMA for the new regime baseline
-            self.routing_emas.append(smoothed_loss) # Seed routing EMA
-            self.best_emas.append(smoothed_loss)
-            self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
+            self.ema_losses.append(new_baseline)  # Set EMA for the new regime baseline
+            self.routing_emas.append(new_baseline) # Seed routing EMA
+            self.best_emas.append(new_baseline)
+            self.ema_history.append(collections.deque([new_baseline], maxlen=10))
             self.has_mastered.append(False)
             self.steps_under_threshold.append(0)
             self.spawn_steps.append(global_step)

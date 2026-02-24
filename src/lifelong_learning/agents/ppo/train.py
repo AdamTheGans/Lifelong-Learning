@@ -265,8 +265,8 @@ def train_ppo(
                 true_regime = infos["regime_id"][0]
                 world_model.active_regime_id = true_regime
             else:
-                best_id, lowest_loss = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
-                did_spawn = world_model.check_and_spawn(lowest_loss, best_id, global_step)
+                best_id, lowest_loss, raw_losses = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
+                did_spawn = world_model.check_and_spawn(raw_losses, best_id, global_step)
                 if did_spawn:
                     wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
                     spawn_occurred = True

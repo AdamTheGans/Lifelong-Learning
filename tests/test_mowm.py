@@ -28,7 +28,7 @@ def test_mowm_spawning_logic():
     # Threshold is 5.0, so 0.4 / 0.1 = 4.0 < 5.0 (Should NOT spawn)
     # Must fill the surprise window to trigger a check
     for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(lowest_loss=0.4, best_regime_id=0, global_step=global_step)
+        did_spawn = mowm.check_and_spawn(raw_losses=[0.4], best_regime_id=0, global_step=global_step)
         global_step += 1
     
     assert not did_spawn
@@ -41,7 +41,7 @@ def test_mowm_spawning_logic():
     mowm.surprise_window.clear()
     
     for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(lowest_loss=1.0, best_regime_id=0, global_step=global_step) 
+        did_spawn = mowm.check_and_spawn(raw_losses=[1.0], best_regime_id=0, global_step=global_step) 
         global_step += 1
     
     assert did_spawn

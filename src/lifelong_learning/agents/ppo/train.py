@@ -358,6 +358,11 @@ def train_ppo(
     # Main Training Loop
     # =========================================================================
 
+    # Spawn guards for multi-head routing
+    spawn_warmup = 10     # don't spawn before this many updates
+    spawn_cooldown = 20   # min updates between spawns
+    last_spawn_update = -999
+
     for update in range(start_update, num_updates + 1):
         if anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -386,15 +391,18 @@ def train_ppo(
             best_head, best_loss = world_model.select_best_head(
                 sample_obs, sample_act, sample_next, sample_rew
             )
-            if best_loss > surprise_threshold and len(world_model.state_heads) < max_heads:
+            spawn_allowed = (
+                update >= spawn_warmup
+                and len(world_model.state_heads) < max_heads
+                and (update - last_spawn_update) >= spawn_cooldown
+            )
+            if best_loss > surprise_threshold and spawn_allowed:
                 best_head = world_model.spawn_head()
+                last_spawn_update = update
                 # Refresh optimizer to include new head parameters
                 wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
-                print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold})")
+                print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold}, update={update})")
             world_model.active_head = best_head
-
-        # Freeze inactive heads to prevent gradient waste
-        world_model.freeze_inactive_heads()
 
         logger.scalar("world_model/active_head", world_model.active_head, global_step)
         logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)
@@ -403,8 +411,28 @@ def train_ppo(
         # Phase B: Update policy on real data
         update_stats = update_policy(buffer, cfg.update_epochs)
 
-        # Phase C: Train World Model
+        # Phase C: Train World Model (active head + trunk)
         wm_stats = update_world_model()
+
+        # Phase C.1: Adapt inactive heads to trunk drift (1 epoch, keeps them routable)
+        if len(world_model.state_heads) > 1:
+            saved_head = world_model.active_head
+            for head_idx in range(len(world_model.state_heads)):
+                if head_idx == saved_head:
+                    continue
+                world_model.active_head = head_idx
+                minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+                for obs, actions, _, _, _, _, next_obs, rewards in minibatches:
+                    pred_next_obs, pred_reward = world_model(obs, actions)
+                    target_indices = torch.argmax(next_obs, dim=1)
+                    loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
+                    loss_reward = torch.nn.functional.mse_loss(pred_reward, rewards)
+                    # Lower weight to prevent overwriting the head's regime specialization
+                    wm_loss = 0.1 * (loss_state + loss_reward)
+                    wm_optimizer.zero_grad()
+                    wm_loss.backward()
+                    wm_optimizer.step()
+            world_model.active_head = saved_head
 
         # Phase D: Dream & update policy on imagined data (skipped in passive mode)
         dream_stats = []

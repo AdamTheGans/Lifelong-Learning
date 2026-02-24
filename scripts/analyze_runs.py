@@ -284,7 +284,8 @@ def plot_run(logdir, run_name):
         "mowm_mastery1": "mowm/has_mastered_model_1"
     }
     
-    data = load_data_from_logdir(logdir, list(tag_map.values()))
+    # Load all available tags to easily find dynamic ShadowLoss_Model_{i} tags
+    data = load_data_from_logdir(logdir, None)
     
     if not data:
         print(f"No data found for {run_name}")
@@ -420,14 +421,35 @@ def plot_run(logdir, run_name):
     
     # Panel 5: World Model Losses
     ax5 = fig.add_subplot(2, 3, 5)
-    for key, color, label in [
-        (tag_map["wm_state"], "blue", "State"),
-        (tag_map["wm_rew"], "orange", "Reward"),
-        (tag_map["wm_total"], "green", "Total"),
-    ]:
-        if key in data:
-            df = data[key]
-            ax5.plot(df['step'], df['value'], c=color, lw=1.5, label=label)
+    
+    # Try to find ShadowLoss metrics first to plot all models' total loss
+    shadow_keys = [k for k in data.keys() if k.startswith("mowm/ShadowLoss_Model_")]
+    shadow_keys = sorted(shadow_keys, key=lambda x: int(x.split('_')[-1]))
+    
+    colors = plt.cm.tab10.colors
+    has_plotted_shadow = False
+    
+    if shadow_keys:
+        for i, key in enumerate(shadow_keys):
+            if key in data and not data[key].empty:
+                df = data[key]
+                model_idx = key.split('_')[-1]
+                color = colors[i % len(colors)]
+                smooth_val = df['value'].rolling(window=10, min_periods=1).mean()
+                ax5.plot(df['step'], smooth_val, c=color, lw=1.5, label=f"Model {model_idx} Total")
+                has_plotted_shadow = True
+    
+    if not has_plotted_shadow:
+        # Fallback to legacy state/reward/total if no shadow data
+        for key, color, label in [
+            (tag_map["wm_state"], "blue", "State"),
+            (tag_map["wm_rew"], "orange", "Reward"),
+            (tag_map["wm_total"], "green", "Total"),
+        ]:
+            if key in data and not data[key].empty:
+                df = data[key]
+                ax5.plot(df['step'], df['value'], c=color, lw=1.5, label=label)
+                
     ax5.set_yscale('log')
     ax5.set_title("World Model Losses (Log)")
     ax5.legend(fontsize=8)

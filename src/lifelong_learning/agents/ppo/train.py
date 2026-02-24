@@ -156,6 +156,11 @@ def train_ppo(
                 world_model.routing_emas = ckpt["mowm_state"]["routing_emas"]
             else:
                 world_model.routing_emas = list(world_model.ema_losses)
+                
+            if "fast_routing_emas" in ckpt["mowm_state"]:
+                world_model.fast_routing_emas = ckpt["mowm_state"]["fast_routing_emas"]
+            else:
+                world_model.fast_routing_emas = list(world_model.routing_emas)
             
             if "ema_history" in ckpt["mowm_state"]:
                 # Convert list of lists back to list of deques
@@ -413,23 +418,31 @@ def train_ppo(
 
                     # State loss: CrossEntropy on one-hot → class indices
                     target_indices = torch.argmax(m_next_obs, dim=1)
-                    loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices)
+                    loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices, reduction='none')
+                    loss_state_mean = loss_state.mean()
 
                     # Reward loss: MSE
-                    loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards)
+                    loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards, reduction='none')
+                    loss_reward_mean = loss_reward.mean()
 
-                    wm_loss = loss_state + loss_reward
+                    # Backpropagate on means to keep gradients stable
+                    wm_loss_mean = loss_state_mean + loss_reward_mean
 
                     m_opt.zero_grad()
-                    wm_loss.backward()
+                    wm_loss_mean.backward()
                     m_opt.step()
 
-                    epoch_losses.append(wm_loss.item())
+                    # Track the MAX loss to establish the EMA baseline correctly!
+                    with torch.no_grad():
+                        state_loss_per_batch = loss_state.mean(dim=[1, 2])
+                        batch_max_loss = (state_loss_per_batch + loss_reward).max().item()
+                    
+                    epoch_losses.append(batch_max_loss)
 
                     wm_stats.append({
-                        "world_model/loss_total": wm_loss.item(),
-                        "world_model/loss_state": loss_state.item(),
-                        "world_model/loss_reward": loss_reward.item(),
+                        "world_model/loss_total": wm_loss_mean.item(),
+                        "world_model/loss_state": loss_state_mean.item(),
+                        "world_model/loss_reward": loss_reward_mean.item(),
                     })
 
             if epoch_losses:
@@ -442,6 +455,26 @@ def train_ppo(
                 
             if m_id == active_id:
                 active_wm_stats = wm_stats
+
+        # Phase B-2: Shadow Tracking (Telemetry) for all models
+        # Grab exactly one minibatch to act as a representative sample of the current transition distribution
+        minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+        try:
+            shadow_obs, shadow_acts, _, _, _, _, shadow_next, shadow_rews, _ = next(minibatches)
+        except StopIteration:
+            pass # Failsafe if buffer completely empty
+        else:
+            with torch.no_grad():
+                shadow_targets = torch.argmax(shadow_next, dim=1)
+                for i, model in enumerate(world_model.models):
+                    p_next, p_rew = model(shadow_obs, shadow_acts)
+                    l_s = torch.nn.functional.cross_entropy(p_next, shadow_targets, reduction='none').mean(dim=[1,2])
+                    l_r = torch.nn.functional.mse_loss(p_rew, shadow_rews, reduction='none')
+                    shadow_loss = (l_s + l_r).mean().item() # We log mean() for smooth telemetry visibility
+                    # Inject it into active_wm_stats so it's guaranteed to be logged
+                    if active_wm_stats:
+                        for stat in active_wm_stats:
+                            stat[f"mowm/ShadowLoss_Model_{i}"] = shadow_loss
 
         return active_wm_stats if active_wm_stats else [{"world_model/loss_total": 0.0, "world_model/loss_state": 0.0, "world_model/loss_reward": 0.0}]
 
@@ -663,6 +696,7 @@ def train_ppo(
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
                         "routing_emas": world_model.routing_emas,
+                        "fast_routing_emas": world_model.fast_routing_emas,
                         "ema_alpha": world_model.ema_alpha,
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,

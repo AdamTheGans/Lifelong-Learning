@@ -29,6 +29,7 @@ class MixtureOfWorldModels(nn.Module):
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
         self.routing_emas = [1.0]
+        self.fast_routing_emas = [1.0]
         self.spawn_steps = [0]
         self.timeout_triggered = [False]
 
@@ -88,16 +89,21 @@ class MixtureOfWorldModels(nn.Module):
         for i, model in enumerate(self.models):
             with torch.no_grad():
                 next_obs_pred, pred_reward = model(state, action)
-                # Compute cross-entropy loss for state
-                state_loss = F.cross_entropy(next_obs_pred, next_state_indices).item()
-                # Compute MSE loss for reward
-                reward_loss = F.mse_loss(pred_reward, reward).item()
-                # Total surprise
-                loss = state_loss + reward_loss
+                
+                # Compute unreduced losses to find the extreme anomaly in the batch
+                state_loss = F.cross_entropy(next_obs_pred, next_state_indices, reduction='none')
+                state_loss_per_batch = state_loss.mean(dim=[1, 2])
+                
+                reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
+                
+                # Max surprise across all environments in this specific transition batch
+                loss_batch = state_loss_per_batch + reward_loss
+                loss = loss_batch.max().item() 
                 raw_losses.append(loss)
                 
-            # Update routing EMA unconditionally for all regimes to maintain a parallel inference track
+            # Update routing EMAs unconditionally for all regimes to maintain a parallel inference track
             self.routing_emas[i] = (self.ema_alpha * loss) + ((1 - self.ema_alpha) * self.routing_emas[i])
+            self.fast_routing_emas[i] = (0.2 * loss) + (0.8 * self.fast_routing_emas[i])
 
         # Newborn stickiness bypass: if in grace period, stick with active model
         # Mastery lock-in bypass: if the active regime has not mastered the environment, it cannot be unseated by veterans.
@@ -120,16 +126,30 @@ class MixtureOfWorldModels(nn.Module):
         else:
             best_regime_id = self.active_regime_id
             best_raw_loss = raw_losses[self.active_regime_id]
-            lowest_routing_ema = self.routing_emas[self.active_regime_id]
             
-            # Hysteresis routing: only switch if a challenger clearly beats the active regime's routing EMA
-            for i in range(len(self.models)):
-                if i != self.active_regime_id:
-                    if self.routing_emas[i] < (self.routing_emas[self.active_regime_id] * self.routing_hysteresis):
-                        if self.routing_emas[i] < lowest_routing_ema:
-                            lowest_routing_ema = self.routing_emas[i]
-                            best_regime_id = i
-                            best_raw_loss = raw_losses[i]
+            dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
+            catastrophic_ceiling = dynamic_threshold
+            
+            active_fast_loss = self.fast_routing_emas[self.active_regime_id]
+            
+            # Argmin Routing Reminder: Rapid Catastrophic Takeover
+            if active_fast_loss > catastrophic_ceiling:
+                best_candidate = min(range(len(self.models)), key=lambda i: self.fast_routing_emas[i])
+                if self.fast_routing_emas[best_candidate] <= catastrophic_ceiling:
+                    best_regime_id = best_candidate
+                    best_raw_loss = raw_losses[best_candidate]
+                    print(f"\n[MoWM] Emergency Routing Switch! Active model {self.active_regime_id} failing ({active_fast_loss:.2f} > {catastrophic_ceiling:.2f}). "
+                          f"Routing to Model {best_candidate} ({self.fast_routing_emas[best_candidate]:.2f})")
+            else:
+                # Standard Hysteresis Routing: Smooth Trend Takeover
+                lowest_routing_ema = self.routing_emas[self.active_regime_id]
+                for i in range(len(self.models)):
+                    if i != self.active_regime_id:
+                        if self.routing_emas[i] < (self.routing_emas[self.active_regime_id] * self.routing_hysteresis):
+                            if self.routing_emas[i] < lowest_routing_ema:
+                                lowest_routing_ema = self.routing_emas[i]
+                                best_regime_id = i
+                                best_raw_loss = raw_losses[i]
                 
         return best_regime_id, best_raw_loss, raw_losses
 
@@ -178,8 +198,8 @@ class MixtureOfWorldModels(nn.Module):
         
         for i in range(len(self.models)):
             # Active model: sluggish 100-step SMA prevents false spawns from micro-fluctuations.
-            # Inactive models: responsive routing_ema rapidly blocks false spawns when a veteran wakes up.
-            metric = smoothed_losses[i] if i == self.active_regime_id else self.routing_emas[i]
+            # Inactive models: extremely responsive fast EMA rapidly blocks false spawns when a veteran wakes up.
+            metric = smoothed_losses[i] if i == self.active_regime_id else self.fast_routing_emas[i]
             
             if metric <= dynamic_threshold:
                 all_surprised = False
@@ -203,6 +223,7 @@ class MixtureOfWorldModels(nn.Module):
             self.active_regime_id = len(self.models) - 1
             self.ema_losses.append(new_baseline)  # Set EMA for the new regime baseline
             self.routing_emas.append(new_baseline) # Seed routing EMA
+            self.fast_routing_emas.append(new_baseline) # Seed fast routing EMA
             self.ema_history.append(collections.deque([new_baseline], maxlen=10))
             self.has_mastered.append(False)
             self.steps_under_threshold.append(0)

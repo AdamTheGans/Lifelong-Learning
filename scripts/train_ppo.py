@@ -32,7 +32,7 @@ def main():
     p.add_argument("--intrinsic_reward_clip", type=float, default=0.1, help="Max intrinsic reward per step")
     p.add_argument("--imagined_horizon", type=int, default=10, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model learning rate")
-    p.add_argument("--surprise_threshold", type=float, default=2.0, help="WM loss threshold to spawn a new head")
+    p.add_argument("--surprise_threshold", type=float, default=0.1, help="Reward-loss threshold to spawn a new head")
     p.add_argument("--max_heads", type=int, default=4, help="Max number of WM heads")
 
     args = p.parse_args()

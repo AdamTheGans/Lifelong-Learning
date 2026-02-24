@@ -40,7 +40,7 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
-    surprise_threshold: float = 2.0,
+    surprise_threshold: float = 0.1,
     max_heads: int = 4,
 ):
     """
@@ -362,6 +362,7 @@ def train_ppo(
     spawn_warmup = 10     # don't spawn before this many updates
     spawn_cooldown = 20   # min updates between spawns
     last_spawn_update = -999
+    running_reward_loss = 0.0  # tracks baseline reward loss for relative threshold
 
     for update in range(start_update, num_updates + 1):
         if anneal_lr:
@@ -396,7 +397,19 @@ def train_ppo(
                 and len(world_model.state_heads) < max_heads
                 and (update - last_spawn_update) >= spawn_cooldown
             )
-            if best_loss > surprise_threshold and spawn_allowed:
+            # Relative + absolute threshold: loss must exceed both the absolute
+            # threshold AND 3× the running average (adapts to loss scale)
+            surprise_spike = best_loss > surprise_threshold
+            if running_reward_loss > 0:
+                surprise_spike = surprise_spike and (best_loss > 3.0 * running_reward_loss)
+
+            # Update running average (EMA of best-head reward loss)
+            if running_reward_loss == 0.0:
+                running_reward_loss = best_loss
+            else:
+                running_reward_loss = 0.05 * best_loss + 0.95 * running_reward_loss
+
+            if surprise_spike and spawn_allowed:
                 best_head = world_model.spawn_head()
                 last_spawn_update = update
                 # Refresh optimizer to include new head parameters

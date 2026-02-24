@@ -133,9 +133,10 @@ class SimpleWorldModel(nn.Module):
     def select_best_head(self, obs: torch.Tensor, actions: torch.Tensor,
                          next_obs: torch.Tensor, rewards: torch.Tensor) -> tuple[int, float]:
         """
-        Evaluate all heads on a batch and return (best_head_index, best_loss).
+        Evaluate all heads on a batch and return (best_head_index, best_reward_loss).
 
-        Uses combined state CE + reward MSE loss to score each head.
+        Routes based on REWARD loss only — state dynamics are identical across
+        regimes, so reward prediction error is the real regime-switch signal.
         """
         # Shared trunk forward (compute once)
         cnn_features = self.cnn(obs)
@@ -144,23 +145,17 @@ class SimpleWorldModel(nn.Module):
         features = self.trunk(x)
         B = obs.shape[0]
 
-        target_indices = torch.argmax(next_obs, dim=1)  # (B, H, W)
-
         best_idx, best_loss = 0, float('inf')
         for i in range(len(self.state_heads)):
-            pred_state = self.state_heads[i](features).reshape(B, self.c, self.h, self.w)
             pred_reward = self.reward_heads[i](features).squeeze(-1)
+            reward_loss = F.mse_loss(pred_reward, rewards).item()
 
-            loss_state = F.cross_entropy(pred_state, target_indices)
-            loss_reward = F.mse_loss(pred_reward, rewards)
-            raw_loss = (loss_state + loss_reward).item()
-
-            # Update EMA
+            # Update EMA on reward loss only
             if self.head_ema_losses[i] == float('inf'):
-                self.head_ema_losses[i] = raw_loss
+                self.head_ema_losses[i] = reward_loss
             else:
                 self.head_ema_losses[i] = (
-                    self.ema_alpha * raw_loss +
+                    self.ema_alpha * reward_loss +
                     (1 - self.ema_alpha) * self.head_ema_losses[i]
                 )
 

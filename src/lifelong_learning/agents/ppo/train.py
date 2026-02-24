@@ -40,6 +40,8 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
+    surprise_threshold: float = 2.0,
+    max_heads: int = 4,
 ):
     """
     Main Dyna-PPO training loop.
@@ -373,6 +375,27 @@ def train_ppo(
         with torch.no_grad():
             _, last_value = model.forward(obs_t)
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
+
+        # Head routing: select best head or spawn a new one
+        with torch.no_grad():
+            n_sample = min(64, cfg.num_steps)
+            sample_obs = buffer.obs[:n_sample].reshape(-1, *obs_shape)
+            sample_act = buffer.actions[:n_sample].reshape(-1)
+            sample_next = buffer.next_obs[:n_sample].reshape(-1, *obs_shape)
+            sample_rew = buffer.rewards[:n_sample].reshape(-1)
+            best_head, best_loss = world_model.select_best_head(
+                sample_obs, sample_act, sample_next, sample_rew
+            )
+            if best_loss > surprise_threshold and len(world_model.state_heads) < max_heads:
+                best_head = world_model.spawn_head()
+                # Refresh optimizer to include new head parameters
+                wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
+                print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold})")
+            world_model.active_head = best_head
+
+        logger.scalar("world_model/active_head", world_model.active_head, global_step)
+        logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)
+        logger.scalar("world_model/best_head_loss", best_loss, global_step)
 
         # Phase B: Update policy on real data
         update_stats = update_policy(buffer, cfg.update_epochs)

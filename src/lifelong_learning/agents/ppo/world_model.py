@@ -21,7 +21,7 @@ class SimpleWorldModel(nn.Module):
             - Reward: Linear → scalar
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256, num_initial_heads: int = 1):
         super().__init__()
         self.obs_shape = obs_shape
         self.c, self.h, self.w = obs_shape
@@ -48,6 +48,7 @@ class SimpleWorldModel(nn.Module):
         self.action_emb = nn.Embedding(n_actions, 32)
 
         # Fuse CNN features + action embedding → MLP trunk
+        self.hidden_dim = hidden_dim
         self.trunk = nn.Sequential(
             nn.Linear(cnn_out_dim + 32, hidden_dim),
             nn.ReLU(),
@@ -55,8 +56,12 @@ class SimpleWorldModel(nn.Module):
             nn.ReLU(),
         )
 
-        self.next_state_head = nn.Linear(hidden_dim, self.flat_obs_dim)
-        self.reward_head = nn.Linear(hidden_dim, 1)
+        self.state_heads = nn.ModuleList()
+        self.reward_heads = nn.ModuleList()
+        for _ in range(num_initial_heads):
+            self.state_heads.append(nn.Linear(hidden_dim, self.flat_obs_dim))
+            self.reward_heads.append(nn.Linear(hidden_dim, 1))
+        self.active_head = 0
 
         self.apply(self._init_weights)
 
@@ -84,8 +89,8 @@ class SimpleWorldModel(nn.Module):
         x = torch.cat([cnn_features, act_emb], dim=1)         # (B, cnn_out_dim + 32)
         features = self.trunk(x)                               # (B, hidden_dim)
 
-        next_obs_flat = self.next_state_head(features)
-        reward_pred = self.reward_head(features).squeeze(-1)
+        next_obs_flat = self.state_heads[self.active_head](features)
+        reward_pred = self.reward_heads[self.active_head](features).squeeze(-1)
         next_obs_pred = next_obs_flat.reshape(B, self.c, self.h, self.w)
 
         return next_obs_pred, reward_pred
@@ -106,6 +111,50 @@ class SimpleWorldModel(nn.Module):
         one_hot = F.one_hot(max_indices, num_classes=self.c)       # (B, H, W, C)
         discrete_obs = one_hot.permute(0, 3, 1, 2).float()        # (B, C, H, W)
         return discrete_obs
+
+    def spawn_head(self) -> int:
+        """Add a new (state, reward) head pair. Returns new head index."""
+        device = next(self.parameters()).device
+        state_head = nn.Linear(self.hidden_dim, self.flat_obs_dim).to(device)
+        reward_head = nn.Linear(self.hidden_dim, 1).to(device)
+        nn.init.orthogonal_(state_head.weight, gain=np.sqrt(2))
+        nn.init.zeros_(state_head.bias)
+        nn.init.orthogonal_(reward_head.weight, gain=np.sqrt(2))
+        nn.init.zeros_(reward_head.bias)
+        self.state_heads.append(state_head)
+        self.reward_heads.append(reward_head)
+        return len(self.state_heads) - 1
+
+    def select_best_head(self, obs: torch.Tensor, actions: torch.Tensor,
+                         next_obs: torch.Tensor, rewards: torch.Tensor) -> tuple[int, float]:
+        """
+        Evaluate all heads on a batch and return (best_head_index, best_loss).
+
+        Uses combined state CE + reward MSE loss to score each head.
+        """
+        # Shared trunk forward (compute once)
+        cnn_features = self.cnn(obs)
+        act_emb = self.action_emb(actions)
+        x = torch.cat([cnn_features, act_emb], dim=1)
+        features = self.trunk(x)
+        B = obs.shape[0]
+
+        target_indices = torch.argmax(next_obs, dim=1)  # (B, H, W)
+
+        best_idx, best_loss = 0, float('inf')
+        for i in range(len(self.state_heads)):
+            pred_state = self.state_heads[i](features).reshape(B, self.c, self.h, self.w)
+            pred_reward = self.reward_heads[i](features).squeeze(-1)
+
+            loss_state = F.cross_entropy(pred_state, target_indices)
+            loss_reward = F.mse_loss(pred_reward, rewards)
+            total = (loss_state + loss_reward).item()
+
+            if total < best_loss:
+                best_loss = total
+                best_idx = i
+
+        return best_idx, best_loss
 
     def generate_imagined_trajectories(
         self,

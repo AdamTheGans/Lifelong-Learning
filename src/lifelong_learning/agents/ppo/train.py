@@ -41,9 +41,7 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
-    dreaming_ratio: float = 1.0,
-    disable_reservoir: bool = False,
-    global_advantage_norm: bool = False,
+    dreaming_ratio: float = 0.25,
 ):
     """
     Main Dyna-PPO training loop.
@@ -195,6 +193,8 @@ def train_ppo(
 
     # State reservoir for generative replay
     state_reservoir = defaultdict(lambda: deque(maxlen=1000))
+    # Temporary storage for states in the current episode, tracked per environment
+    temp_env_states = [[] for _ in range(num_envs)]
 
     # =========================================================================
     # Helper Functions
@@ -202,7 +202,7 @@ def train_ppo(
 
     def collect_real_experience(global_step):
         """Phase A: Interact with real environments and collect transitions."""
-        nonlocal obs_t, running_returns, running_lengths
+        nonlocal obs_t, running_returns, running_lengths, temp_env_states
 
         episodic_intrinsic_rewards = []
         episodic_intrinsic_rewards_max = []
@@ -294,10 +294,9 @@ def train_ppo(
                 regime_ids=current_regime,
             )
 
-            # Add to state reservoir conditionally
-            if not disable_reservoir:
-                env_idx = np.random.randint(num_envs)
-                state_reservoir[world_model.active_regime_id].append(obs_t[env_idx].clone().cpu())
+            # Add to temporary state storage for the current episode
+            for i in range(num_envs):
+                temp_env_states[i].append(obs_t[i].clone().cpu())
 
             obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
 
@@ -321,6 +320,13 @@ def train_ppo(
                     elif reached_bad > 0:
                         outcome = -1  # failure
                     
+                    if outcome == 1:
+                        # Append the successful episode's states to the permanent reservoir
+                        state_reservoir[world_model.active_regime_id].extend(temp_env_states[i])
+
+                    # Always clear temporary states on episode end
+                    temp_env_states[i].clear()
+
                     outcome_window.append(outcome)
 
                     if len(outcome_window) > 0:
@@ -468,8 +474,7 @@ def train_ppo(
                 b_logprobs = buf.logprobs.reshape(batch_size)
                 
                 b_advantages = buf.advantages.reshape(batch_size)
-                if not global_advantage_norm:
-                    b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
                 
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
@@ -490,9 +495,6 @@ def train_ppo(
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)
-
-            if global_advantage_norm:
-                c_advantages = (c_advantages - c_advantages.mean()) / (c_advantages.std() + 1e-8)
             
             total_size = c_obs.size(0)
             idxs = np.arange(total_size)

@@ -18,6 +18,7 @@ from collections import deque
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+from lifelong_learning.agents.ppo.ewc import EWC
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
@@ -42,6 +43,7 @@ def train_ppo(
     wm_lr: float = 1e-4,
     surprise_threshold: float = 0.1,
     max_heads: int = 4,
+    ewc_coef: float = 1000.0,
 ):
     """
     Main Dyna-PPO training loop.
@@ -350,7 +352,8 @@ def train_ppo(
             minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
                 ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
+                stats = ppo_update(model, optimizer, [ppo_batch], cfg,
+                                   ewc=ewc_tracker, ewc_coef=ewc_coef)
                 update_stats.append(stats)
         return update_stats
 
@@ -363,6 +366,11 @@ def train_ppo(
     spawn_cooldown = 20   # min updates between spawns
     last_spawn_update = -999
     running_reward_loss = 0.0  # tracks baseline reward loss for relative threshold
+
+    # EWC for policy consolidation
+    ewc_tracker = EWC(model, device)
+    prev_active_head = world_model.active_head
+    prev_regime_id = -1  # track actual regime from environment
 
     for update in range(start_update, num_updates + 1):
         if anneal_lr:
@@ -416,6 +424,28 @@ def train_ppo(
                 wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
                 print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold}, update={update})")
             world_model.active_head = best_head
+
+        # Detect regime switch → snapshot Fisher for EWC
+        # Compute current regime from global_step (matches env's logic)
+        if steps_per_regime and steps_per_regime > 0:
+            current_regime_id = global_step // steps_per_regime
+        else:
+            current_regime_id = 0
+        regime_switched = (
+            (world_model.active_head != prev_active_head) or
+            (current_regime_id != prev_regime_id and prev_regime_id >= 0)
+        )
+        if regime_switched:
+            trigger = "head" if world_model.active_head != prev_active_head else "regime_id"
+            print(f"[ewc] Switch detected via {trigger} (regime {prev_regime_id}→{current_regime_id}, "
+                  f"head {prev_active_head}→{world_model.active_head}), computing Fisher...")
+            ewc_obs = buffer.obs[:].reshape(-1, *obs_shape)
+            ewc_act = buffer.actions[:].reshape(-1)
+            ewc_tracker.update(model, ewc_obs, ewc_act)
+            prev_active_head = world_model.active_head
+            prev_regime_id = current_regime_id
+        elif prev_regime_id < 0:
+            prev_regime_id = current_regime_id  # first-update init
 
         logger.scalar("world_model/active_head", world_model.active_head, global_step)
         logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)

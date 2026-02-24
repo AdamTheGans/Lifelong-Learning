@@ -29,7 +29,6 @@ class EWC:
     def is_active(self) -> bool:
         return self._initialized
 
-    @torch.no_grad()
     def update(self, model: nn.Module, obs: torch.Tensor,
                actions: torch.Tensor) -> None:
         """
@@ -43,11 +42,12 @@ class EWC:
             actions: (N,) actions taken in those observations
         """
         # 1. Snapshot current parameters as theta*
-        self.ref_params = {
-            name: p.data.clone()
-            for name, p in model.named_parameters()
-            if p.requires_grad
-        }
+        with torch.no_grad():
+            self.ref_params = {
+                name: p.data.clone()
+                for name, p in model.named_parameters()
+                if p.requires_grad
+            }
 
         # 2. Estimate diagonal Fisher via policy log-prob gradients
         self.fisher = {
@@ -71,14 +71,16 @@ class EWC:
             loss = log_probs.mean()
             loss.backward()
 
-            for name, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    # Fisher = E[grad(log pi)^2]
-                    self.fisher[name] += (p.grad.data ** 2) * (end - start)
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        # Fisher = E[grad(log pi)^2]
+                        self.fisher[name] += (p.grad.data ** 2) * (end - start)
 
         # Normalize by total samples
-        for name in self.fisher:
-            self.fisher[name] /= n_samples
+        with torch.no_grad():
+            for name in self.fisher:
+                self.fisher[name] /= n_samples
 
         model.train()
         self._initialized = True

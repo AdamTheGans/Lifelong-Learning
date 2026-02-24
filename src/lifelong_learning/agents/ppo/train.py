@@ -41,7 +41,7 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
-    dreaming_ratio: float = 0.25,
+    dreaming_ratio: float = 1.0,
     oracle_mode: bool = False,
 ):
     """
@@ -447,10 +447,12 @@ def train_ppo(
 
     def generate_dream_experience(reservoir, min_states=16):
         """Phase C: Generate imagined trajectories using WM as simulator."""
-        if torch.rand(1).item() < 0.5:
-            dream_regime_id = world_model.active_regime_id
+        num_models = len(world_model.models)
+        if num_models > 1:
+            inactive_regimes = [i for i in range(num_models) if i != world_model.active_regime_id]
+            dream_regime_id = inactive_regimes[torch.randint(0, len(inactive_regimes), (1,)).item()]
         else:
-            dream_regime_id = torch.randint(0, len(world_model.models), (1,)).item()
+            dream_regime_id = world_model.active_regime_id
             
         dream_regime_tensor = torch.full((num_envs,), dream_regime_id, dtype=torch.long, device=device)
 
@@ -513,7 +515,6 @@ def train_ppo(
                 b_logprobs = buf.logprobs.reshape(batch_size)
                 
                 b_advantages = buf.advantages.reshape(batch_size)
-                b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
                 
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
@@ -531,6 +532,7 @@ def train_ppo(
             c_actions = torch.cat(all_actions, dim=0)
             c_logprobs = torch.cat(all_logprobs, dim=0)
             c_advantages = torch.cat(all_advantages, dim=0)
+            c_advantages = (c_advantages - c_advantages.mean()) / (c_advantages.std() + 1e-8)
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)

@@ -152,6 +152,13 @@ class MixtureOfWorldModels(nn.Module):
         if len(self.surprise_window) < self.surprise_window_size:
             return False
             
+        # Routing Transition Guard
+        # If the router officially decides to switch to a veteran model (hysteresis broken),
+        # block spawning and clear the window so old regime losses don't pollute the new evaluation.
+        if best_regime_id != self.active_regime_id:
+            self.surprise_window.clear()
+            return False
+            
         # Calculate smoothed loss for EVERY model
         smoothed_losses = [sum(losses[i] for losses in self.surprise_window) / len(self.surprise_window) for i in range(len(self.models))]
 
@@ -168,7 +175,11 @@ class MixtureOfWorldModels(nn.Module):
         # Are there any models in the collective that are NOT surprised?
         all_surprised = True
         for i in range(len(self.models)):
-            ratio = smoothed_losses[i] / max(self.best_emas[i], self.ema_epsilon)
+            # Active model: sluggish 100-step SMA prevents false spawns from micro-fluctuations.
+            # Inactive models: responsive routing_ema rapidly blocks false spawns when a veteran wakes up.
+            metric = smoothed_losses[i] if i == self.active_regime_id else self.routing_emas[i]
+            
+            ratio = metric / max(self.best_emas[i], self.ema_epsilon)
             if ratio <= self.surprise_threshold:
                 all_surprised = False
                 break

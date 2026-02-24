@@ -103,6 +103,7 @@ def train_ppo(
         world_model.ema_history.append(deque([1.0], maxlen=10))
         world_model.has_mastered.append(False)
         world_model.steps_under_threshold.append(0)
+        world_model.spawn_steps.append(0)
         
         wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
 
@@ -177,6 +178,11 @@ def train_ppo(
                 # Backwards compatibility: Assume models initialized before this feature have already mastered
                 world_model.has_mastered = [True] * len(world_model.models)
                 world_model.steps_under_threshold = [world_model.mastery_buffer_steps] * len(world_model.models)
+
+            if "spawn_steps" in ckpt["mowm_state"]:
+                world_model.spawn_steps = ckpt["mowm_state"]["spawn_steps"]
+            else:
+                world_model.spawn_steps = [0] * len(world_model.models)
 
             if "force_active_until" in ckpt["mowm_state"]:
                 world_model.force_active_until = ckpt["mowm_state"]["force_active_until"]
@@ -438,7 +444,7 @@ def train_ppo(
                 # Temporarily swap active_regime_id to update the right EMA
                 original_id = world_model.active_regime_id
                 world_model.active_regime_id = m_id
-                world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps)
+                world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps, global_step=global_step)
                 world_model.active_regime_id = original_id
                 
             if m_id == active_id:
@@ -611,6 +617,7 @@ def train_ppo(
         for i, ema_l in enumerate(world_model.ema_losses):
             logger.scalar(f"mowm/ema_loss_model_{i}", ema_l, global_step)
             logger.scalar(f"mowm/routing_ema_model_{i}", world_model.routing_emas[i], global_step)
+            logger.scalar(f"mowm/has_mastered_model_{i}", float(world_model.has_mastered[i]), global_step)
             
         avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
@@ -665,6 +672,7 @@ def train_ppo(
                         "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,
+                        "spawn_steps": world_model.spawn_steps,
                         "force_active_until": world_model.force_active_until,
                     },
                     "cfg": cfg.__dict__,

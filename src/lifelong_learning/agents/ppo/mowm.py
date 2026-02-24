@@ -30,6 +30,8 @@ class MixtureOfWorldModels(nn.Module):
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
         self.routing_emas = [1.0]
+        self.spawn_steps = [0]
+        self.timeout_triggered = [False]
 
         # Hyperparameters
         self.ema_alpha = 0.05
@@ -44,12 +46,13 @@ class MixtureOfWorldModels(nn.Module):
         self.max_ema_growth = 0.10           # Trend-Aware Spawning: Max relative growth
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
         self.mastery_buffer_steps = 5000     # Mastery Prerequisite: Continuous steps required below threshold
+        self.max_lockin_steps = 250000       # Maximum steps to keep the mastery shield up
         
         # State tracking
         self.force_active_until = 0
         self.surprise_window = collections.deque(maxlen=self.surprise_window_size)
 
-    def update_ema(self, current_loss: float, steps_added: int = 0):
+    def update_ema(self, current_loss: float, steps_added: int = 0, global_step: int = -1):
         """
         Updates the exponential moving average of the loss.
         Note: This should ONLY be called externally during the training loop of the active world model,
@@ -63,7 +66,10 @@ class MixtureOfWorldModels(nn.Module):
         if self.ema_losses[idx] < self.mastery_loss_threshold:
             self.steps_under_threshold[idx] += steps_added
             if self.steps_under_threshold[idx] >= self.mastery_buffer_steps:
-                self.has_mastered[idx] = True
+                if not self.has_mastered[idx]:
+                    self.has_mastered[idx] = True
+                    step_str = f" at {global_step} steps" if global_step >= 0 else ""
+                    print(f"\n[MoWM] World Model {idx} reached mastery{step_str}! Shield dropped.")
         else:
             self.steps_under_threshold[idx] = 0
 
@@ -94,7 +100,21 @@ class MixtureOfWorldModels(nn.Module):
             self.routing_emas[i] = (self.ema_alpha * loss) + ((1 - self.ema_alpha) * self.routing_emas[i])
 
         # Newborn stickiness bypass: if in grace period, stick with active model
-        if global_step < self.force_active_until:
+        # Mastery lock-in bypass: if the active regime has not mastered the environment, it cannot be unseated by veterans.
+        elapsed_steps = global_step - self.spawn_steps[self.active_regime_id]
+        
+        # Timeout warning (ensuring backwards compatibility of attribute)
+        if not hasattr(self, 'timeout_triggered'):
+            self.timeout_triggered = [False] * len(self.models)
+        
+        if not self.has_mastered[self.active_regime_id] and elapsed_steps >= self.max_lockin_steps:
+            if not self.timeout_triggered[self.active_regime_id]:
+                self.timeout_triggered[self.active_regime_id] = True
+                print(f"\n[MoWM] World Model {self.active_regime_id} Mastery Shield TIMEOUT at {global_step} steps! Shield forced down.")
+
+        is_locked_in = (global_step < self.force_active_until) or (not self.has_mastered[self.active_regime_id] and elapsed_steps < self.max_lockin_steps)
+
+        if is_locked_in:
             best_regime_id = self.active_regime_id
             best_raw_loss = raw_losses[self.active_regime_id]
         else:
@@ -168,6 +188,9 @@ class MixtureOfWorldModels(nn.Module):
             self.ema_history.append(collections.deque([smoothed_loss], maxlen=10))
             self.has_mastered.append(False)
             self.steps_under_threshold.append(0)
+            self.spawn_steps.append(global_step)
+            if hasattr(self, 'timeout_triggered'):
+                self.timeout_triggered.append(False)
             self.force_active_until = global_step + self.newborn_grace_period
             self.surprise_window.clear()
             

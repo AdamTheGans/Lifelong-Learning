@@ -279,7 +279,9 @@ def plot_run(logdir, run_name):
         "mowm_ema_old": "mowm/ema_loss",
         "mowm_ema_active": "mowm/ema_loss_active",
         "mowm_avg": "mowm/epoch_avg_loss",
-        "mowm_spawn": "mowm/spawn_occurred"
+        "mowm_spawn": "mowm/spawn_occurred",
+        "mowm_mastery0": "mowm/has_mastered_model_0",
+        "mowm_mastery1": "mowm/has_mastered_model_1"
     }
     
     data = load_data_from_logdir(logdir, list(tag_map.values()))
@@ -460,6 +462,16 @@ def plot_run(logdir, run_name):
         ax6_right.set_yticks(range(max_spawns + 2))
         ax6_right.tick_params(axis='y', labelcolor="green")
         
+        lines = [line_true, line_pred, line_spawns]
+
+        # Check for mastery data and plot it as background highlighting
+        if tag_map["mowm_mastery1"] in data and not data[tag_map["mowm_mastery1"]].empty:
+            df_m1 = data[tag_map["mowm_mastery1"]]
+            # Fill region where has_mastered_model_1 is 0 (is NOT mastered = "Shield Active")
+            ax6.fill_between(df_m1['step'], 0, max_active + 1, where=(df_m1['value'] == 0.0), 
+                             color='red', alpha=0.1, step='post', label='Model 1 Shield Active (Unmastered)')
+            lines.append(plt.Line2D([0], [0], color='red', alpha=0.3, lw=4, label='Model 1 Shield Active (Unmastered)'))
+
         # Combine legends
         lines = [line_true, line_pred, line_spawns]
         labels = [l.get_label() for l in lines]

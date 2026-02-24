@@ -298,14 +298,15 @@ def plot_run(logdir, run_name):
 
     # --- Generate Separate Regime Plots ---
     # Ensure graphs directory exists
-    os.makedirs("graphs", exist_ok=True)
+    unique_folder = "graphs_" + run_name.replace(os.path.sep, '_')
+    os.makedirs(unique_folder, exist_ok=True)
 
     # 1. Step Reward vs Surprise
     df_step_rew = data.get(tag_map["step_rew"])
     df_wm_rew_loss = data.get(tag_map["wm_rew"])
     
     if df_step_rew is not None:
-        out_file = os.path.join("graphs", f"regime_analysis_step_reward_{run_name.replace(os.path.sep, '_')}.png")
+        out_file = os.path.join(unique_folder, f"regime_analysis_step_reward_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_step_rew, df_wm_rew_loss,
             "Regime Analysis: Step Reward vs Surprise", "Mean Step Reward",
@@ -316,7 +317,7 @@ def plot_run(logdir, run_name):
     # 2. Episodic Return vs Surprise
     df_eps_ret = data.get(tag_map["score"])
     if df_eps_ret is not None:
-        out_file = os.path.join("graphs", f"regime_analysis_episodic_return_{run_name.replace(os.path.sep, '_')}.png")
+        out_file = os.path.join(unique_folder, f"regime_analysis_episodic_return_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_eps_ret, df_wm_rew_loss,
             "Regime Analysis: Episodic Return vs Surprise", "Episodic Return",
@@ -327,7 +328,7 @@ def plot_run(logdir, run_name):
     # 3. Success Rate vs Surprise
     df_success = data.get(tag_map["success"])
     if df_success is not None:
-        out_file = os.path.join("graphs", f"regime_analysis_success_rate_{run_name.replace(os.path.sep, '_')}.png")
+        out_file = os.path.join(unique_folder, f"regime_analysis_success_rate_{run_name.replace(os.path.sep, '_')}.png")
         plot_single_graph(
             df_success, df_wm_rew_loss,
             "Regime Analysis: Success Rate vs Surprise", "Success Rate",

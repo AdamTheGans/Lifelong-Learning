@@ -112,7 +112,8 @@ class SimpleWorldModel(nn.Module):
         policy_net: nn.Module,
         start_states: torch.Tensor,
         horizon: int,
-        regime_tensor: torch.Tensor
+        regime_tensor: torch.Tensor,
+        reservoir_states: list | None = None
     ) -> list[dict]:
         """
         Roll out imagined trajectories using the WM as a simulator (Dyna-style).
@@ -122,15 +123,27 @@ class SimpleWorldModel(nn.Module):
         All operations are under no_grad — PPO treats imagined data the same
         as real data (fixed collection, then update).
 
+        Rewards are snapped to canonical environment values to prevent
+        garbage-scale predictions from corrupting the PPO learning signal.
+        Terminal dream envs are reset from the reservoir to prevent
+        post-terminal hallucination.
+
         Args:
-            policy_net:   PPO Actor-Critic network
-            start_states: (B, C, H, W) seed states sampled from the replay buffer
-            horizon:      number of imagination steps
+            policy_net:       PPO Actor-Critic network
+            start_states:     (B, C, H, W) seed states sampled from the reservoir
+            horizon:          number of imagination steps
+            regime_tensor:    (B,) regime IDs for policy conditioning
+            reservoir_states: list of CPU tensors for resetting terminal dream envs
 
         Returns:
             List of transition dicts, one per timestep:
                 {obs, actions, logprobs, rewards, dones, values, next_obs}
         """
+        # Canonical reward values from RegimeGoalSwapWrapper:
+        #   step penalty = -0.01, bad goal = -1.01, good goal = +4.99
+        CANONICAL_REWARDS = torch.tensor([-1.01, -0.01, 4.99], device=start_states.device)
+        STEP_PENALTY_IDX = 1  # Index of -0.01 in the canonical array
+
         trajectories = []
         curr_obs = start_states
 
@@ -141,18 +154,35 @@ class SimpleWorldModel(nn.Module):
 
             next_obs_discrete = self.discretize_state(next_obs_pred)
 
-            # Termination heuristic: reward > 0.5 implies goal reached
-            dones = (reward_pred > 0.5).float()
+            # [FIX] Snap reward to nearest canonical environment value
+            diffs = (reward_pred.unsqueeze(-1) - CANONICAL_REWARDS.unsqueeze(0)).abs()
+            nearest_idx = diffs.argmin(dim=-1)  # (B,)
+            snapped_reward = CANONICAL_REWARDS[nearest_idx]  # (B,)
+
+            # [FIX] Terminal = any non-step-penalty reward (i.e. a goal was reached)
+            dones = (nearest_idx != STEP_PENALTY_IDX).float()
 
             trajectories.append({
                 "obs": curr_obs,
                 "actions": action,
                 "logprobs": logprob,
-                "rewards": reward_pred,
+                "rewards": snapped_reward,
                 "dones": dones,
                 "values": value,
                 "next_obs": next_obs_discrete
             })
+
+            # [FIX] Reset terminated dream envs to a reservoir state
+            # to prevent post-terminal hallucinated garbage from corrupting
+            # subsequent dream steps.
+            if reservoir_states is not None and len(reservoir_states) > 0 and dones.any():
+                done_mask = dones.bool()
+                num_done = done_mask.sum().item()
+                if num_done > 0:
+                    idxs = np.random.choice(len(reservoir_states), int(num_done), replace=True)
+                    reset_states = torch.stack([reservoir_states[i] for i in idxs]).to(curr_obs.device)
+                    next_obs_discrete = next_obs_discrete.clone()
+                    next_obs_discrete[done_mask] = reset_states
 
             curr_obs = next_obs_discrete
 

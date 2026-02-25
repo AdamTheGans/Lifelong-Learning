@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.13")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.14")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -518,7 +518,8 @@ def train_ppo(
             policy_net=model,
             start_states=start_states,
             horizon=imagined_horizon,
-            regime_tensor=dream_regime_tensor
+            regime_tensor=dream_regime_tensor,
+            reservoir_states=list(reservoir[dream_regime_id])
         )
 
         # Build a dream buffer from the imagined data
@@ -561,13 +562,7 @@ def train_ppo(
                 b_obs = buf.obs.reshape((batch_size,) + buf.obs_shape)
                 b_actions = buf.actions.reshape(batch_size)
                 b_logprobs = buf.logprobs.reshape(batch_size)
-                
                 b_advantages = buf.advantages.reshape(batch_size)
-                std = b_advantages.std()
-                if std < 1e-6:
-                    std = torch.tensor(1.0, device=b_advantages.device)
-                b_advantages = (b_advantages - b_advantages.mean()) / (std + 1e-8)
-                
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
                 b_regime_ids = buf.regime_ids.reshape(batch_size)
@@ -587,6 +582,13 @@ def train_ppo(
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)
+            
+            # Normalize advantages AFTER concatenation across all buffers
+            # so real and dream signals retain their relative magnitudes.
+            std = c_advantages.std()
+            if std < 1e-6:
+                std = torch.tensor(1.0, device=c_advantages.device)
+            c_advantages = (c_advantages - c_advantages.mean()) / (std + 1e-8)
             
             total_size = c_obs.size(0)
             idxs = np.arange(total_size)

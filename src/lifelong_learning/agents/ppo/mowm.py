@@ -94,9 +94,9 @@ class MixtureOfWorldModels(nn.Module):
                 
                 reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
                 
-                # Max surprise across all environments in this specific transition batch
+                # Mean surprise across all environments in this specific transition batch
                 loss_batch = state_loss_per_batch + reward_loss
-                loss = loss_batch.max().item() 
+                loss = loss_batch.mean().item() 
                 raw_losses.append(loss)
                 
             # Update routing EMAs unconditionally for all regimes to maintain a parallel inference track

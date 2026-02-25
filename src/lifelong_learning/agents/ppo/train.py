@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.8")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.9")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -446,16 +446,15 @@ def train_ppo(
                     wm_loss_mean.backward()
                     m_opt.step()
 
-                    # Track the MAX loss to establish the EMA baseline correctly!
+                    # Track the MEAN loss to establish the EMA baseline correctly!
                     with torch.no_grad():
-                        state_loss_per_batch = loss_state.mean(dim=[1, 2])
-                        batch_max_loss = (state_loss_per_batch + loss_reward).max().item()
+                        batch_mean_loss = wm_loss_mean.item()
                     
-                    epoch_losses.append(batch_max_loss)
+                    epoch_losses.append(batch_mean_loss)
 
                     wm_stats.append({
                         "world_model/loss_total": wm_loss_mean.item(),
-                        "world_model/loss_max": batch_max_loss,
+                        "world_model/loss_mean": batch_mean_loss,
                         "world_model/loss_state": loss_state_mean.item(),
                         "world_model/loss_reward": loss_reward_mean.item(),
                     })

@@ -17,7 +17,7 @@ class CNNActorCritic(nn.Module):
     Output: (logits, value)
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, max_regimes: int = 10):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, max_regimes: int = 2):
         super().__init__()
         self.c, self.h, self.w = obs_shape
         self.max_regimes = max_regimes

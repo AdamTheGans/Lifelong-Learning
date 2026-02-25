@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.15")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.16")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -276,11 +276,19 @@ def train_ppo(
                 world_model.active_regime_id = true_regime
             else:
                 best_id, lowest_loss, raw_losses = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
+                old_active_id = world_model.active_regime_id
                 did_spawn = world_model.check_and_spawn(raw_losses, best_id, global_step)
                 if did_spawn:
                     wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                    # ROLLBACK: Undo corruption on the old model before shelving it
+                    world_model.rollback_safe_state(old_active_id, world_model.models[old_active_id], wm_optimizers[old_active_id], global_step=global_step)
                     spawn_occurred = True
                 else:
+                    if best_id != world_model.active_regime_id:
+                        # ROLLBACK: Undo corruption on the outgoing model before switching away
+                        old_id = world_model.active_regime_id
+                        world_model.rollback_safe_state(old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step)
+                        print(f"\n[MoWM] Regime Switch: Model {old_id} → Model {best_id} at step {global_step}.")
                     world_model.active_regime_id = best_id
             
             # Update the current_regime tensor for the buffer and for next step's policy
@@ -466,6 +474,9 @@ def train_ppo(
                 world_model.active_regime_id = m_id
                 world_model.update_ema(avg_loss, steps_added=num_envs * cfg.num_steps, global_step=global_step)
                 world_model.active_regime_id = original_id
+
+                # Refresh safe state if this model is currently stable
+                world_model.refresh_safe_state(m_id, m_model, m_opt, global_step=global_step)
                 
             if m_id == active_id:
                 active_wm_stats = wm_stats

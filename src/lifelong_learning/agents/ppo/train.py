@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("Dyna-PPO Trainer Version: 0.7.6")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.7")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -237,6 +237,17 @@ def train_ppo(
         episodic_intrinsic_rewards_max = []
         spawn_occurred = False
 
+        # Diagnostics: Context-Ignorance Lazy Policy Check
+        with torch.no_grad():
+            r0 = torch.zeros(num_envs, dtype=torch.long, device=device)
+            r1 = torch.ones(num_envs, dtype=torch.long, device=device)
+            logits0, _ = model(obs_t, r0)
+            logits1, _ = model(obs_t, r1)
+            p0 = torch.nn.functional.softmax(logits0, dim=-1)
+            p1 = torch.nn.functional.softmax(logits1, dim=-1)
+            # KL(P0 || P1) = sum(P0 * log(P0 / P1))
+            kl_div = (p0 * (torch.log(p0 + 1e-8) - torch.log(p1 + 1e-8))).sum(dim=-1).mean().item()
+
         for t in range(cfg.num_steps):
             global_step += num_envs
 
@@ -389,6 +400,7 @@ def train_ppo(
             "buffer_rewards_std": buffer.rewards.std().item(),
             "buffer_rewards_abs_mean": buffer.rewards.abs().mean().item(),
             "spawn_occurred": spawn_occurred,
+            "regime_kl_divergence": kl_div,
         }
 
     def update_world_model():
@@ -492,15 +504,15 @@ def train_ppo(
             
         dream_regime_tensor = torch.full((num_envs,), dream_regime_id, dtype=torch.long, device=device)
 
-        # Sample start states from reservoir if available, else fallback to real buffer
+        # Sample start states from reservoir if available, else abort dream
         if len(reservoir[dream_regime_id]) >= min_states:
             res_list = list(reservoir[dream_regime_id])
             idxs = np.random.choice(len(res_list), num_envs, replace=True)
             start_states = torch.stack([res_list[i] for i in idxs]).to(device)
         else:
-            rand_time_idxs = torch.randint(0, cfg.num_steps, (num_envs,), device=device)
-            env_idxs = torch.arange(num_envs, device=device)
-            start_states = buffer.obs[rand_time_idxs, env_idxs]
+            # Prevent Out-Of-Distribution Dream Seeds by aborting dream sequence
+            print(f"[Warning] Aborting dream sequence: insufficient seed states for Regime {dream_regime_id} ({len(reservoir[dream_regime_id])}/{min_states}).")
+            return None, []
 
         # Roll out imagined trajectories
         imagined_trajectories = world_model.models[dream_regime_id].generate_imagined_trajectories(
@@ -625,7 +637,8 @@ def train_ppo(
             if num_dream_rollouts > 0:
                 for _ in range(num_dream_rollouts):
                     db, _ = generate_dream_experience(state_reservoir)
-                    dream_buffers.append(db)
+                    if db is not None:
+                        dream_buffers.append(db)
 
         # Phase D: Update policy on mixed real + imagined data
         buffers_to_train = [buffer] + dream_buffers
@@ -682,6 +695,9 @@ def train_ppo(
             logger.scalar("ppo/intrinsic_reward_ratio", mean_intrinsic / mean_total_abs, global_step)
         else:
             logger.scalar("ppo/intrinsic_reward_ratio", 0.0, global_step)
+
+        # Log "Laziness" Diagnostic Metric
+        logger.scalar("ppo/regime_kl_divergence", collect_stats["regime_kl_divergence"], global_step)
 
         logger.scalar("charts/learning_rate", lrnow, global_step)
         logger.scalar("charts/heartbeat", global_step, global_step)

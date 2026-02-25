@@ -282,7 +282,8 @@ def plot_run(logdir, run_name):
         "mowm_avg_fallback": "mowm/epoch_avg_loss", # Left for backwards compatibility with older runs
         "mowm_spawn": "mowm/spawn_occurred",
         "mowm_mastery0": "mowm/has_mastered_model_0",
-        "mowm_mastery1": "mowm/has_mastered_model_1"
+        "mowm_mastery1": "mowm/has_mastered_model_1",
+        "regime_kl": "ppo/regime_kl_divergence"
     }
     
     # Load all available tags to easily find dynamic ShadowLoss_Model_{i} tags
@@ -405,7 +406,7 @@ def plot_run(logdir, run_name):
     else:
         ax3.text(0.5, 0.5, "No Goal Rate Data\n(Metrics missing in old runs)", ha='center', va='center', color='gray')
     
-    # Panel 4: Intrinsic Reward
+    # Panel 4: Intrinsic Reward & KL Diagnostics
     ax4 = fig.add_subplot(2, 3, 4)
     if tag_map["intrinsic"] in data:
         df = data[tag_map["intrinsic"]]
@@ -416,8 +417,13 @@ def plot_run(logdir, run_name):
         df = data[tag_map["intrinsic_ratio"]]
         smooth_val = df['value'].rolling(window=20, min_periods=1).mean()
         ax4.plot(df['step'], smooth_val, c="purple", lw=1.5, label="Intrinsic Ratio")
+
+    if tag_map["regime_kl"] in data and not data[tag_map["regime_kl"]].empty:
+        df = data[tag_map["regime_kl"]]
+        smooth_val = df['value'].rolling(window=20, min_periods=1).mean()
+        ax4.plot(df['step'], smooth_val, c="teal", lw=2, linestyle=":", label="KL(Regime 0 || 1)")
         
-    ax4.set_title("Intrinsic Rewards")
+    ax4.set_title("Actor Diagnostics (Intrinsic / KL)")
     ax4.legend(fontsize=8)
     
     # Panel 5: World Model Losses

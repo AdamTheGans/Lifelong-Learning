@@ -5,7 +5,7 @@ from lifelong_learning.agents.ppo.mowm import MixtureOfWorldModels
 
 def test_mowm_spawning_logic():
     # 1. Initialize the Brain
-    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32)
+    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=3)
     assert len(mowm.models) == 1
     assert mowm.active_regime_id == 0
 
@@ -53,7 +53,7 @@ def test_mowm_spawning_logic():
 
 def test_mowm_rescue_routing_logic():
     from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
-    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32)
+    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=3)
     # Initialize second model correctly
     mowm.models.append(SimpleWorldModel((21, 8, 8), 4, 32))
     

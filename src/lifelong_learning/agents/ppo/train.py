@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import warnings
 
-# Silence TensorFlow OneDNN warning (must be before torch/tensorflow imports)
+# [FIX] Silence TensorFlow OneDNN warning (must be before torch/tensorflow imports)
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-# Silence pkg_resources deprecation warning from pygame
+# [FIX] Silence pkg_resources deprecation warning from pygame
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 
 import time
@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.16")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.15")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -297,14 +297,10 @@ def train_ppo(
 
                 logger.scalar("debug/raw_cross_entropy_loss", state_surprise.mean().item(), global_step)
 
-                # Reward surprise: CrossEntropy between predicted logits and actual reward class
+                # Reward surprise: MSE between predicted and actual reward
                 real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
-                reward_classes = torch.ones_like(real_reward_t, dtype=torch.long)
-                reward_classes[real_reward_t < -0.5] = 0
-                reward_classes[real_reward_t > 1.0] = 2
-
-                reward_surprise = torch.nn.functional.cross_entropy(
-                    pred_reward, reward_classes, reduction='none'
+                reward_surprise = torch.nn.functional.mse_loss(
+                    pred_reward, real_reward_t, reduction='none'
                 )  # (B,)
 
                 # Combined surprise → intrinsic reward (zero in passive mode)
@@ -439,12 +435,8 @@ def train_ppo(
                     loss_state = torch.nn.functional.cross_entropy(pred_next_obs, target_indices, reduction='none')
                     loss_state_mean = loss_state.mean()
 
-                    # Reward loss: CrossEntropy
-                    m_reward_classes = torch.ones_like(m_rewards, dtype=torch.long)
-                    m_reward_classes[m_rewards < -0.5] = 0
-                    m_reward_classes[m_rewards > 1.0] = 2
-
-                    loss_reward = torch.nn.functional.cross_entropy(pred_reward, m_reward_classes, reduction='none')
+                    # Reward loss: MSE
+                    loss_reward = torch.nn.functional.mse_loss(pred_reward, m_rewards, reduction='none')
                     loss_reward_mean = loss_reward.mean()
 
                     # Backpropagate on means to keep gradients stable
@@ -491,11 +483,7 @@ def train_ppo(
                 for i, model in enumerate(world_model.models):
                     p_next, p_rew = model(shadow_obs, shadow_acts)
                     l_s = torch.nn.functional.cross_entropy(p_next, shadow_targets, reduction='none').mean(dim=[1,2])
-                    shadow_rew_classes = torch.ones_like(shadow_ext_rews, dtype=torch.long)
-                    shadow_rew_classes[shadow_ext_rews < -0.5] = 0
-                    shadow_rew_classes[shadow_ext_rews > 1.0] = 2
-
-                    l_r = torch.nn.functional.cross_entropy(p_rew, shadow_rew_classes, reduction='none')
+                    l_r = torch.nn.functional.mse_loss(p_rew, shadow_ext_rews, reduction='none')
                     shadow_loss = (l_s + l_r).mean().item() # We log mean() for smooth telemetry visibility
                     # Inject it into active_wm_stats so it's guaranteed to be logged
                     if active_wm_stats:

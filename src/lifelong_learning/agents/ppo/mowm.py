@@ -151,6 +151,12 @@ class MixtureOfWorldModels(nn.Module):
                                 lowest_routing_ema = self.routing_emas[i]
                                 best_regime_id = i
                                 best_raw_loss = raw_losses[i]
+
+        if best_regime_id != self.active_regime_id:
+            # History Flush: Reset the moving averages of the newly rescued veteran 
+            # to prevent a "ping-pong death spiral" caused by trailing high-loss garbage.
+            self.routing_emas[best_regime_id] = best_raw_loss
+            self.fast_routing_emas[best_regime_id] = best_raw_loss
                 
         return best_regime_id, best_raw_loss, raw_losses
 

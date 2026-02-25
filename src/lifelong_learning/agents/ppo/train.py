@@ -43,6 +43,7 @@ def train_ppo(
     wm_lr: float = 1e-4,
     surprise_threshold: float = 0.1,
     max_heads: int = 4,
+    freeze_encoder_after: int = 25,
 ):
     """
     Main Dyna-PPO training loop.
@@ -367,8 +368,21 @@ def train_ppo(
 
     # Multi-head policy: track regime for actor head switching
     prev_regime_id = -1
+    encoder_frozen = False
 
     for update in range(start_update, num_updates + 1):
+        # Freeze encoder after warmup (prevents shared encoder drift)
+        if not encoder_frozen and update >= freeze_encoder_after:
+            for p in model.encoder.parameters():
+                p.requires_grad = False
+            # Rebuild optimizer with only trainable params
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=lrnow, eps=1e-5
+            )
+            encoder_frozen = True
+            print(f"[policy] Encoder frozen at update {update} — only actor heads + critic will train")
+
         if anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * cfg.lr
@@ -431,7 +445,8 @@ def train_ppo(
             while current_regime_id >= len(model.actor_heads):
                 new_idx = model.spawn_policy_head()
                 # Refresh optimizer to include new head parameters
-                optimizer = torch.optim.Adam(model.parameters(), lr=lrnow)
+                trainable = filter(lambda p: p.requires_grad, model.parameters())
+                optimizer = torch.optim.Adam(trainable, lr=lrnow, eps=1e-5)
                 print(f"[policy] Spawned policy head {new_idx}")
             model.active_policy_head = current_regime_id
             print(f"[policy] Regime switch → regime {current_regime_id}, policy head {current_regime_id}")

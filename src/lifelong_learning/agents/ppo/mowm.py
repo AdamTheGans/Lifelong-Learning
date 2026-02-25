@@ -133,13 +133,14 @@ class MixtureOfWorldModels(nn.Module):
             
             # Argmin Routing Reminder: Rapid Catastrophic Takeover
             if active_fast_loss > catastrophic_ceiling:
-                best_candidate = min(range(len(self.models)), key=lambda i: self.fast_routing_emas[i])
+                # Use raw_losses to evaluate other models to completely avoid EMA lag
+                best_candidate = min(range(len(self.models)), key=lambda i: raw_losses[i])
                 if best_candidate != self.active_regime_id:
-                    if self.fast_routing_emas[best_candidate] < self.absolute_spawn_threshold:
+                    if raw_losses[best_candidate] < self.absolute_spawn_threshold:
                         best_regime_id = best_candidate
                         best_raw_loss = raw_losses[best_candidate]
                         print(f"\n[MoWM] Rescue Routing Switch! Active model {self.active_regime_id} failing ({active_fast_loss:.2f} > {catastrophic_ceiling:.2f}). "
-                              f"Rescued by Model {best_candidate} ({self.fast_routing_emas[best_candidate]:.2f})")
+                              f"Rescued by Model {best_candidate} (Raw Loss: {raw_losses[best_candidate]:.2f})")
             else:
                 # Standard Hysteresis Routing: Smooth Trend Takeover
                 lowest_routing_ema = self.routing_emas[self.active_regime_id]
@@ -190,15 +191,16 @@ class MixtureOfWorldModels(nn.Module):
         if active_metric <= dynamic_threshold:
             return False
             
-        # 2. Active model is surprised. Are there any BETTER models available?
-        best_model_id = min(range(len(self.models)), key=lambda i: smoothed_losses[i])
+        # 2. Active model is surprised. Are there any BETTER models available right now?
+        # Crucial: Evaluate veterans using instantaneous batch losses (raw_losses) to avoid lag!
+        best_model_id = min(range(len(self.models)), key=lambda i: raw_losses[i])
         
         if best_model_id == self.active_regime_id:
             # The active model is the best we got, and it's surprised. MUST SPAWN.
             all_surprised = True
         else:
-            # A veteran model is better! Are they actually good though?
-            if smoothed_losses[best_model_id] < self.absolute_spawn_threshold:
+            # A veteran model is better! Are they actually good though on this exact batch?
+            if raw_losses[best_model_id] < self.absolute_spawn_threshold:
                 # Veteran can rescue us, block spawn. (Router will switch)
                 all_surprised = False
             else:

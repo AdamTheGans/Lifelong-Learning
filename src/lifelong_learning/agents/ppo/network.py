@@ -12,7 +12,7 @@ class CNNActorCritic(nn.Module):
     Architecture:
         - Shared 3-layer CNN encoder (input channels → 32 → 64 → 64)
         - Multiple Actor heads (one per regime, switchable)
-        - Single Critic head (state value, shared across regimes)
+        - Multiple Critic heads (one per regime, switchable)
 
     Input:  (B, C, H, W) one-hot tensor from OneHotPartialObsWrapper
     Output: (logits, value)
@@ -40,14 +40,11 @@ class CNNActorCritic(nn.Module):
 
         # Multi-head actor (one per regime)
         self.actor_heads = nn.ModuleList([self._make_actor_head()])
-        self.active_policy_head: int = 0
 
-        # Critic head (value function, shared)
-        self.critic_head = nn.Sequential(
-            nn.Linear(self.flat_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+        # Multi-head critic (one per regime)
+        self.critic_heads = nn.ModuleList([self._make_critic_head()])
+
+        self.active_policy_head: int = 0
 
         # Weight initialization
         self.apply(self._init_weights)
@@ -59,7 +56,6 @@ class CNNActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(256, self.n_actions)
         )
-        # Init: hidden layer orthogonal sqrt(2), output layer gain=0.01
         for layer in head:
             if isinstance(layer, nn.Linear):
                 gain = 0.01 if layer == head[-1] else np.sqrt(2)
@@ -68,34 +64,48 @@ class CNNActorCritic(nn.Module):
                     nn.init.zeros_(layer.bias)
         return head
 
+    def _make_critic_head(self) -> nn.Sequential:
+        """Create a new critic head with proper initialization."""
+        head = nn.Sequential(
+            nn.Linear(self.flat_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        for layer in head:
+            if isinstance(layer, nn.Linear):
+                gain = 1.0 if layer == head[-1] else np.sqrt(2)
+                nn.init.orthogonal_(layer.weight, gain=gain)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        return head
+
     def spawn_policy_head(self) -> int:
-        """Add a new actor head and return its index."""
-        head = self._make_actor_head()
-        # Move to same device as existing params
+        """Add new actor + critic heads and return the index."""
         device = next(self.parameters()).device
-        head = head.to(device)
-        self.actor_heads.append(head)
+        self.actor_heads.append(self._make_actor_head().to(device))
+        self.critic_heads.append(self._make_critic_head().to(device))
         return len(self.actor_heads) - 1
 
+    def get_param_groups(self, head_lr: float, encoder_lr: float) -> list[dict]:
+        """Return param groups with separate LRs for encoder vs heads."""
+        return [
+            {"params": list(self.encoder.parameters()), "lr": encoder_lr},
+            {"params": list(self.actor_heads.parameters()) +
+                       list(self.critic_heads.parameters()), "lr": head_lr},
+        ]
+
     def _init_weights(self, m):
-        """Orthogonal init with role-specific gains for output layers."""
+        """Orthogonal init for conv/linear layers."""
         if isinstance(m, (nn.Linear, nn.Conv2d)):
             nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-        # Critic output: gain=1.0 → standard for value function
-        for layer in self.critic_head:
-            if isinstance(layer, nn.Linear):
-                gain = 1.0 if layer == self.critic_head[-1] else np.sqrt(2)
-                nn.init.orthogonal_(layer.weight, gain=gain)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-
     def forward(self, obs: torch.Tensor):
         features = self.encoder(obs)
         logits = self.actor_heads[self.active_policy_head](features)
-        return logits, self.critic_head(features).squeeze(-1)
+        value = self.critic_heads[self.active_policy_head](features).squeeze(-1)
+        return logits, value
 
     def act(self, obs: torch.Tensor):
         """Sample an action and return (action, log_prob, entropy, value)."""

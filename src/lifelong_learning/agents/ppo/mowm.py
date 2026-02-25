@@ -47,9 +47,9 @@ class MixtureOfWorldModels(nn.Module):
         self.max_lockin_steps = 250000       # Maximum steps to keep the mastery shield up
         
         # Safe State Rollback: rolling buffer of last 2 snapshots per model.
-        # Each entry is a deque(maxlen=2) of tuples: (state_dict, optimizer_state, ema_loss, step)
+        # Each entry is a deque(maxlen=3) of tuples: (state_dict, optimizer_state, ema_loss, step)
         # Rollback uses deque[0] (oldest) to guarantee the snapshot predates any lag-period corruption.
-        self.safe_state_buffer = [collections.deque(maxlen=2)]
+        self.safe_state_buffer = [collections.deque(maxlen=3)]
 
         # State tracking
         self.force_active_until = 0
@@ -62,7 +62,7 @@ class MixtureOfWorldModels(nn.Module):
             1. EMA loss is below the mastery threshold (model is well-trained)
             2. We are past the newborn grace period (not a brand-new model)
 
-        Appends to a rolling deque(maxlen=2). Snapshots are stored on CPU
+        Appends to a rolling deque(maxlen=3). Snapshots are stored on CPU
         to avoid doubling GPU VRAM usage.
         """
         is_stable = (
@@ -227,7 +227,7 @@ class MixtureOfWorldModels(nn.Module):
         self.spawn_steps.append(global_step)
         if hasattr(self, 'timeout_triggered'):
             self.timeout_triggered.append(False)
-        self.safe_state_buffer.append(collections.deque(maxlen=2))
+        self.safe_state_buffer.append(collections.deque(maxlen=3))
         self.force_active_until = global_step + self.newborn_grace_period
 
         print(f"\n[MoWM] Spawned new World Model {new_id} at step {global_step}.")

@@ -60,7 +60,7 @@ def test_mowm_epoch_boundary_veteran_rescue():
     mowm.spawn_steps.append(1000)
     if hasattr(mowm, 'timeout_triggered'):
         mowm.timeout_triggered.append(False)
-    mowm.safe_state_buffer.append(collections.deque(maxlen=2))
+    mowm.safe_state_buffer.append(collections.deque(maxlen=3))
     mowm.force_active_until = 0
 
     global_step = mowm.global_grace_period + mowm.newborn_grace_period + 1
@@ -93,7 +93,7 @@ def test_hard_cap_forces_switch_to_lesser_evil():
     mowm.steps_under_threshold.append(mowm.mastery_buffer_steps)
     mowm.spawn_steps.append(1000)
     mowm.timeout_triggered.append(False)
-    mowm.safe_state_buffer.append(collections.deque(maxlen=2))
+    mowm.safe_state_buffer.append(collections.deque(maxlen=3))
     mowm.force_active_until = 0
 
     global_step = mowm.global_grace_period + mowm.newborn_grace_period + 1

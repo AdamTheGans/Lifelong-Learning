@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import warnings
 
-# [FIX] Silence TensorFlow OneDNN warning (must be before torch/tensorflow imports)
+# Silence TensorFlow OneDNN warning (must be before torch/tensorflow imports)
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-# [FIX] Silence pkg_resources deprecation warning from pygame
+# Silence pkg_resources deprecation warning from pygame
 warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
 
 import time
@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.18")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.19")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -102,10 +102,7 @@ def train_ppo(
         world_model.has_mastered.append(False)
         world_model.steps_under_threshold.append(0)
         world_model.spawn_steps.append(0)
-        world_model.safe_state_dicts.append(None)
-        world_model.safe_optimizer_states.append(None)
-        world_model.safe_ema_losses.append(None)
-        world_model.safe_state_steps.append(None)
+        world_model.safe_state_buffer.append(deque(maxlen=2))
         
         wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
 

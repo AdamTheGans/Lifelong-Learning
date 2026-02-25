@@ -46,11 +46,10 @@ class MixtureOfWorldModels(nn.Module):
         self.mastery_buffer_steps = 5000     # Mastery Prerequisite: Continuous steps required below threshold
         self.max_lockin_steps = 250000       # Maximum steps to keep the mastery shield up
         
-        # Safe State Rollback tracking (per-model)
-        self.safe_state_dicts = [None]       # CPU-offloaded weight snapshots
-        self.safe_optimizer_states = [None]   # Optimizer momentum snapshots
-        self.safe_ema_losses = [None]         # EMA loss at time of snapshot
-        self.safe_state_steps = [None]        # Global step when snapshot was taken
+        # Safe State Rollback: rolling buffer of last 2 snapshots per model.
+        # Each entry is a deque(maxlen=2) of tuples: (state_dict, optimizer_state, ema_loss, step)
+        # Rollback uses deque[0] (oldest) to guarantee the snapshot predates any lag-period corruption.
+        self.safe_state_buffer = [collections.deque(maxlen=2)]
 
         # State tracking
         self.force_active_until = 0
@@ -63,7 +62,8 @@ class MixtureOfWorldModels(nn.Module):
             1. EMA loss is below the mastery threshold (model is well-trained)
             2. We are past the newborn grace period (not a brand-new model)
 
-        Snapshots are stored on CPU to avoid doubling GPU VRAM usage.
+        Appends to a rolling deque(maxlen=2). Snapshots are stored on CPU
+        to avoid doubling GPU VRAM usage.
         """
         is_stable = (
             self.ema_losses[regime_id] < self.mastery_loss_threshold
@@ -73,30 +73,36 @@ class MixtureOfWorldModels(nn.Module):
             return
 
         # Deep-copy and offload to CPU to prevent VRAM doubling
-        self.safe_state_dicts[regime_id] = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        self.safe_optimizer_states[regime_id] = copy.deepcopy(optimizer.state_dict())
-        self.safe_ema_losses[regime_id] = self.ema_losses[regime_id]
-        self.safe_state_steps[regime_id] = global_step
+        snapshot = (
+            {k: v.cpu().clone() for k, v in model.state_dict().items()},  # weights
+            copy.deepcopy(optimizer.state_dict()),                         # optimizer
+            self.ema_losses[regime_id],                                    # ema
+            global_step,                                                   # step
+        )
+        self.safe_state_buffer[regime_id].append(snapshot)
 
     def rollback_safe_state(self, regime_id: int, model: nn.Module, optimizer, global_step: int = -1) -> bool:
         """
-        Restore a world model's weights to its last safe checkpoint.
+        Restore a world model's weights to its oldest safe checkpoint in the
+        rolling buffer (deque[0]).
 
-        Called at the exact moment the Router transitions away from this model,
-        undoing any weight corruption accumulated during the detection lag period.
+        Using the oldest (second-to-last) snapshot guarantees the checkpoint
+        predates any lag-period corruption from the regime transition.
 
         Returns True if rollback occurred, False if no safe state was available.
         """
-        if self.safe_state_dicts[regime_id] is None:
+        buf = self.safe_state_buffer[regime_id]
+        if len(buf) == 0:
             print(f"[MoWM] Rollback skipped for Model {regime_id}: no safe state available (newborn).")
             return False
 
-        model.load_state_dict(self.safe_state_dicts[regime_id])
-        optimizer.load_state_dict(self.safe_optimizer_states[regime_id])
-        self.ema_losses[regime_id] = self.safe_ema_losses[regime_id]
-        saved_step = self.safe_state_steps[regime_id]
+        # Use the oldest snapshot (deque[0]) for maximum safety margin
+        state_dict, opt_state, ema_loss, saved_step = buf[0]
+        model.load_state_dict(state_dict)
+        optimizer.load_state_dict(opt_state)
+        self.ema_losses[regime_id] = ema_loss
         steps_ago = f" from step {saved_step} ({global_step - saved_step} steps ago)" if saved_step is not None and global_step >= 0 else ""
-        print(f"[MoWM] Rolled back Model {regime_id} to safe state{steps_ago} (EMA: {self.safe_ema_losses[regime_id]:.4f}).")
+        print(f"[MoWM] Rolled back Model {regime_id} to safe state{steps_ago} (EMA: {ema_loss:.4f}).")
         return True
 
     def update_ema(self, current_loss: float, steps_added: int = 0, global_step: int = -1):
@@ -214,10 +220,7 @@ class MixtureOfWorldModels(nn.Module):
         self.spawn_steps.append(global_step)
         if hasattr(self, 'timeout_triggered'):
             self.timeout_triggered.append(False)
-        self.safe_state_dicts.append(None)
-        self.safe_optimizer_states.append(None)
-        self.safe_ema_losses.append(None)
-        self.safe_state_steps.append(None)
+        self.safe_state_buffer.append(collections.deque(maxlen=2))
         self.force_active_until = global_step + self.newborn_grace_period
 
         print(f"\n[MoWM] Spawned new World Model {new_id} at step {global_step}.")

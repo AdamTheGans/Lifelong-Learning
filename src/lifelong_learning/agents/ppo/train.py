@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.17")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.18")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -99,11 +99,13 @@ def train_ppo(
         world_model.models.append(new_model)
         
         world_model.ema_losses.append(1.0)
-        world_model.routing_emas.append(1.0)
-        world_model.ema_history.append(deque([1.0], maxlen=10))
         world_model.has_mastered.append(False)
         world_model.steps_under_threshold.append(0)
         world_model.spawn_steps.append(0)
+        world_model.safe_state_dicts.append(None)
+        world_model.safe_optimizer_states.append(None)
+        world_model.safe_ema_losses.append(None)
+        world_model.safe_state_steps.append(None)
         
         wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
 
@@ -154,21 +156,13 @@ def train_ppo(
                 world_model.ema_alpha = ckpt["mowm_state"]["ema_alpha"]
             
             if "routing_emas" in ckpt["mowm_state"]:
-                world_model.routing_emas = ckpt["mowm_state"]["routing_emas"]
-            else:
-                world_model.routing_emas = list(world_model.ema_losses)
-                
+                pass  # routing_emas removed in v0.7.17 (epoch-boundary routing)
+
             if "fast_routing_emas" in ckpt["mowm_state"]:
-                world_model.fast_routing_emas = ckpt["mowm_state"]["fast_routing_emas"]
-            else:
-                world_model.fast_routing_emas = list(world_model.routing_emas)
-            
+                pass  # fast_routing_emas removed in v0.7.17 (epoch-boundary routing)
+
             if "ema_history" in ckpt["mowm_state"]:
-                # Convert list of lists back to list of deques
-                world_model.ema_history = [deque(h, maxlen=10) for h in ckpt["mowm_state"]["ema_history"]]
-            else:
-                # Backwards compatibility
-                world_model.ema_history = [deque([ema], maxlen=10) for ema in world_model.ema_losses]
+                pass  # ema_history removed in v0.7.17 (epoch-boundary routing)
             
             if "has_mastered" in ckpt["mowm_state"]:
                 world_model.has_mastered = ckpt["mowm_state"]["has_mastered"]
@@ -235,7 +229,6 @@ def train_ppo(
 
         episodic_intrinsic_rewards = []
         episodic_intrinsic_rewards_max = []
-        spawn_occurred = False
         last_true_regime = None  # Track ground truth regime for transition logging
 
         # Diagnostics: Context-Ignorance Lazy Policy Check
@@ -277,30 +270,15 @@ def train_ppo(
             
             real_next_obs_t = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
 
-            # Infer best regime and check spawn
-            real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
+            # Oracle mode: override active regime with ground truth
             if oracle_mode:
                 true_regime = infos["regime_id"][0]
                 world_model.active_regime_id = true_regime
-            else:
-                best_id, lowest_loss, raw_losses = world_model.infer_regime(obs_t, action, real_next_obs_t, real_reward_t, global_step)
-                old_active_id = world_model.active_regime_id
-                did_spawn = world_model.check_and_spawn(raw_losses, best_id, global_step)
-                if did_spawn:
-                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
-                    # ROLLBACK: Undo corruption on the old model before shelving it
-                    world_model.rollback_safe_state(old_active_id, world_model.models[old_active_id], wm_optimizers[old_active_id], global_step=global_step)
-                    spawn_occurred = True
-                else:
-                    if best_id != world_model.active_regime_id:
-                        # ROLLBACK: Undo corruption on the outgoing model before switching away
-                        old_id = world_model.active_regime_id
-                        world_model.rollback_safe_state(old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step)
-                        print(f"\n[MoWM] Regime Switch: Model {old_id} → Model {best_id} at step {global_step}.")
-                    world_model.active_regime_id = best_id
             
             # Update the current_regime tensor for the buffer and for next step's policy
             current_regime.fill_(world_model.active_regime_id)
+
+            real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
 
             # Compute intrinsic reward (surprise signal)
             with torch.no_grad():
@@ -314,7 +292,6 @@ def train_ppo(
                 logger.scalar("debug/raw_cross_entropy_loss", state_surprise.mean().item(), global_step)
 
                 # Reward surprise: MSE between predicted and actual reward
-                real_reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
                 reward_surprise = torch.nn.functional.mse_loss(
                     pred_reward, real_reward_t, reduction='none'
                 )  # (B,)
@@ -415,7 +392,6 @@ def train_ppo(
             "buffer_rewards_max": buffer.rewards.max().item(),
             "buffer_rewards_std": buffer.rewards.std().item(),
             "buffer_rewards_abs_mean": buffer.rewards.abs().mean().item(),
-            "spawn_occurred": spawn_occurred,
             "regime_kl_divergence": kl_div,
         }
 
@@ -649,6 +625,45 @@ def train_ppo(
         # Phase B: Train World Model (trains on freshly collected buffer)
         wm_stats = update_world_model()
 
+        # Phase B.5: Epoch Boundary Routing (replaces per-step Rescue Routing)
+        spawn_occurred = False
+        if not oracle_mode:
+            # Get the active model's epoch average loss for threshold comparison
+            avg_wm_stats_pre = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
+            epoch_avg_loss = avg_wm_stats_pre.get("world_model/loss_total", 0.0)
+
+            # Evaluate all models on a representative batch from the buffer
+            eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
+            try:
+                eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ = next(eval_minibatches)
+            except StopIteration:
+                eval_obs = None
+
+            if eval_obs is not None:
+                eval_losses = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                transition_action, target_id = world_model.check_epoch_transition(
+                    epoch_avg_loss, eval_losses, global_step
+                )
+
+                if transition_action == "switch":
+                    old_id = world_model.active_regime_id
+                    world_model.rollback_safe_state(
+                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                    )
+                    print(f"[MoWM] Regime Switch: Model {old_id} \u2192 Model {target_id} at step {global_step}.")
+                    world_model.active_regime_id = target_id
+                    current_regime.fill_(target_id)
+
+                elif transition_action == "spawn":
+                    old_id = world_model.active_regime_id
+                    new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
+                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                    world_model.rollback_safe_state(
+                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                    )
+                    current_regime.fill_(new_id)
+                    spawn_occurred = True
+
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
         if cfg.mode == "dyna" and imagined_horizon > 0:
@@ -681,18 +696,16 @@ def train_ppo(
         logger.scalar("mowm/active_regime_id", world_model.active_regime_id, global_step)
         logger.scalar("mowm/num_regimes", len(world_model.models), global_step)
         logger.scalar("mowm/ema_loss_active", world_model.ema_losses[world_model.active_regime_id], global_step)
-        logger.scalar("mowm/routing_ema_active", world_model.routing_emas[world_model.active_regime_id], global_step)
         
         for i, ema_l in enumerate(world_model.ema_losses):
             logger.scalar(f"mowm/ema_loss_model_{i}", ema_l, global_step)
-            logger.scalar(f"mowm/routing_ema_model_{i}", world_model.routing_emas[i], global_step)
             logger.scalar(f"mowm/has_mastered_model_{i}", float(world_model.has_mastered[i]), global_step)
             
         avg_total_loss = avg_wm_stats.get("world_model/loss_total", 0.0)
         avg_max_loss = avg_wm_stats.get("world_model/loss_max", avg_total_loss)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
         logger.scalar("mowm/epoch_avg_max_loss", avg_max_loss, global_step)
-        logger.scalar("mowm/spawn_occurred", float(collect_stats["spawn_occurred"]), global_step)
+        logger.scalar("mowm/spawn_occurred", float(spawn_occurred), global_step)
 
         if dream_buffers:
             avg_dream_val = np.mean([db.values.mean().item() for db in dream_buffers])
@@ -740,8 +753,7 @@ def train_ppo(
                     "wm_optimizers_state_dict": wm_opts_state,
                     "mowm_state": {
                         "active_regime_id": world_model.active_regime_id,
-                        "routing_emas": world_model.routing_emas,
-                        "fast_routing_emas": world_model.fast_routing_emas,
+                        "ema_losses": world_model.ema_losses,
                         "ema_alpha": world_model.ema_alpha,
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,

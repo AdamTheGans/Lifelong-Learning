@@ -3,93 +3,82 @@ import pytest
 from lifelong_learning.agents.ppo.mowm import MixtureOfWorldModels
 
 
-def test_mowm_spawning_logic():
-    # 1. Initialize the Brain
+def test_mowm_epoch_boundary_spawning():
+    """Verify that check_epoch_transition triggers a spawn when the active model is surprised
+    and no veteran can rescue."""
     mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=3)
     assert len(mowm.models) == 1
     assert mowm.active_regime_id == 0
 
-    # Fast forward past global grace period so we can test spawns
+    # Fast forward past global grace period
     global_step = mowm.global_grace_period + 1
 
-    # 2. Simulate standard learning (EMA drops to ~0.1)
+    # Simulate standard learning (EMA drops to ~0.1)
     for _ in range(1000):
         mowm.update_ema(0.1, steps_added=10)
     
-    # After 1000 steps with alpha=0.05, EMA should be very close to 0.1
     assert abs(mowm.ema_losses[0] - 0.1) < 1e-4
     assert len(mowm.models) == 1
     
-    # 3. Test a normal fluctuation (e.g. loss jumping to 0.3)
-    # Threshold is 0.35 (EMA 0.1 * 3.5). 0.3 < 0.35 (Should NOT spawn)
-    # Must fill the surprise window to trigger a check
-    for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(raw_losses=[0.3], best_regime_id=0, global_step=global_step)
-        global_step += 1
-    
-    assert not did_spawn
+    # Normal fluctuation: epoch loss 0.3, threshold = 0.1 * 3.5 = 0.35
+    # 0.3 < 0.35 → should stay
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=0.3, eval_losses=[0.3], global_step=global_step
+    )
+    assert action == "stay"
     assert len(mowm.models) == 1
 
-    # 4. Simulate a sudden Regime Switch (Loss spikes to 3.0)
-    # 3.0 > 0.5 (Should spawn!)
-    
-    # We must clear the queue manually because the previous test filled it with 0.4s.
-    mowm.surprise_window.clear()
-    
-    for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(raw_losses=[3.0], best_regime_id=0, global_step=global_step) 
-        global_step += 1
-    
-    assert did_spawn
+    # Regime switch: epoch loss 3.0 >> threshold 0.35 → should spawn
+    # eval_losses shows only one model, and it's bad → no veteran to rescue
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=3.0, eval_losses=[3.0], global_step=global_step
+    )
+    assert action == "spawn"
+
+    # Execute the spawn
+    new_id = mowm.spawn_new_model(global_step, seed_ema=3.0)
+    assert new_id == 1
     assert mowm.active_regime_id == 1
     assert len(mowm.models) == 2
-    
-    # Ensure EMA resets correctly on spawn to the active model's smoothed loss
     assert mowm.ema_losses[1] == 3.0
-    
-    # Ensure newborn grace period is activated
     assert mowm.force_active_until >= global_step + mowm.newborn_grace_period - 1
 
 
-def test_mowm_rescue_routing_logic():
+def test_mowm_epoch_boundary_veteran_rescue():
+    """Verify that check_epoch_transition returns 'switch' when a veteran can handle it,
+    and 'spawn' when no veteran is viable."""
     from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
     mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=3)
-    # Initialize second model correctly
+    # Add a second model
     mowm.models.append(SimpleWorldModel((21, 8, 8), 4, 32))
     
-    # Configure so Model 1 is active, Model 0 is inactive veteran
     mowm.active_regime_id = 1
     mowm.ema_losses.append(0.1)
-    mowm.routing_emas.append(0.1)
-    mowm.fast_routing_emas.append(0.1)
     mowm.has_mastered.append(True)
     mowm.steps_under_threshold.append(mowm.mastery_buffer_steps)
     mowm.spawn_steps.append(1000)
     if hasattr(mowm, 'timeout_triggered'):
         mowm.timeout_triggered.append(False)
+    mowm.safe_state_dicts.append(None)
+    mowm.safe_optimizer_states.append(None)
+    mowm.safe_ema_losses.append(None)
+    mowm.safe_state_steps.append(None)
     mowm.force_active_until = 0
 
     global_step = mowm.global_grace_period + mowm.newborn_grace_period + 1
 
-    # Simulate active model failing (loss = 2.0), while Model 0 is perfect (loss = 0.1)
-    # This should NOT trigger a spawn because Model 0 rescues it.
-    for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(raw_losses=[0.1, 2.0], best_regime_id=1, global_step=global_step)
-        global_step += 1
-    
-    assert not did_spawn
-    assert len(mowm.models) == 2
+    # Active model (1) is surprised, but Model 0 has low loss → switch
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[0.1, 2.0], global_step=global_step
+    )
+    assert action == "switch"
+    assert target == 0
 
-    mowm.surprise_window.clear()
-    
-    # Simulate active model failing (loss = 2.0), and Model 0 is also terrible (loss = 0.8)
-    # Both > 0.3. This SHOULD spawn Model 2.
-    for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(raw_losses=[0.8, 2.0], best_regime_id=1, global_step=global_step)
-        global_step += 1
-
-    assert did_spawn
-    assert len(mowm.models) == 3
+    # Active model (1) is surprised, and Model 0 is also terrible → spawn
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[0.8, 2.0], global_step=global_step
+    )
+    assert action == "spawn"
 
 
 def test_safe_state_rollback():
@@ -157,27 +146,16 @@ def test_spawn_appends_none_safe_state():
     """Verify that spawning a new model initializes its safe state slots to None."""
     mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=3)
 
-    # Fast forward past global grace period
-    global_step = mowm.global_grace_period + 1
+    # Spawn via the new spawn_new_model method
+    new_id = mowm.spawn_new_model(global_step=50000, seed_ema=1.5)
 
-    # Drive EMA to a low stable value
-    for _ in range(1000):
-        mowm.update_ema(0.1, steps_added=10)
-
-    # Fill surprise window with high losses to trigger spawn
-    mowm.surprise_window.clear()
-    for _ in range(mowm.surprise_window_size):
-        did_spawn = mowm.check_and_spawn(raw_losses=[3.0], best_regime_id=0, global_step=global_step)
-        global_step += 1
-
-    assert did_spawn
+    assert new_id == 1
     assert len(mowm.models) == 2
-
-    # Verify safe state lists grew but the new model's slots are None
     assert len(mowm.safe_state_dicts) == 2
     assert len(mowm.safe_optimizer_states) == 2
     assert len(mowm.safe_ema_losses) == 2
+    assert len(mowm.safe_state_steps) == 2
     assert mowm.safe_state_dicts[1] is None
     assert mowm.safe_optimizer_states[1] is None
     assert mowm.safe_ema_losses[1] is None
-
+    assert mowm.safe_state_steps[1] is None

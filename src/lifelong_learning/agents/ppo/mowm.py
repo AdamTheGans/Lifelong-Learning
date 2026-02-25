@@ -30,8 +30,6 @@ class MixtureOfWorldModels(nn.Module):
         self.ema_losses = [1.0]
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
-        self.routing_emas = [1.0]
-        self.fast_routing_emas = [1.0]
         self.spawn_steps = [0]
         self.timeout_triggered = [False]
 
@@ -40,14 +38,10 @@ class MixtureOfWorldModels(nn.Module):
         self.anomaly_floor = 0.05  # Absolute minimum for the EMA used in dynamic threshold calculation
         self.anomaly_multiplier = 3.5  # Multiplier for the dynamic threshold
         
-        # MoWM Routing Fixes
+        # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
-        self.surprise_window_size = 100      # Smooth surprise across 100 transitions
-        self.routing_hysteresis = 0.85       # Hysteresis stickiness multiplier (challenger < active * 0.85)
-        self.ema_epsilon = 1e-5              # Denominator safety avoids div by zero
-        self.max_ema_growth = 0.10           # Trend-Aware Spawning: Max relative growth
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
         self.mastery_buffer_steps = 5000     # Mastery Prerequisite: Continuous steps required below threshold
         self.max_lockin_steps = 250000       # Maximum steps to keep the mastery shield up
@@ -60,7 +54,6 @@ class MixtureOfWorldModels(nn.Module):
 
         # State tracking
         self.force_active_until = 0
-        self.surprise_window = collections.deque(maxlen=self.surprise_window_size)
 
     def refresh_safe_state(self, regime_id: int, model: nn.Module, optimizer, global_step: int = 0):
         """
@@ -125,185 +118,110 @@ class MixtureOfWorldModels(nn.Module):
         else:
             self.steps_under_threshold[idx] = 0
 
-    def infer_regime(
-        self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor, global_step: int
-    ) -> tuple[int, float, list[float]]:
+    def evaluate_all_models(
+        self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor
+    ) -> list[float]:
         """
-        Evaluates a transition across all models and returns the ID of the best fitting regime,
-        its corresponding lowest loss, and a list of all raw losses for the collective ignorance check.
-        Handles newborn stickiness and mastery lock-in to force training.
+        Evaluate all world models on a batch and return per-model raw losses.
+        Used at epoch boundaries to determine which model best fits the current data.
         """
-        # Convert next_state (B, C, H, W) float to class indices (B, H, W) for CE Loss
-        # Assuming next_state is one-hot or normalized probabilities
         next_state_indices = torch.argmax(next_state, dim=1)
 
         raw_losses = []
         for i, model in enumerate(self.models):
             with torch.no_grad():
                 next_obs_pred, pred_reward = model(state, action)
-                
-                # Compute unreduced losses to find the extreme anomaly in the batch
                 state_loss = F.cross_entropy(next_obs_pred, next_state_indices, reduction='none')
                 state_loss_per_batch = state_loss.mean(dim=[1, 2])
-                
                 reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
-                
-                # Mean surprise across all environments in this specific transition batch
-                loss_batch = state_loss_per_batch + reward_loss
-                loss = loss_batch.mean().item() 
+                loss = (state_loss_per_batch + reward_loss).mean().item()
                 raw_losses.append(loss)
-                
-            # Update routing EMAs unconditionally for all regimes to maintain a parallel inference track
-            self.routing_emas[i] = (self.ema_alpha * loss) + ((1 - self.ema_alpha) * self.routing_emas[i])
-            self.fast_routing_emas[i] = (0.2 * loss) + (0.8 * self.fast_routing_emas[i])
 
-        # Newborn stickiness bypass: if in grace period, stick with active model
-        # Mastery lock-in bypass: if the active regime has not mastered the environment, it cannot be unseated by veterans.
+        return raw_losses
+
+    def check_epoch_transition(
+        self, epoch_avg_loss: float, eval_losses: list[float], global_step: int
+    ) -> tuple[str, int]:
+        """
+        Epoch-boundary routing decision. Replaces the old per-step Rescue Routing.
+
+        Compares the active model's epoch average loss against the EMA-based dynamic
+        threshold. If surprised, finds the best alternative model or signals a spawn.
+
+        Returns:
+            (action, target_id) where action is "stay", "switch", or "spawn".
+            target_id is the model to switch to (for "switch"), -1 otherwise.
+        """
+        # Grace period guards
+        if global_step < self.global_grace_period or global_step < self.force_active_until:
+            return ("stay", self.active_regime_id)
+
+        # Mastery lock-in: don't route away from a non-mastered model (unless timeout)
         elapsed_steps = global_step - self.spawn_steps[self.active_regime_id]
-        
-        # Timeout warning (ensuring backwards compatibility of attribute)
+
         if not hasattr(self, 'timeout_triggered'):
             self.timeout_triggered = [False] * len(self.models)
-        
+
         if not self.has_mastered[self.active_regime_id] and elapsed_steps >= self.max_lockin_steps:
             if not self.timeout_triggered[self.active_regime_id]:
                 self.timeout_triggered[self.active_regime_id] = True
                 print(f"\n[MoWM] World Model {self.active_regime_id} Mastery Shield TIMEOUT at {global_step} steps! Shield forced down.")
 
-        is_locked_in = (global_step < self.force_active_until) or (not self.has_mastered[self.active_regime_id] and elapsed_steps < self.max_lockin_steps)
-
+        is_locked_in = (
+            not self.has_mastered[self.active_regime_id]
+            and elapsed_steps < self.max_lockin_steps
+        )
         if is_locked_in:
-            best_regime_id = self.active_regime_id
-            best_raw_loss = raw_losses[self.active_regime_id]
-        else:
-            best_regime_id = self.active_regime_id
-            best_raw_loss = raw_losses[self.active_regime_id]
-            
-            dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
-            catastrophic_ceiling = dynamic_threshold
-            
-            active_fast_loss = self.fast_routing_emas[self.active_regime_id]
-            
-            # Argmin Routing Reminder: Rapid Catastrophic Takeover
-            if active_fast_loss > catastrophic_ceiling:
-                # Use raw_losses to evaluate other models to completely avoid EMA lag
-                best_candidate = min(range(len(self.models)), key=lambda i: raw_losses[i])
-                if best_candidate != self.active_regime_id:
-                    if raw_losses[best_candidate] < self.absolute_spawn_threshold:
-                        best_regime_id = best_candidate
-                        best_raw_loss = raw_losses[best_candidate]
-                        print(f"\n[MoWM] Rescue Routing Switch! Active model {self.active_regime_id} failing ({active_fast_loss:.2f} > {catastrophic_ceiling:.2f}). "
-                              f"Rescued by Model {best_candidate} (Raw Loss: {raw_losses[best_candidate]:.2f})")
-            else:
-                # Standard Hysteresis Routing: Smooth Trend Takeover
-                lowest_routing_ema = self.routing_emas[self.active_regime_id]
-                for i in range(len(self.models)):
-                    if i != self.active_regime_id:
-                        if self.routing_emas[i] < (self.routing_emas[self.active_regime_id] * self.routing_hysteresis):
-                            if self.routing_emas[i] < lowest_routing_ema:
-                                lowest_routing_ema = self.routing_emas[i]
-                                best_regime_id = i
-                                best_raw_loss = raw_losses[i]
+            return ("stay", self.active_regime_id)
 
-        if best_regime_id != self.active_regime_id:
-            # History Flush: Reset the moving averages of the newly rescued veteran 
-            # to prevent a "ping-pong death spiral" caused by trailing high-loss garbage.
-            self.routing_emas[best_regime_id] = best_raw_loss
-            self.fast_routing_emas[best_regime_id] = best_raw_loss
-                
-        return best_regime_id, best_raw_loss, raw_losses
-
-    def check_and_spawn(self, raw_losses: list[float], best_regime_id: int, global_step: int) -> bool:
-        """
-        Checks if the entire collective of models represents a high surprise.
-        Only spawns a new model if EVERY existing model exceeds the dynamic EMA surprise threshold.
-        Includes safeguards for global grace period, newborn grace period, and sequence smoothing.
-        """
-        # Global Step 0 Grace Guard & Newborn Stickiness Guard
-        if global_step < self.global_grace_period or global_step < self.force_active_until:
-            self.surprise_window.clear()
-            return False
-            
-        # Collective Surprise Smoothing
-        self.surprise_window.append(raw_losses)
-        
-        # Wait until window is full before making spawn decisions
-        if len(self.surprise_window) < self.surprise_window_size:
-            return False
-            
-        # Routing Transition Guard
-        # If the router officially decides to switch to a veteran model (hysteresis broken),
-        # block spawning and clear the window so old regime losses don't pollute the new evaluation.
-        if best_regime_id != self.active_regime_id:
-            self.surprise_window.clear()
-            return False
-            
-        # Calculate smoothed loss for EVERY model
-        smoothed_losses = [sum(losses[i] for losses in self.surprise_window) / len(self.surprise_window) for i in range(len(self.models))]
-
-
-        # Collective Ignorance Check
+        # Is the active model surprised?
         dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
-        active_metric = smoothed_losses[self.active_regime_id]
-        
-        # 1. Is the active model surprised?
-        if active_metric <= dynamic_threshold:
-            return False
-            
-        # 2. Active model is surprised. Are there any BETTER models available right now?
-        # Crucial: Evaluate veterans using instantaneous batch losses (raw_losses) to avoid lag!
-        best_model_id = min(range(len(self.models)), key=lambda i: raw_losses[i])
-        
-        if best_model_id == self.active_regime_id:
-            # The active model is the best we got, and it's surprised. MUST SPAWN.
-            all_surprised = True
-        else:
-            # A veteran model is better! Are they actually good though on this exact batch?
-            if raw_losses[best_model_id] < self.absolute_spawn_threshold:
-                # Veteran can rescue us, block spawn. (Router will switch)
-                all_surprised = False
-            else:
-                # Veteran is better, but still terrible.
-                all_surprised = True
-        
-        if all_surprised:
-            if len(self.models) >= self.max_regimes:
-                print(f"\n[MoWM] Hard Cap Reached! Cannot spawn Model {len(self.models)}. Forced to salvage existing regimes.")
-                return False
-                
-            # Instantiate a new world model
-            new_model = SimpleWorldModel(self.obs_shape, self.n_actions, self.hidden_dim)
-            
-            # CRITICAL: Prevent PyTorch Device Trap by placing the new model on the same device
-            device = next(self.models[0].parameters()).device
-            new_model = new_model.to(device)
-            
-            # Append it to the mixture of experts
-            self.models.append(new_model)
-            
-            # Use the active model's smoothed loss as the seed for the new baseline
-            new_baseline = smoothed_losses[self.active_regime_id]
+        if epoch_avg_loss <= dynamic_threshold:
+            return ("stay", self.active_regime_id)
 
-            # Update internal tracking variables
-            self.active_regime_id = len(self.models) - 1
-            self.ema_losses.append(new_baseline)  # Set EMA for the new regime baseline
-            self.routing_emas.append(new_baseline) # Seed routing EMA
-            self.fast_routing_emas.append(new_baseline) # Seed fast routing EMA
-            self.has_mastered.append(False)
-            self.steps_under_threshold.append(0)
-            self.spawn_steps.append(global_step)
-            if hasattr(self, 'timeout_triggered'):
-                self.timeout_triggered.append(False)
-            # Newborn models have no safe state yet
-            self.safe_state_dicts.append(None)
-            self.safe_optimizer_states.append(None)
-            self.safe_ema_losses.append(None)
-            self.safe_state_steps.append(None)
-            self.force_active_until = global_step + self.newborn_grace_period
-            self.surprise_window.clear()
-            
-            return True
-        return False
+        print(f"\n[MoWM] Surprise detected! Model {self.active_regime_id} epoch loss ({epoch_avg_loss:.4f}) > threshold ({dynamic_threshold:.4f}).")
+
+        # Active model is surprised. Find the best alternative.
+        best_candidate = min(range(len(self.models)), key=lambda i: eval_losses[i])
+
+        if best_candidate != self.active_regime_id and eval_losses[best_candidate] < self.absolute_spawn_threshold:
+            # A veteran can handle the current regime
+            return ("switch", best_candidate)
+
+        # No good veteran — try to spawn
+        if len(self.models) >= self.max_regimes:
+            print(f"[MoWM] Hard Cap Reached! Cannot spawn Model {len(self.models)}.")
+            return ("stay", self.active_regime_id)
+
+        return ("spawn", -1)
+
+    def spawn_new_model(self, global_step: int, seed_ema: float) -> int:
+        """
+        Instantiate a new world model and set it as active.
+
+        Returns the new model's regime ID.
+        """
+        new_model = SimpleWorldModel(self.obs_shape, self.n_actions, self.hidden_dim)
+        device = next(self.models[0].parameters()).device
+        new_model = new_model.to(device)
+        self.models.append(new_model)
+
+        new_id = len(self.models) - 1
+        self.active_regime_id = new_id
+        self.ema_losses.append(seed_ema)
+        self.has_mastered.append(False)
+        self.steps_under_threshold.append(0)
+        self.spawn_steps.append(global_step)
+        if hasattr(self, 'timeout_triggered'):
+            self.timeout_triggered.append(False)
+        self.safe_state_dicts.append(None)
+        self.safe_optimizer_states.append(None)
+        self.safe_ema_losses.append(None)
+        self.safe_state_steps.append(None)
+        self.force_active_until = global_step + self.newborn_grace_period
+
+        print(f"\n[MoWM] Spawned new World Model {new_id} at step {global_step}.")
+        return new_id
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, regime_id: int):
         """

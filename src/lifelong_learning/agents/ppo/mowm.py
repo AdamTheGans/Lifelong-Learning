@@ -38,6 +38,7 @@ class MixtureOfWorldModels(nn.Module):
         self.anomaly_multiplier = 3.5  # Multiplier for the dynamic threshold
         
         # MoWM Routing Fixes
+        self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.surprise_window_size = 100      # Smooth surprise across 100 transitions
@@ -133,11 +134,12 @@ class MixtureOfWorldModels(nn.Module):
             # Argmin Routing Reminder: Rapid Catastrophic Takeover
             if active_fast_loss > catastrophic_ceiling:
                 best_candidate = min(range(len(self.models)), key=lambda i: self.fast_routing_emas[i])
-                if self.fast_routing_emas[best_candidate] <= catastrophic_ceiling:
-                    best_regime_id = best_candidate
-                    best_raw_loss = raw_losses[best_candidate]
-                    print(f"\n[MoWM] Emergency Routing Switch! Active model {self.active_regime_id} failing ({active_fast_loss:.2f} > {catastrophic_ceiling:.2f}). "
-                          f"Routing to Model {best_candidate} ({self.fast_routing_emas[best_candidate]:.2f})")
+                if best_candidate != self.active_regime_id:
+                    if self.fast_routing_emas[best_candidate] < self.absolute_spawn_threshold:
+                        best_regime_id = best_candidate
+                        best_raw_loss = raw_losses[best_candidate]
+                        print(f"\n[MoWM] Rescue Routing Switch! Active model {self.active_regime_id} failing ({active_fast_loss:.2f} > {catastrophic_ceiling:.2f}). "
+                              f"Rescued by Model {best_candidate} ({self.fast_routing_emas[best_candidate]:.2f})")
             else:
                 # Standard Hysteresis Routing: Smooth Trend Takeover
                 lowest_routing_ema = self.routing_emas[self.active_regime_id]
@@ -181,19 +183,27 @@ class MixtureOfWorldModels(nn.Module):
 
 
         # Collective Ignorance Check
-        # Are there any models in the collective that are NOT surprised?
-        all_surprised = True
-        
         dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
+        active_metric = smoothed_losses[self.active_regime_id]
         
-        for i in range(len(self.models)):
-            # Active model: sluggish 100-step SMA prevents false spawns from micro-fluctuations.
-            # Inactive models: extremely responsive fast EMA rapidly blocks false spawns when a veteran wakes up.
-            metric = smoothed_losses[i] if i == self.active_regime_id else self.fast_routing_emas[i]
+        # 1. Is the active model surprised?
+        if active_metric <= dynamic_threshold:
+            return False
             
-            if metric <= dynamic_threshold:
+        # 2. Active model is surprised. Are there any BETTER models available?
+        best_model_id = min(range(len(self.models)), key=lambda i: smoothed_losses[i])
+        
+        if best_model_id == self.active_regime_id:
+            # The active model is the best we got, and it's surprised. MUST SPAWN.
+            all_surprised = True
+        else:
+            # A veteran model is better! Are they actually good though?
+            if smoothed_losses[best_model_id] < self.absolute_spawn_threshold:
+                # Veteran can rescue us, block spawn. (Router will switch)
                 all_surprised = False
-                break
+            else:
+                # Veteran is better, but still terrible.
+                all_surprised = True
         
         if all_surprised:
             # Instantiate a new world model

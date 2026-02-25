@@ -34,7 +34,6 @@ def main():
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model learning rate")
     p.add_argument("--surprise_threshold", type=float, default=0.1, help="Reward-loss threshold to spawn a new head")
     p.add_argument("--max_heads", type=int, default=4, help="Max number of WM heads")
-    p.add_argument("--ewc_coef", type=float, default=1000.0, help="EWC penalty coefficient (0 to disable)")
 
     args = p.parse_args()
 
@@ -72,7 +71,6 @@ def main():
         wm_lr=args.wm_lr,
         surprise_threshold=args.surprise_threshold,
         max_heads=args.max_heads,
-        ewc_coef=args.ewc_coef,
     )
 
 

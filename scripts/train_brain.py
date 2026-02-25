@@ -40,6 +40,8 @@ def train_brain(args):
     # -----------------------------------------------------------------
     # Meta-environment
     # -----------------------------------------------------------------
+    logger = TBLogger(run_name=args.run_name or "brain_training")
+
     meta_env = MetaEnv(
         env_id=args.env_id,
         inner_cfg=inner_cfg,
@@ -52,6 +54,7 @@ def train_brain(args):
         intrinsic_coef=args.inner_intrinsic_coef,
         imagined_horizon=args.inner_imagined_horizon,
         wm_lr=args.inner_wm_lr,
+        inner_log_dir=logger.full_dir,
     )
 
     # -----------------------------------------------------------------
@@ -66,7 +69,7 @@ def train_brain(args):
     brain_model = MLPActorCritic().to(device)
     brain_optimizer = torch.optim.Adam(brain_model.parameters(), lr=brain_cfg.lr, eps=1e-5)
 
-    logger = TBLogger(run_name=args.run_name or "brain_training")
+    # logger already created above, before MetaEnv
 
     # -----------------------------------------------------------------
     # Training loop: each episode = one full inner training run

@@ -52,6 +52,7 @@ class MetaEnv(gym.Env):
         intrinsic_reward_clip: float = 0.1,
         imagined_horizon: int = 10,
         wm_lr: float = 1e-4,
+        inner_log_dir: str | None = None,
     ):
         super().__init__()
 
@@ -70,6 +71,7 @@ class MetaEnv(gym.Env):
         self.intrinsic_reward_clip = intrinsic_reward_clip
         self.imagined_horizon_init = imagined_horizon
         self.wm_lr = wm_lr
+        self.inner_log_dir = inner_log_dir
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -90,6 +92,7 @@ class MetaEnv(gym.Env):
         self._signal_extractor: SignalExtractor | None = None
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
+        self._prev_failure_rate = 0.0
         self._episode_counter = 0
 
     def reset(self, *, seed=None, options=None):
@@ -102,7 +105,7 @@ class MetaEnv(gym.Env):
         self._episode_counter += 1
         run_name = self.inner_run_name or f"brain_inner_ep{self._episode_counter}"
 
-        self._state = init_inner_training(
+        init_kwargs = dict(
             env_id=self.env_id,
             cfg=self.inner_cfg,
             steps_per_regime=self.steps_per_regime,
@@ -116,10 +119,14 @@ class MetaEnv(gym.Env):
             imagined_horizon=self.imagined_horizon_init,
             wm_lr=self.wm_lr,
         )
+        if self.inner_log_dir is not None:
+            init_kwargs["log_dir"] = self.inner_log_dir
+        self._state = init_inner_training(**init_kwargs)
 
         self._signal_extractor = SignalExtractor()
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
+        self._prev_failure_rate = 0.0
 
         # Run initial updates to get a meaningful first observation
         stats = self._run_n_updates(self.decision_interval)
@@ -147,11 +154,13 @@ class MetaEnv(gym.Env):
 
         delta_success = success_rate - self._prev_success_rate
         delta_return = mean_return - self._prev_mean_return
+        delta_failure = failure_rate - self._prev_failure_rate
 
-        reward = delta_success + self.reward_alpha * delta_return - self.reward_beta * failure_rate
+        reward = delta_success + self.reward_alpha * delta_return - self.reward_beta * delta_failure
 
         self._prev_success_rate = success_rate
         self._prev_mean_return = mean_return
+        self._prev_failure_rate = failure_rate
 
         terminated = stats.get("done", False)
         truncated = False

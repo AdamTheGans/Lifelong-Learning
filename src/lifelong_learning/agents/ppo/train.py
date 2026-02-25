@@ -100,6 +100,7 @@ def init_inner_training(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
+    log_dir: str = "runs",
 ) -> InnerTrainState:
     """
     Initialize all components of the Dyna-PPO inner training loop.
@@ -180,7 +181,7 @@ def init_inner_training(
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
 
-    logger = TBLogger(run_name=run_name)
+    logger = TBLogger(run_name=run_name, log_dir=log_dir)
     os.makedirs(save_dir, exist_ok=True)
 
     obs, info = envs.reset(seed=cfg.seed)

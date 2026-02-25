@@ -13,6 +13,7 @@ class TBLogger:
         ts = time.strftime("%Y%m%d-%H%M%S")
         full_dir = os.path.join(self.log_dir, f"{self.run_name}_{ts}")
         self.writer = SummaryWriter(full_dir)
+        self.full_dir = full_dir
 
     def scalar(self, tag: str, value: float, step: int) -> None:
         assert self.writer is not None

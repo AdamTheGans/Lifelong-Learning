@@ -43,7 +43,6 @@ def train_ppo(
     wm_lr: float = 1e-4,
     surprise_threshold: float = 0.1,
     max_heads: int = 4,
-    encoder_lr_ratio: float = 0.1,
 ):
     """
     Main Dyna-PPO training loop.
@@ -82,12 +81,12 @@ def train_ppo(
     # Model & Optimizer Setup
     # -------------------------------------------------------------------------
 
-    model = CNNActorCritic(obs_shape, n_actions).to(device)
-    # Separate LRs: encoder trains slowly, heads train normally
-    optimizer = torch.optim.Adam(
-        model.get_param_groups(head_lr=cfg.lr, encoder_lr=cfg.lr * encoder_lr_ratio),
-        eps=1e-5
-    )
+    # Per-regime separate networks (regime 0 starts active)
+    models = [CNNActorCritic(obs_shape, n_actions).to(device)]
+    optimizers = [torch.optim.Adam(models[0].parameters(), lr=cfg.lr, eps=1e-5)]
+    active_model_idx = 0
+    model = models[0]       # closure variable for helper functions
+    optimizer = optimizers[0]
 
     world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
     wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
@@ -101,10 +100,10 @@ def train_ppo(
     if resume_path is not None and os.path.exists(resume_path):
         print(f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        models[0].load_state_dict(ckpt["model_state_dict"])
 
         if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            optimizers[0].load_state_dict(ckpt["optimizer_state_dict"])
             print("Optimizer state loaded.")
         else:
             print("WARNING: Optimizer state not found in checkpoint.")
@@ -370,16 +369,16 @@ def train_ppo(
     last_spawn_update = -999
     running_reward_loss = 0.0  # tracks baseline reward loss for relative threshold
 
-    # Multi-head policy: track regime for actor head switching
+    # Track regime for network switching
     prev_regime_id = -1
 
     for update in range(start_update, num_updates + 1):
         if anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * cfg.lr
-            # Scale both param groups proportionally
-            optimizer.param_groups[0]["lr"] = frac * cfg.lr * encoder_lr_ratio  # encoder
-            optimizer.param_groups[1]["lr"] = lrnow  # heads
+            for opt in optimizers:
+                for pg in opt.param_groups:
+                    pg["lr"] = lrnow
         else:
             lrnow = cfg.lr
 
@@ -428,30 +427,31 @@ def train_ppo(
                 print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold}, update={update})")
             world_model.active_head = best_head
 
-        # Multi-head policy: switch actor head on regime change
+        # Switch active network on regime change
         if steps_per_regime and steps_per_regime > 0:
             current_regime_id = (global_step // steps_per_regime) % 2
         else:
             current_regime_id = 0
         if current_regime_id != prev_regime_id and prev_regime_id >= 0:
-            # Spawn a new policy head if needed (head index = regime_id)
-            while current_regime_id >= len(model.actor_heads):
-                new_idx = model.spawn_policy_head()
-                # Refresh optimizer to include new head parameters
-                optimizer = torch.optim.Adam(
-                    model.get_param_groups(head_lr=lrnow, encoder_lr=lrnow * encoder_lr_ratio),
-                    eps=1e-5
-                )
-                print(f"[policy] Spawned policy head {new_idx}")
-            model.active_policy_head = current_regime_id
-            print(f"[policy] Regime switch → regime {current_regime_id}, policy head {current_regime_id}")
+            # Spawn a new network if this regime hasn't been seen before
+            while current_regime_id >= len(models):
+                new_model = CNNActorCritic(obs_shape, n_actions).to(device)
+                new_opt = torch.optim.Adam(new_model.parameters(), lr=lrnow, eps=1e-5)
+                models.append(new_model)
+                optimizers.append(new_opt)
+                print(f"[policy] Spawned separate network {len(models)-1}")
+            # Swap the active model & optimizer (closure vars update for helpers)
+            active_model_idx = current_regime_id
+            model = models[active_model_idx]
+            optimizer = optimizers[active_model_idx]
+            print(f"[policy] Regime switch → regime {current_regime_id}, using network {active_model_idx}")
         prev_regime_id = current_regime_id
 
         logger.scalar("world_model/active_head", world_model.active_head, global_step)
         logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)
         logger.scalar("world_model/best_head_loss", best_loss, global_step)
-        logger.scalar("policy/active_head", model.active_policy_head, global_step)
-        logger.scalar("policy/num_heads", len(model.actor_heads), global_step)
+        logger.scalar("policy/active_network", active_model_idx, global_step)
+        logger.scalar("policy/num_networks", len(models), global_step)
 
         # Phase B: Update policy on real data
         update_stats = update_policy(buffer, cfg.update_epochs)
@@ -487,22 +487,25 @@ def train_ppo(
             dream_buffer, _ = generate_dream_experience()
             dream_stats = update_policy(dream_buffer, epochs=1)
 
-            # Cross-regime dreaming: dream on all OTHER heads too
-            # Also switch policy head so each regime's dreams train the right actor
+            # Cross-regime dreaming: dream on all OTHER WM heads
+            # Temporarily swap to each regime's own network
             saved_wm_head = world_model.active_head
-            saved_policy_head = model.active_policy_head
+            saved_model = model
+            saved_optimizer = optimizer
             for head_idx in range(len(world_model.state_heads)):
                 if head_idx == saved_wm_head:
                     continue
                 world_model.active_head = head_idx
-                # Use matching policy head if it exists
-                policy_idx = head_idx % len(model.actor_heads)
-                model.active_policy_head = policy_idx
+                # Use matching network if it exists
+                net_idx = head_idx % len(models)
+                model = models[net_idx]
+                optimizer = optimizers[net_idx]
                 cross_dream_buffer, _ = generate_dream_experience()
                 cross_stats = update_policy(cross_dream_buffer, epochs=1)
                 dream_stats.extend(cross_stats)
-            world_model.active_head = saved_wm_head  # restore
-            model.active_policy_head = saved_policy_head
+            world_model.active_head = saved_wm_head
+            model = saved_model
+            optimizer = saved_optimizer
 
         # -----------------------------------------------------------------
         # Logging
@@ -555,8 +558,9 @@ def train_ppo(
             ckpt_path = os.path.join(save_dir, f"{run_name}_update{update}.pt")
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
+                    "models_state_dicts": [m.state_dict() for m in models],
+                    "optimizers_state_dicts": [o.state_dict() for o in optimizers],
+                    "active_model_idx": active_model_idx,
                     "world_model_state_dict": world_model.state_dict(),
                     "wm_optimizer_state_dict": wm_optimizer.state_dict(),
                     "cfg": cfg.__dict__,

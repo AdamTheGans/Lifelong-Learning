@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.7")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.8")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -723,7 +723,6 @@ def train_ppo(
                         "routing_emas": world_model.routing_emas,
                         "fast_routing_emas": world_model.fast_routing_emas,
                         "ema_alpha": world_model.ema_alpha,
-                        "ema_history": [list(h) for h in world_model.ema_history], # Convert deques to lists for serialization
                         "has_mastered": world_model.has_mastered,
                         "steps_under_threshold": world_model.steps_under_threshold,
                         "spawn_steps": world_model.spawn_steps,

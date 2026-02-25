@@ -25,7 +25,6 @@ class MixtureOfWorldModels(nn.Module):
         # Status variables
         self.active_regime_id = 0
         self.ema_losses = [1.0]
-        self.ema_history = [collections.deque([1.0], maxlen=10)]
         self.has_mastered = [False]
         self.steps_under_threshold = [0]
         self.routing_emas = [1.0]
@@ -61,7 +60,6 @@ class MixtureOfWorldModels(nn.Module):
         """
         idx = self.active_regime_id
         self.ema_losses[idx] = (self.ema_alpha * current_loss) + ((1 - self.ema_alpha) * self.ema_losses[idx])
-        self.ema_history[idx].append(self.ema_losses[idx])
 
         if self.ema_losses[idx] < self.mastery_loss_threshold:
             self.steps_under_threshold[idx] += steps_added
@@ -181,14 +179,6 @@ class MixtureOfWorldModels(nn.Module):
         # Calculate smoothed loss for EVERY model
         smoothed_losses = [sum(losses[i] for losses in self.surprise_window) / len(self.surprise_window) for i in range(len(self.models))]
 
-        # False Spawn Guard: Policy Shift Check (Trend-Aware Spawning)
-        # If the EMA baseline is already rising rapidly, the agent is exploring and we should block spawns.
-        history = self.ema_history[best_regime_id]
-        if len(history) == history.maxlen:
-            relative_growth = (history[-1] - history[0]) / max(history[0], self.ema_epsilon)
-            if relative_growth > self.max_ema_growth:
-                self.surprise_window.clear()
-                return False
 
         # Collective Ignorance Check
         # Are there any models in the collective that are NOT surprised?
@@ -224,7 +214,6 @@ class MixtureOfWorldModels(nn.Module):
             self.ema_losses.append(new_baseline)  # Set EMA for the new regime baseline
             self.routing_emas.append(new_baseline) # Seed routing EMA
             self.fast_routing_emas.append(new_baseline) # Seed fast routing EMA
-            self.ema_history.append(collections.deque([new_baseline], maxlen=10))
             self.has_mastered.append(False)
             self.steps_under_threshold.append(0)
             self.spawn_steps.append(global_step)

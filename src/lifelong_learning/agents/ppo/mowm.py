@@ -189,15 +189,22 @@ class MixtureOfWorldModels(nn.Module):
 
         # Active model is surprised. Find the best alternative.
         best_candidate = min(range(len(self.models)), key=lambda i: eval_losses[i])
+        at_hard_cap = len(self.models) >= self.max_regimes
 
+        # Hard Cap Bypass: if we can't spawn, we MUST switch to the lesser evil
+        if at_hard_cap:
+            if best_candidate != self.active_regime_id:
+                print(f"[MoWM] Hard Cap forced switch to Model {best_candidate} "
+                      f"(eval loss: {eval_losses[best_candidate]:.4f} vs active: {eval_losses[self.active_regime_id]:.4f}).")
+                return ("switch", best_candidate)
+            else:
+                print(f"[MoWM] Hard Cap Reached and active model is still lowest loss. Staying.")
+                return ("stay", self.active_regime_id)
+
+        # Normal path: can still spawn
         if best_candidate != self.active_regime_id and eval_losses[best_candidate] < self.absolute_spawn_threshold:
-            # A veteran can handle the current regime
+            # A veteran can confidently handle the current regime
             return ("switch", best_candidate)
-
-        # No good veteran — try to spawn
-        if len(self.models) >= self.max_regimes:
-            print(f"[MoWM] Hard Cap Reached! Cannot spawn Model {len(self.models)}.")
-            return ("stay", self.active_regime_id)
 
         return ("spawn", -1)
 

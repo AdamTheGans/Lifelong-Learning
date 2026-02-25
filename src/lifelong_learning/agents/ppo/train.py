@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.19")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.20")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -629,15 +629,20 @@ def train_ppo(
             avg_wm_stats_pre = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
             epoch_avg_loss = avg_wm_stats_pre.get("world_model/loss_total", 0.0)
 
-            # Evaluate all models on a representative batch from the buffer
-            eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-            try:
-                eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ = next(eval_minibatches)
-            except StopIteration:
-                eval_obs = None
+            # Evaluate all models across the ENTIRE buffer for stable routing
+            eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=False)
+            eval_loss_accum = None
+            num_eval_batches = 0
+            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ in eval_minibatches:
+                batch_losses = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                if eval_loss_accum is None:
+                    eval_loss_accum = [0.0] * len(batch_losses)
+                for i, loss in enumerate(batch_losses):
+                    eval_loss_accum[i] += loss
+                num_eval_batches += 1
 
-            if eval_obs is not None:
-                eval_losses = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
+            if eval_loss_accum is not None and num_eval_batches > 0:
+                eval_losses = [total / num_eval_batches for total in eval_loss_accum]
                 transition_action, target_id = world_model.check_epoch_transition(
                     epoch_avg_loss, eval_losses, global_step
                 )

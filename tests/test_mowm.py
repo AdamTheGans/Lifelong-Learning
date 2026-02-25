@@ -79,6 +79,35 @@ def test_mowm_epoch_boundary_veteran_rescue():
     assert action == "spawn"
 
 
+def test_hard_cap_forces_switch_to_lesser_evil():
+    """When at max_regimes, the system must switch to the best candidate even if
+    its loss exceeds absolute_spawn_threshold — it's the lesser of two evils."""
+    from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=2)
+    mowm.models.append(SimpleWorldModel((21, 8, 8), 4, 32))
+    assert len(mowm.models) == mowm.max_regimes  # at hard cap
+
+    mowm.active_regime_id = 1
+    mowm.ema_losses.append(0.1)
+    mowm.has_mastered.append(True)
+    mowm.steps_under_threshold.append(mowm.mastery_buffer_steps)
+    mowm.spawn_steps.append(1000)
+    mowm.timeout_triggered.append(False)
+    mowm.safe_state_buffer.append(collections.deque(maxlen=2))
+    mowm.force_active_until = 0
+
+    global_step = mowm.global_grace_period + mowm.newborn_grace_period + 1
+
+    # Model 0 loss = 0.45 (above absolute_spawn_threshold of 0.3)
+    # Model 1 loss = 2.0 (active, terrible)
+    # At hard cap → MUST switch to Model 0 despite its imperfect score
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[0.45, 2.0], global_step=global_step
+    )
+    assert action == "switch"
+    assert target == 0
+
+
 def test_safe_state_rollback_uses_oldest_snapshot():
     """Verify that rollback restores the OLDEST snapshot in the rolling buffer,
     not the most recent one (which may be poisoned from the lag period)."""

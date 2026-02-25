@@ -12,11 +12,12 @@ class MixtureOfWorldModels(nn.Module):
     exceeds a dynamically tracked threshold (EMA).
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256, max_regimes: int = 2):
         super().__init__()
         self.obs_shape = obs_shape
         self.n_actions = n_actions
         self.hidden_dim = hidden_dim
+        self.max_regimes = max_regimes
 
         # Initialize with a single world model
         initial_model = SimpleWorldModel(obs_shape, n_actions, hidden_dim)
@@ -214,6 +215,10 @@ class MixtureOfWorldModels(nn.Module):
                 all_surprised = True
         
         if all_surprised:
+            if len(self.models) >= self.max_regimes:
+                print(f"\n[MoWM] Hard Cap Reached! Cannot spawn Model {len(self.models)}. Forced to salvage existing regimes.")
+                return False
+                
             # Instantiate a new world model
             new_model = SimpleWorldModel(self.obs_shape, self.n_actions, self.hidden_dim)
             

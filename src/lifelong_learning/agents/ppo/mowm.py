@@ -36,7 +36,7 @@ class MixtureOfWorldModels(nn.Module):
         # Hyperparameters
         self.ema_alpha = 0.05
         self.anomaly_floor = 0.05  # Absolute minimum for the EMA used in dynamic threshold calculation
-        self.anomaly_multiplier = 5.0  # Multiplier for the dynamic threshold
+        self.anomaly_multiplier = 3.5  # Multiplier for the dynamic threshold
         
         # MoWM Routing Fixes
         self.global_grace_period = 20000     # No spawns before this step

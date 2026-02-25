@@ -33,10 +33,10 @@ class TestDynaLogic(unittest.TestCase):
         obs = torch.randn(B, *self.obs_shape)
         action = torch.randint(0, self.n_actions, (B,))
 
-        next_obs, reward = self.wm(obs, action)
+        next_obs, reward_logits = self.wm(obs, action)
 
         self.assertEqual(next_obs.shape, (B, *self.obs_shape))
-        self.assertEqual(reward.shape, (B,))
+        self.assertEqual(reward_logits.shape, (B, 3))
 
     def test_discretize_state(self):
         """Verify discretize_state produces valid one-hot encoding."""

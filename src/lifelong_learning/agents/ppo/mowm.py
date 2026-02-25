@@ -94,7 +94,10 @@ class MixtureOfWorldModels(nn.Module):
                 state_loss = F.cross_entropy(next_obs_pred, next_state_indices, reduction='none')
                 state_loss_per_batch = state_loss.mean(dim=[1, 2])
                 
-                reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
+                reward_classes = torch.ones_like(reward, dtype=torch.long)
+                reward_classes[reward < -0.5] = 0
+                reward_classes[reward > 1.0] = 2
+                reward_loss = F.cross_entropy(pred_reward, reward_classes, reduction='none')
                 
                 # Mean surprise across all environments in this specific transition batch
                 loss_batch = state_loss_per_batch + reward_loss

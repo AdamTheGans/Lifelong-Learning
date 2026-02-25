@@ -56,7 +56,7 @@ class SimpleWorldModel(nn.Module):
         )
 
         self.next_state_head = nn.Linear(hidden_dim, self.flat_obs_dim)
-        self.reward_head = nn.Linear(hidden_dim, 1)
+        self.reward_head = nn.Linear(hidden_dim, 3)
 
         self.apply(self._init_weights)
 
@@ -85,7 +85,7 @@ class SimpleWorldModel(nn.Module):
         features = self.trunk(x)                               # (B, hidden_dim)
 
         next_obs_flat = self.next_state_head(features)
-        reward_pred = self.reward_head(features).squeeze(-1)
+        reward_pred = self.reward_head(features)
         next_obs_pred = next_obs_flat.reshape(B, self.c, self.h, self.w)
 
         return next_obs_pred, reward_pred
@@ -154,13 +154,13 @@ class SimpleWorldModel(nn.Module):
 
             next_obs_discrete = self.discretize_state(next_obs_pred)
 
-            # [FIX] Snap reward to nearest canonical environment value
-            diffs = (reward_pred.unsqueeze(-1) - CANONICAL_REWARDS.unsqueeze(0)).abs()
-            nearest_idx = diffs.argmin(dim=-1)  # (B,)
-            snapped_reward = CANONICAL_REWARDS[nearest_idx]  # (B,)
+            # Reward is now predicted as logits over 3 classes
+            reward_logits = reward_pred
+            reward_class = torch.argmax(reward_logits, dim=-1) # (B,)
+            snapped_reward = CANONICAL_REWARDS[reward_class]  # (B,)
 
-            # [FIX] Terminal = any non-step-penalty reward (i.e. a goal was reached)
-            dones = (nearest_idx != STEP_PENALTY_IDX).float()
+            # Terminal = any non-step-penalty reward (i.e. a goal was reached)
+            dones = (reward_class != STEP_PENALTY_IDX).float()
 
             trajectories.append({
                 "obs": curr_obs,
@@ -172,7 +172,7 @@ class SimpleWorldModel(nn.Module):
                 "next_obs": next_obs_discrete
             })
 
-            # [FIX] Reset terminated dream envs to a reservoir state
+            # Reset terminated dream envs to a reservoir state
             # to prevent post-terminal hallucinated garbage from corrupting
             # subsequent dream steps.
             if reservoir_states is not None and len(reservoir_states) > 0 and dones.any():

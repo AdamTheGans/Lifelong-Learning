@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.7.16")
+    print("MoWM Dyna-PPO Trainer Version: 0.7.17")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -236,6 +236,7 @@ def train_ppo(
         episodic_intrinsic_rewards = []
         episodic_intrinsic_rewards_max = []
         spawn_occurred = False
+        last_true_regime = None  # Track ground truth regime for transition logging
 
         # Diagnostics: Context-Ignorance Lazy Policy Check
         with torch.no_grad():
@@ -257,6 +258,13 @@ def train_ppo(
 
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
+
+            # Log ground truth regime transitions
+            if "regime_id" in infos:
+                true_regime = infos["regime_id"][0]
+                if last_true_regime is not None and true_regime != last_true_regime:
+                    print(f"\n[ENV] True Regime Switch: Regime {last_true_regime} → Regime {true_regime} at step {global_step}.")
+                last_true_regime = true_regime
 
             # Handle autoreset: use final_observation for surprise calc on done envs
             real_next_obs = next_obs.copy()

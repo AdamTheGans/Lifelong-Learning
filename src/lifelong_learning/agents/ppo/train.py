@@ -793,6 +793,38 @@ def train_ppo(
                 print(f"  Q2         : {q2} transitions")
                 print(f"  Q3         : {q3} transitions")
                 print(f"  Q4 (end)   : {q4} transitions")
+
+                # 3. Per-transition reward prediction probe
+                num_samples = min(10, num_masked)
+                sample_idx = torch.randperm(num_masked)[:num_samples]
+                sample_obs = masked_obs[sample_idx]
+                sample_acts = masked_acts[sample_idx]
+                sample_rews = masked_rews[sample_idx]
+
+                print(f"\nPer-transition reward predictions (sample of {num_samples}):")
+                header = "| # | Actual Reward |"
+                divider = "|---|---------------|"
+                for m_id in range(len(world_model.models)):
+                    header += f" Model {m_id} Pred | M{m_id} MSE    |"
+                    divider += "----------------|-----------|"
+                print(header)
+                print(divider)
+
+                with torch.no_grad():
+                    preds_per_model = []
+                    for m_id, m in enumerate(world_model.models):
+                        _, pred_r = m(sample_obs, sample_acts)
+                        preds_per_model.append(pred_r)
+
+                    for j in range(num_samples):
+                        actual = sample_rews[j].item()
+                        row = f"| {j:<1} | {actual:>+13.3f} |"
+                        for m_id in range(len(world_model.models)):
+                            pred = preds_per_model[m_id][j].item()
+                            mse = (pred - actual) ** 2
+                            row += f" {pred:>+14.3f} | {mse:>9.4f} |"
+                        print(row)
+
                 print("--------------------------------------------------\n")
 
             # Oracle Routing: bypass masking logic and use ground truth

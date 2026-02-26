@@ -38,6 +38,7 @@ def main():
     
     # Oracle Baseline
     p.add_argument("--oracle", action="store_true", default=False, help="Enable Oracle Baseline mode (perfect routing, frequent interleaving, no dreaming)")
+    p.add_argument("--oracle_routing", action="store_true", default=False, help="Enable Oracle Routing (ground-truth regime switches, normal training)")
 
     args = p.parse_args()
 
@@ -79,6 +80,7 @@ def main():
         wm_lr=args.wm_lr,
         dreaming_ratio=args.dreaming_ratio,
         oracle_mode=args.oracle,
+        oracle_routing=args.oracle_routing,
     )
 
 

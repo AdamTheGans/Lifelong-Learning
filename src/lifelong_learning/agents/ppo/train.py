@@ -43,6 +43,7 @@ def train_ppo(
     wm_lr: float = 1e-4,
     dreaming_ratio: float = 1.0,
     oracle_mode: bool = False,
+    oracle_routing: bool = False,
 ):
     """
     Main Dyna-PPO training loop.
@@ -53,7 +54,9 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.5")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.6")
+    if oracle_routing:
+        print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -737,21 +740,30 @@ def train_ppo(
             masked_next = all_next[masked_indices]
             masked_rews = all_rews[masked_indices]
 
-            # Targeted Evaluation: Evaluate ALL models on the masked high-loss subset
-            eval_loss_accum_masked = [0.0] * len(world_model.models)
+            # Targeted Evaluation: Evaluate ALL models on the masked subset (with state/reward breakdown)
+            masked_detailed_accum = None
             num_eval_batches_masked = 0
 
             for start in range(0, num_masked, cfg.minibatch_size):
                 end = min(start + cfg.minibatch_size, num_masked)
-                batch_losses_masked = world_model.evaluate_all_models(
+                batch_detailed = world_model.evaluate_all_models_detailed(
                     masked_obs[start:end], masked_acts[start:end],
                     masked_next[start:end], masked_rews[start:end]
                 )
-                for i, loss in enumerate(batch_losses_masked):
-                    eval_loss_accum_masked[i] += loss
+                if masked_detailed_accum is None:
+                    masked_detailed_accum = [{'total': 0.0, 'state': 0.0, 'reward': 0.0} for _ in batch_detailed]
+                for i, d in enumerate(batch_detailed):
+                    masked_detailed_accum[i]['total'] += d['total']
+                    masked_detailed_accum[i]['state'] += d['state']
+                    masked_detailed_accum[i]['reward'] += d['reward']
                 num_eval_batches_masked += 1
 
-            eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
+            # Average the accumulated detailed losses
+            masked_detailed = []
+            for d in masked_detailed_accum:
+                n = max(1, num_eval_batches_masked)
+                masked_detailed.append({'total': d['total']/n, 'state': d['state']/n, 'reward': d['reward']/n})
+            eval_losses = [d['total'] for d in masked_detailed]
 
             if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
                 # --- DIAGNOSTICS: Inspect the Masked Subset ---
@@ -780,29 +792,48 @@ def train_ppo(
                 print(f"  Q4 (end)   : {q4} transitions")
                 print("--------------------------------------------------\n")
 
-            transition_action, target_id = world_model.check_epoch_transition(
-                epoch_avg_loss, eval_losses, global_step,
-                full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio
-            )
-
-            if transition_action == "switch":
-                old_id = world_model.active_regime_id
-                world_model.rollback_safe_state(
-                    old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+            # Oracle Routing: bypass masking logic and use ground truth
+            if oracle_routing and last_true_regime is not None and len(world_model.models) > 1:
+                true_id = last_true_regime
+                if true_id != world_model.active_regime_id:
+                    old_id = world_model.active_regime_id
+                    world_model.rollback_safe_state(
+                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                    )
+                    print(f"[ORACLE ROUTING] Forced switch: Model {old_id} → Model {true_id} at step {global_step}.")
+                    world_model.active_regime_id = true_id
+                    current_regime.fill_(true_id)
+                # Still call check_epoch_transition for logging/EMA updates, but ignore its action
+                world_model.check_epoch_transition(
+                    epoch_avg_loss, eval_losses, global_step,
+                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
+                    masked_detailed=masked_detailed
                 )
-                print(f"[MoWM] Regime Switch: Model {old_id} \u2192 Model {target_id} at step {global_step}.")
-                world_model.active_regime_id = target_id
-                current_regime.fill_(target_id)
-
-            elif transition_action == "spawn":
-                old_id = world_model.active_regime_id
-                new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
-                wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
-                world_model.rollback_safe_state(
-                    old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+            else:
+                transition_action, target_id = world_model.check_epoch_transition(
+                    epoch_avg_loss, eval_losses, global_step,
+                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
+                    masked_detailed=masked_detailed
                 )
-                current_regime.fill_(new_id)
-                spawn_occurred = True
+
+                if transition_action == "switch":
+                    old_id = world_model.active_regime_id
+                    world_model.rollback_safe_state(
+                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                    )
+                    print(f"[MoWM] Regime Switch: Model {old_id} → Model {target_id} at step {global_step}.")
+                    world_model.active_regime_id = target_id
+                    current_regime.fill_(target_id)
+
+                elif transition_action == "spawn":
+                    old_id = world_model.active_regime_id
+                    new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
+                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                    world_model.rollback_safe_state(
+                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                    )
+                    current_regime.fill_(new_id)
+                    spawn_occurred = True
 
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []

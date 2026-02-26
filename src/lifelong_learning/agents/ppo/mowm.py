@@ -164,9 +164,32 @@ class MixtureOfWorldModels(nn.Module):
 
         return raw_losses
 
+    def evaluate_all_models_detailed(
+        self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor
+    ) -> list[dict]:
+        """
+        Evaluate all world models and return per-model breakdown of state and reward losses.
+        Returns a list of dicts with keys: 'total', 'state', 'reward'.
+        """
+        next_state_indices = torch.argmax(next_state, dim=1)
+
+        detailed = []
+        for i, model in enumerate(self.models):
+            with torch.no_grad():
+                next_obs_pred, pred_reward = model(state, action)
+                state_loss = F.cross_entropy(next_obs_pred, next_state_indices, reduction='none')
+                state_loss_per_batch = state_loss.mean(dim=[1, 2])
+                reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
+                s = state_loss_per_batch.mean().item()
+                r = reward_loss.mean().item()
+                detailed.append({'total': s + r, 'state': s, 'reward': r})
+
+        return detailed
+
     def check_epoch_transition(
         self, epoch_avg_loss: float, eval_losses: list[float], global_step: int,
-        full_buffer_losses: list[float] = None, num_masked: int = None, mask_ratio: float = None
+        full_buffer_losses: list[float] = None, num_masked: int = None, mask_ratio: float = None,
+        masked_detailed: list[dict] = None
     ) -> tuple[str, int]:
         """
         Epoch-boundary routing decision. Replaces the old per-step Rescue Routing.
@@ -210,12 +233,20 @@ class MixtureOfWorldModels(nn.Module):
         if full_buffer_losses is not None and num_masked is not None and mask_ratio is not None:
             print(f"[MoWM] Masking reveals {num_masked} highly-surprising transitions (Top {mask_ratio*100:g}%).")
             print("[MoWM] Model Evaluation Comparison:")
-            print("| Model   | Masked Subset Loss | Full Buffer Loss |")
-            print("|---------|--------------------|------------------|")
-            for i in range(len(self.models)):
-                masked_loss = eval_losses[i]
-                full_loss = full_buffer_losses[i]
-                print(f"| Model {i:<1} | {masked_loss:<18.4f} | {full_loss:<16.4f} |")
+            if masked_detailed is not None:
+                print("| Model   | Masked Total | State Loss | Reward Loss | Full Buffer |")
+                print("|---------|--------------|------------|-------------|-------------|")
+                for i in range(len(self.models)):
+                    d = masked_detailed[i]
+                    full_loss = full_buffer_losses[i]
+                    print(f"| Model {i:<1} | {d['total']:<12.4f} | {d['state']:<10.4f} | {d['reward']:<11.4f} | {full_loss:<11.4f} |")
+            else:
+                print("| Model   | Masked Subset Loss | Full Buffer Loss |")
+                print("|---------|--------------------|------------------|")
+                for i in range(len(self.models)):
+                    masked_loss = eval_losses[i]
+                    full_loss = full_buffer_losses[i]
+                    print(f"| Model {i:<1} | {masked_loss:<18.4f} | {full_loss:<16.4f} |")
 
         # Active model is surprised. Find the best alternative.
         best_candidate = min(range(len(self.models)), key=lambda i: eval_losses[i])

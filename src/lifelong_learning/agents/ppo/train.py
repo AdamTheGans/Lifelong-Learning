@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.6")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.7")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -402,6 +402,7 @@ def train_ppo(
             "buffer_rewards_std": buffer.rewards.std().item(),
             "buffer_rewards_abs_mean": buffer.rewards.abs().mean().item(),
             "regime_kl_divergence": kl_div,
+            "last_true_regime": last_true_regime,
         }
 
     def update_world_model():
@@ -637,6 +638,7 @@ def train_ppo(
         # Phase A: Collect real experience
         collect_stats = collect_real_experience(global_step)
         global_step = collect_stats["global_step"]
+        last_true_regime = collect_stats["last_true_regime"]
 
         with torch.no_grad():
             _, last_value = model.forward(obs_t, current_regime)

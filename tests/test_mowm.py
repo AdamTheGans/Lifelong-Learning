@@ -79,6 +79,58 @@ def test_mowm_epoch_boundary_veteran_rescue():
     assert action == "spawn"
 
 
+def test_mowm_relative_rescue_ratio():
+    """Verify that the relative rescue ratio allows a veteran to win even when its
+    absolute loss exceeds the spawn threshold, as long as it dramatically beats the
+    active model. This models the 'regime switch-back' scenario where a veteran is
+    rusty but clearly correct."""
+    from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+    mowm = MixtureOfWorldModels(obs_shape=(21, 8, 8), n_actions=4, hidden_dim=32, max_regimes=5)
+    # Add a second model
+    mowm.models.append(SimpleWorldModel((21, 8, 8), 4, 32))
+
+    mowm.active_regime_id = 1
+    mowm.ema_losses.append(0.1)
+    mowm.has_mastered.append(True)
+    mowm.steps_under_threshold.append(mowm.mastery_buffer_steps)
+    mowm.spawn_steps.append(1000)
+    if hasattr(mowm, 'timeout_triggered'):
+        mowm.timeout_triggered.append(False)
+    mowm.safe_state_buffer.append(collections.deque(maxlen=3))
+    mowm.force_active_until = 0
+
+    global_step = mowm.global_grace_period + mowm.newborn_grace_period + 1
+
+    # Scenario: Regime switch-back. Active model (1) loss is massive (34.5),
+    # veteran (0) loss is 2.17 (above absolute threshold of 0.3, but ratio =
+    # 2.17/34.5 = 0.063 << rescue_ratio of 0.3) → should switch via relative rescue
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[2.17, 34.5], global_step=global_step
+    )
+    assert action == "switch"
+    assert target == 0
+
+    # Edge case: Both models have similar high losses (ratio 0.75 > 0.3) → spawn
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[15.0, 20.0], global_step=global_step
+    )
+    assert action == "spawn"
+
+    # Edge case: Veteran loss is exactly at the rescue ratio boundary
+    # 6.0 / 20.0 = 0.30, which is NOT strictly less than 0.3 → spawn
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[6.0, 20.0], global_step=global_step
+    )
+    assert action == "spawn"
+
+    # Just below the boundary: 5.9 / 20.0 = 0.295 < 0.3 → switch
+    action, target = mowm.check_epoch_transition(
+        epoch_avg_loss=2.0, eval_losses=[5.9, 20.0], global_step=global_step
+    )
+    assert action == "switch"
+    assert target == 0
+
+
 def test_hard_cap_forces_switch_to_lesser_evil():
     """When at max_regimes, the system must switch to the best candidate even if
     its loss exceeds absolute_spawn_threshold — it's the lesser of two evils."""

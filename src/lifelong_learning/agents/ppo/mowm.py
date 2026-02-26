@@ -40,6 +40,7 @@ class MixtureOfWorldModels(nn.Module):
         
         # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
+        self.rescue_ratio = 0.3               # Relative rescue: veteran wins if loss < active * ratio
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -263,9 +264,23 @@ class MixtureOfWorldModels(nn.Module):
                 return ("stay", self.active_regime_id)
 
         # Normal path: can still spawn
-        if best_candidate != self.active_regime_id and eval_losses[best_candidate] < self.absolute_spawn_threshold:
-            # A veteran can confidently handle the current regime
-            return ("switch", best_candidate)
+        # A veteran can rescue if EITHER:
+        #   1. Absolute confidence: its loss is below the spawn threshold (very clean match)
+        #   2. Relative dominance: its loss is dramatically lower than the active model's
+        #      (handles "rusty but correct" veterans on the high-loss masked subset)
+        if best_candidate != self.active_regime_id:
+            best_loss = eval_losses[best_candidate]
+            active_loss = eval_losses[self.active_regime_id]
+            abs_ok = best_loss < self.absolute_spawn_threshold
+            rel_ok = active_loss > 0 and best_loss < active_loss * self.rescue_ratio
+            if abs_ok or rel_ok:
+                if abs_ok:
+                    reason = "absolute confidence"
+                else:
+                    reason = f"relative dominance ({best_loss/active_loss:.3f} < {self.rescue_ratio})"
+                print(f"[MoWM] Veteran rescue ({reason}): Model {best_candidate} "
+                      f"(loss: {best_loss:.4f}) beats active Model {self.active_regime_id} (loss: {active_loss:.4f}).")
+                return ("switch", best_candidate)
 
         return ("spawn", -1)
 

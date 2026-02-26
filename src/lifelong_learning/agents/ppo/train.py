@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.2")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.3")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -249,6 +249,14 @@ def train_ppo(
             next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
 
+            # Detect AutoReset dummy steps (SyncVectorEnv emits exactly 0.0 reward on the step after a done)
+            is_dummy = (reward == 0.0)
+            if is_dummy.any():
+                # For dummy steps, the reward is 0.0 and the obs is the first obs of the new episode.
+                # We don't want the agent to learn to predict this transition, nor be penalized for it.
+                pass  # We will handle masking this out during World Model training and Masked Diagnostics
+
+
             # Log ground truth regime transitions
             if "regime_id" in infos:
                 true_regime = infos["regime_id"][0]
@@ -327,6 +335,7 @@ def train_ppo(
                 values=value,
                 next_obs=real_next_obs_t,
                 regime_ids=current_regime,
+                is_dummy=torch.tensor(is_dummy, dtype=torch.bool, device=device)
             )
 
             # Add to temporary state storage for the current episode
@@ -407,8 +416,9 @@ def train_ppo(
 
             for epoch in range(cfg.update_epochs):
                 minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
-                for obs, actions, _, _, _, _, next_obs, rewards, extrinsic_rewards, regime_ids in minibatches:
-                    mask = (regime_ids == m_id)
+                for obs, actions, _, _, _, _, next_obs, rewards, extrinsic_rewards, regime_ids, is_dummy in minibatches:
+                    # Filter out dummy AutoReset steps and steps from other regimes
+                    mask = (regime_ids == m_id) & (~is_dummy)
                     if not mask.any():
                         continue
 
@@ -466,9 +476,19 @@ def train_ppo(
         # Grab exactly one minibatch to act as a representative sample of the current transition distribution
         minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
         try:
-            shadow_obs, shadow_acts, _, _, _, _, shadow_next, shadow_rews, shadow_ext_rews, _ = next(minibatches)
+            shadow_obs, shadow_acts, _, _, _, _, shadow_next, shadow_rews, shadow_ext_rews, _, shadow_is_dummy = next(minibatches)
+            
+            # Filter dummy AutoReset frames
+            valid_mask = ~shadow_is_dummy
+            if not valid_mask.any():
+                raise StopIteration # Skip shadow tracking for this step if entire batch is dummies
+            
+            shadow_obs = shadow_obs[valid_mask]
+            shadow_acts = shadow_acts[valid_mask]
+            shadow_next = shadow_next[valid_mask]
+            shadow_ext_rews = shadow_ext_rews[valid_mask]
         except StopIteration:
-            pass # Failsafe if buffer completely empty
+            pass # Failsafe if buffer completely empty or all dummy
         else:
             with torch.no_grad():
                 shadow_targets = torch.argmax(shadow_next, dim=1)
@@ -638,9 +658,19 @@ def train_ppo(
             eval_loss_accum_full = None
             num_eval_batches_full = 0
 
-            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ in eval_minibatches:
+            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _, eval_is_dummy in eval_minibatches:
+                # Filter out dummy AutoReset frames
+                valid_mask = ~eval_is_dummy
+                if not valid_mask.any():
+                    continue
+
+                eval_obs_valid = eval_obs[valid_mask]
+                eval_acts_valid = eval_acts[valid_mask]
+                eval_next_valid = eval_next[valid_mask]
+                eval_ext_rews_valid = eval_ext_rews[valid_mask]
+
                 # 1. Full-buffer evaluation for all models (Observability)
-                batch_losses_full = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                batch_losses_full = world_model.evaluate_all_models(eval_obs_valid, eval_acts_valid, eval_next_valid, eval_ext_rews_valid)
                 if eval_loss_accum_full is None:
                     eval_loss_accum_full = [0.0] * len(batch_losses_full)
                 for i, loss in enumerate(batch_losses_full):
@@ -648,13 +678,13 @@ def train_ppo(
                 num_eval_batches_full += 1
                 
                 # 2. Collect active model's unreduced losses for masking
-                unreduced = world_model.get_active_model_unreduced_losses(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                unreduced = world_model.get_active_model_unreduced_losses(eval_obs_valid, eval_acts_valid, eval_next_valid, eval_ext_rews_valid)
                 all_unreduced_losses.append(unreduced)
                 
-                all_obs.append(eval_obs)
-                all_acts.append(eval_acts)
-                all_next.append(eval_next)
-                all_rews.append(eval_ext_rews)
+                all_obs.append(eval_obs_valid)
+                all_acts.append(eval_acts_valid)
+                all_next.append(eval_next_valid)
+                all_rews.append(eval_ext_rews_valid)
 
             if eval_loss_accum_full is not None and num_eval_batches_full > 0:
                 full_buffer_losses = [total / num_eval_batches_full for total in eval_loss_accum_full]
@@ -696,33 +726,34 @@ def train_ppo(
                     
                 eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
 
-                # --- DIAGNOSTICS: Inspect the Masked Subset ---
-                print("\n[MoWM DIAGNOSTICS] --- Masked Subset Analysis ---")
-                print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
-                
-                # 1. Rewards Distribution
-                unique_rews, counts = torch.unique(masked_rews, return_counts=True)
-                print("Rewards in Masked Subset:")
-                for r, c in zip(unique_rews.tolist(), counts.tolist()):
-                    print(f"  Reward {r:+.3f}: {c} occurrences")
+                if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
+                    # --- DIAGNOSTICS: Inspect the Masked Subset ---
+                    print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
+                    print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
                     
-                # 2. Chronological Distribution
-                # topk_indices range from 0 to (num_steps * num_envs - 1). 
-                # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
-                step_indices = topk_indices // num_envs
-                
-                # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
-                q1 = (step_indices < buffer.num_steps / 4).sum().item()
-                q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
-                q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
-                q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
+                    # 1. Rewards Distribution
+                    unique_rews, counts = torch.unique(masked_rews, return_counts=True)
+                    print("Rewards in Masked Subset:")
+                    for r, c in zip(unique_rews.tolist(), counts.tolist()):
+                        print(f"  Reward {r:+.3f}: {c} occurrences")
+                        
+                    # 2. Chronological Distribution
+                    # topk_indices range from 0 to (num_steps * num_envs - 1). 
+                    # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
+                    step_indices = topk_indices // num_envs
+                    
+                    # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
+                    q1 = (step_indices < buffer.num_steps / 4).sum().item()
+                    q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
+                    q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
+                    q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
 
-                print("Chronological placement in current epoch (by quartiles Q1->Q4):")
-                print(f"  Q1 (start) : {q1} transitions")
-                print(f"  Q2         : {q2} transitions")
-                print(f"  Q3         : {q3} transitions")
-                print(f"  Q4 (end)   : {q4} transitions")
-                print("--------------------------------------------------\n")
+                    print("Chronological placement in current epoch (by quartiles Q1->Q4):")
+                    print(f"  Q1 (start) : {q1} transitions")
+                    print(f"  Q2         : {q2} transitions")
+                    print(f"  Q3         : {q3} transitions")
+                    print(f"  Q4 (end)   : {q4} transitions")
+                    print("--------------------------------------------------\n")
 
                 transition_action, target_id = world_model.check_epoch_transition(
                     epoch_avg_loss, eval_losses, global_step,

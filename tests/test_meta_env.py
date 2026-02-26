@@ -39,10 +39,10 @@ class TestMetaEnv(unittest.TestCase):
         self.assertEqual(self.env.observation_space.shape, (NUM_SIGNALS,))
 
     def test_action_space(self):
-        """Action space should be Box(4,) in [-1, 1]."""
-        self.assertEqual(self.env.action_space.shape, (4,))
-        np.testing.assert_array_equal(self.env.action_space.low, -1.0 * np.ones(4))
-        np.testing.assert_array_equal(self.env.action_space.high, 1.0 * np.ones(4))
+        """Action space should be Box(5,) in [-1, 1]."""
+        self.assertEqual(self.env.action_space.shape, (5,))
+        np.testing.assert_array_equal(self.env.action_space.low, -1.0 * np.ones(5))
+        np.testing.assert_array_equal(self.env.action_space.high, 1.0 * np.ones(5))
 
     def test_reset_returns_correct_shape(self):
         """reset() should return (obs, info) with correct obs shape."""

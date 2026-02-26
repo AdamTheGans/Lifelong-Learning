@@ -65,6 +65,7 @@ def train_brain(args):
                 wm_lr=args.inner_wm_lr,
                 inner_log_dir=log_dir_str,
                 env_index=env_idx,
+                episodic_memory_capacity=args.episodic_memory_capacity,
             )
         return _make_env_fn
 
@@ -106,14 +107,14 @@ def train_brain(args):
                 # Index 1 is success_rate (from signals.py)
                 success_rates = obs[:, 1]
                 
-                target_actions = np.zeros((args.brain_num_envs, 4), dtype=np.float32)
+                target_actions = np.zeros((args.brain_num_envs, 5), dtype=np.float32)
                 for i in range(args.brain_num_envs):
                     if success_rates[i] < 0.5:
-                        # Explore: increase lr, ent, curiosity; decrease horizon slightly or keep 0
-                        target_actions[i] = [0.5, 0.5, 0.5, 0.0]
+                        # Explore: increase lr, ent, curiosity; no replay of old task
+                        target_actions[i] = [0.5, 0.5, 0.5, 0.0, -0.5]
                     else:
-                        # Exploit: decrease lr, ent, curiosity; 
-                        target_actions[i] = [-0.5, -0.5, -0.5, 0.0]
+                        # Exploit: decrease lr, ent, curiosity; rehearse old knowledge
+                        target_actions[i] = [-0.5, -0.5, -0.5, 0.0, 0.5]
 
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
                 target_a_t = torch.tensor(target_actions, dtype=torch.float32, device=device)
@@ -157,6 +158,8 @@ def train_brain(args):
         episode_action_ents = []
         episode_action_intrs = []
         episode_action_horizons = []
+        episode_action_replays = []
+        episode_replay_ratios = []
 
         obs, info = meta_env.reset()
 
@@ -178,6 +181,8 @@ def train_brain(args):
                     episode_ent_coefs.append(float(np.mean(inner_stats.get("current_ent_coef", 0.0))))
                     episode_intrinsic_coefs.append(float(np.mean(inner_stats.get("current_intrinsic_coef", 0.0))))
                     episode_horizons.append(float(np.mean(inner_stats.get("current_imagined_horizon", 0.0))))
+                    if "current_replay_ratio" in inner_stats:
+                        episode_replay_ratios.append(float(np.mean(inner_stats.get("current_replay_ratio", 0.0))))
                 elif isinstance(inner_stats, (list, tuple)):
                     lrs = [s.get("current_lr", 0.0) for s in inner_stats if isinstance(s, dict) and "current_lr" in s]
                     if lrs: episode_lrs.append(float(np.mean(lrs)))
@@ -187,12 +192,15 @@ def train_brain(args):
                     if intrs: episode_intrinsic_coefs.append(float(np.mean(intrs)))
                     horz = [s.get("current_imagined_horizon", 0.0) for s in inner_stats if isinstance(s, dict) and "current_imagined_horizon" in s]
                     if horz: episode_horizons.append(float(np.mean(horz)))
+                    rr = [s.get("current_replay_ratio", 0.0) for s in inner_stats if isinstance(s, dict) and "current_replay_ratio" in s]
+                    if rr: episode_replay_ratios.append(float(np.mean(rr)))
                 
             # Track average Brain action taken
             episode_action_lrs.append(float(np.mean(action_np[:, 0])))
             episode_action_ents.append(float(np.mean(action_np[:, 1])))
             episode_action_intrs.append(float(np.mean(action_np[:, 2])))
             episode_action_horizons.append(float(np.mean(action_np[:, 3])))
+            episode_action_replays.append(float(np.mean(action_np[:, 4])))
 
             # Store batched experience
             dones = (terminations | truncations).astype(np.float32)
@@ -245,6 +253,7 @@ def train_brain(args):
             logger.scalar("brain_action/mean_ent_adjustment", float(np.mean(episode_action_ents)), episode)
             logger.scalar("brain_action/mean_intrinsic_adjustment", float(np.mean(episode_action_intrs)), episode)
             logger.scalar("brain_action/mean_horizon_adjustment", float(np.mean(episode_action_horizons)), episode)
+            logger.scalar("brain_action/mean_replay_adjustment", float(np.mean(episode_action_replays)), episode)
 
         # Log mean inner hyperparameters actually realized during the episode
         if episode_lrs:
@@ -255,6 +264,8 @@ def train_brain(args):
             logger.scalar("brain_hyperparams/mean_inner_intrinsic_coef", float(np.mean(episode_intrinsic_coefs)), episode)
         if episode_horizons:
             logger.scalar("brain_hyperparams/mean_inner_imagined_horizon", float(np.mean(episode_horizons)), episode)
+        if episode_replay_ratios:
+            logger.scalar("brain_hyperparams/mean_inner_replay_ratio", float(np.mean(episode_replay_ratios)), episode)
 
         # Extract final inner training metrics from the first environment
         final_info = infos.get("final_info", [{}])[0]
@@ -300,6 +311,10 @@ def main():
     # Reward shaping
     p.add_argument("--reward_alpha", type=float, default=0.1)
     p.add_argument("--reward_beta", type=float, default=0.5)
+
+    # Episodic Memory
+    p.add_argument("--episodic_memory_capacity", type=int, default=50000,
+                   help="Capacity of the episodic memory ring buffer")
 
     # General
     p.add_argument("--seed", type=int, default=0)

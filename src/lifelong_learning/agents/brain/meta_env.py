@@ -56,6 +56,7 @@ class MetaEnv(gym.Env):
         wm_lr: float = 1e-4,
         inner_log_dir: str | None = None,
         env_index: int = 0,
+        episodic_memory_capacity: int = 50000,
     ):
         super().__init__()
 
@@ -76,13 +77,14 @@ class MetaEnv(gym.Env):
         self.imagined_horizon_init = imagined_horizon
         self.wm_lr = wm_lr
         self.inner_log_dir = inner_log_dir
+        self.episodic_memory_capacity = episodic_memory_capacity
 
         # Spaces
         self.observation_space = spaces.Box(
             low=-10.0, high=10.0, shape=(NUM_SIGNALS,), dtype=np.float32
         )
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(4,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
         )
 
         # HP bounds (absolute min/max)
@@ -90,6 +92,7 @@ class MetaEnv(gym.Env):
         self.ent_coef_bounds = (0.001, 0.1)
         self.intrinsic_coef_bounds = (0.001, 0.5)
         self.imagined_horizon_bounds = (1, 30)
+        self.replay_ratio_bounds = (0.0, 0.5)
 
         # Will be initialized on reset()
         self._state: InnerTrainState | None = None
@@ -129,6 +132,7 @@ class MetaEnv(gym.Env):
             intrinsic_reward_clip=self.intrinsic_reward_clip,
             imagined_horizon=self.imagined_horizon_init,
             wm_lr=self.wm_lr,
+            episodic_memory_capacity=self.episodic_memory_capacity,
         )
         if self.inner_log_dir is not None:
             init_kwargs["log_dir"] = self.inner_log_dir
@@ -216,6 +220,13 @@ class MetaEnv(gym.Env):
         s.imagined_horizon = int(np.clip(
             s.imagined_horizon + horizon_delta,
             *self.imagined_horizon_bounds
+        ))
+
+        # Action[4]: replay_ratio → linear map [-1, 1] → [0.0, 0.5]
+        replay_ratio = float((action[4] + 1.0) / 2.0 * 0.5)  # [-1,1] → [0, 0.5]
+        s.replay_ratio = float(np.clip(
+            replay_ratio,
+            *self.replay_ratio_bounds
         ))
 
     @staticmethod

@@ -20,6 +20,7 @@ from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
+from lifelong_learning.agents.ppo.episodic_memory import EpisodicMemory
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import DataLogger
 from lifelong_learning.envs.make_env import make_env
@@ -56,6 +57,11 @@ class InnerTrainState:
     intrinsic_coef: float = 0.1
     intrinsic_reward_clip: float = 0.1
     imagined_horizon: int = 5
+    replay_ratio: float = 0.0
+
+    # --- Episodic Memory ---
+    episodic_memory: EpisodicMemory = field(default=None, repr=False)
+    episodic_memory_capacity: int = 50000
     anneal_lr: bool = True
 
     # --- Counters ---
@@ -101,6 +107,7 @@ def init_inner_training(
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
     log_dir: str = "runs",
+    episodic_memory_capacity: int = 50000,
 ) -> InnerTrainState:
     """
     Initialize all components of the Dyna-PPO inner training loop.
@@ -191,6 +198,12 @@ def init_inner_training(
     global_step = start_global_step
     start_update = global_step // (num_envs * cfg.num_steps) + 1
 
+    ep_memory = EpisodicMemory(
+        capacity=episodic_memory_capacity,
+        obs_shape=obs_shape,
+        device=device,
+    )
+
     return InnerTrainState(
         model=model,
         optimizer=optimizer,
@@ -219,6 +232,8 @@ def init_inner_training(
         run_name=run_name,
         save_dir=save_dir,
         save_every_updates=save_every_updates,
+        episodic_memory=ep_memory,
+        episodic_memory_capacity=episodic_memory_capacity,
     )
 
 
@@ -277,6 +292,11 @@ def run_inner_update(state: InnerTrainState) -> dict:
 
         next_obs, reward, terminated, truncated, infos = s.envs.step(action.cpu().numpy())
         done = np.logical_or(terminated, truncated)
+
+        # Log regime_id for regime switch visualization
+        if "regime_id" in infos:
+            regime_ids = infos["regime_id"]
+            s.logger.scalar("charts/regime_id", float(np.mean(regime_ids)), s.global_step)
 
         # Handle autoreset: use final_observation for surprise calc on done envs
         real_next_obs = next_obs.copy()
@@ -389,6 +409,49 @@ def run_inner_update(state: InnerTrainState) -> dict:
             stats = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
             update_stats.append(stats)
 
+    # Phase B2: Replay from episodic memory (Brain-controlled)
+    replay_stats = []
+    if s.replay_ratio > 0.01 and s.episodic_memory is not None and s.episodic_memory.size >= s.cfg.minibatch_size:
+        n_replay = max(1, int(s.cfg.minibatch_size * s.replay_ratio))
+        n_fresh = s.cfg.minibatch_size - n_replay
+
+        replay_sample = s.episodic_memory.sample(n_replay)
+        if replay_sample is not None:
+            # Get fresh samples from current buffer
+            fresh_idxs = np.random.randint(0, s.cfg.num_steps * s.num_envs, size=n_fresh)
+            flat_obs = s.buffer.obs.reshape((-1,) + s.obs_shape)
+            flat_actions = s.buffer.actions.reshape(-1)
+            flat_rewards = s.buffer.rewards.reshape(-1)
+            flat_next_obs = s.buffer.next_obs.reshape((-1,) + s.obs_shape)
+
+            # Combine fresh + replay observations and actions
+            mixed_obs = torch.cat([flat_obs[fresh_idxs], replay_sample["obs"]], dim=0)
+            mixed_actions = torch.cat([flat_actions[fresh_idxs], replay_sample["actions"]], dim=0)
+
+            # Recompute values & logprobs under current policy for the mixed batch
+            with torch.no_grad():
+                _, mixed_values = s.model.forward(mixed_obs)
+
+            # Compute simple 1-step returns: r + gamma * V(s') for replay
+            mixed_rewards = torch.cat([flat_rewards[fresh_idxs], replay_sample["rewards"]], dim=0)
+            mixed_next_obs = torch.cat([flat_next_obs[fresh_idxs], replay_sample["next_obs"]], dim=0)
+            with torch.no_grad():
+                _, next_values = s.model.forward(mixed_next_obs)
+            mixed_dones = torch.cat([
+                s.buffer.dones.reshape(-1)[fresh_idxs],
+                replay_sample["dones"]
+            ], dim=0)
+            mixed_returns = mixed_rewards + s.cfg.gamma * next_values * (1.0 - mixed_dones)
+            mixed_advantages = mixed_returns - mixed_values
+            mixed_advantages = (mixed_advantages - mixed_advantages.mean()) / (mixed_advantages.std() + 1e-8)
+
+            # Recompute logprobs under current policy
+            new_logprobs, _, _ = s.model.evaluate_actions(mixed_obs, mixed_actions)
+
+            ppo_batch = [mixed_obs, mixed_actions, new_logprobs, mixed_advantages, mixed_returns, mixed_values]
+            rs = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+            replay_stats.append(rs)
+
     # =====================================================================
     # Phase C: Train World Model
     # =====================================================================
@@ -448,6 +511,10 @@ def run_inner_update(state: InnerTrainState) -> dict:
                 _, last_dream_value = s.model.forward(last_dream_obs)
             dream_buffer.compute_returns_and_advantages(last_dream_value, s.cfg.gamma, s.cfg.gae_lambda)
 
+        # Archive current rollout to episodic memory BEFORE dreaming
+        if s.episodic_memory is not None:
+            s.episodic_memory.store_from_rollout(s.buffer)
+
         for epoch in range(1):
             minibatches = dream_buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
@@ -494,6 +561,8 @@ def run_inner_update(state: InnerTrainState) -> dict:
 
     sps = int(s.global_step / max(1e-9, (time.time() - s.start_time)))
     s.logger.scalar("charts/SPS", sps, s.global_step)
+    s.logger.scalar("charts/replay_ratio", s.replay_ratio, s.global_step)
+    s.logger.scalar("charts/episodic_memory_fullness", s.episodic_memory.fullness if s.episodic_memory else 0.0, s.global_step)
 
     # Checkpointing
     if update % s.save_every_updates == 0 or update == s.num_updates:
@@ -551,6 +620,9 @@ def run_inner_update(state: InnerTrainState) -> dict:
         "current_lr": lrnow,
         "current_ent_coef": s.cfg.ent_coef,
         "current_intrinsic_coef": s.intrinsic_coef,
+        "current_replay_ratio": s.replay_ratio,
+        "episodic_memory_size": s.episodic_memory.size if s.episodic_memory else 0,
+        "episodic_memory_fullness": s.episodic_memory.fullness if s.episodic_memory else 0.0,
         "current_imagined_horizon": s.imagined_horizon,
     }
 

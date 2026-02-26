@@ -2,6 +2,8 @@ import os
 import json
 import time
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -48,6 +50,16 @@ class DataLogger:
         else:
             axes = axes.flatten()
             
+        # Auto-detect regime switch points from charts/regime_id
+        regime_switch_steps = []
+        regime_data = self.data.get("charts/regime_id", [])
+        if len(regime_data) > 1:
+            for i in range(1, len(regime_data)):
+                prev_val = regime_data[i - 1][1]
+                curr_val = regime_data[i][1]
+                if round(prev_val) != round(curr_val):
+                    regime_switch_steps.append(regime_data[i][0])
+
         for i, tag in enumerate(tags):
             ax = axes[i]
             points = self.data[tag]
@@ -68,6 +80,11 @@ class DataLogger:
                 ax.plot(steps, values, color='lightblue', alpha=0.3)
             else:
                 ax.plot(steps, values, color='blue')
+
+            # Draw regime switch lines
+            if regime_switch_steps:
+                for rs_step in regime_switch_steps:
+                    ax.axvline(x=rs_step, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
                 
             ax.set_title(tag)
             ax.set_xlabel('Steps' if 'step' in tag.lower() else 'Updates/Episodes')

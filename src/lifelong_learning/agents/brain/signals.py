@@ -27,6 +27,8 @@ SIGNAL_NAMES = [
     "current_intrinsic_coef",
     "current_imagined_horizon",
     "steps_since_surprise_spike",
+    "current_replay_ratio",
+    "episodic_memory_fullness",
 ]
 
 NUM_SIGNALS = len(SIGNAL_NAMES)
@@ -111,6 +113,8 @@ class SignalExtractor:
             stats.get("current_intrinsic_coef", 0.0),
             stats.get("current_imagined_horizon", 0.0),
             float(self.steps_since_spike),
+            stats.get("current_replay_ratio", 0.0),
+            stats.get("episodic_memory_fullness", 0.0),
         ], dtype=np.float32)
 
         self.normalizer.update(raw)

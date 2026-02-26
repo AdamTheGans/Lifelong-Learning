@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.1")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.2")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -695,6 +695,34 @@ def train_ppo(
                     num_eval_batches_masked += 1
                     
                 eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
+
+                # --- DIAGNOSTICS: Inspect the Masked Subset ---
+                print("\n[MoWM DIAGNOSTICS] --- Masked Subset Analysis ---")
+                print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
+                
+                # 1. Rewards Distribution
+                unique_rews, counts = torch.unique(masked_rews, return_counts=True)
+                print("Rewards in Masked Subset:")
+                for r, c in zip(unique_rews.tolist(), counts.tolist()):
+                    print(f"  Reward {r:+.3f}: {c} occurrences")
+                    
+                # 2. Chronological Distribution
+                # topk_indices range from 0 to (num_steps * num_envs - 1). 
+                # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
+                step_indices = topk_indices // num_envs
+                
+                # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
+                q1 = (step_indices < buffer.num_steps / 4).sum().item()
+                q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
+                q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
+                q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
+
+                print("Chronological placement in current epoch (by quartiles Q1->Q4):")
+                print(f"  Q1 (start) : {q1} transitions")
+                print(f"  Q2         : {q2} transitions")
+                print(f"  Q3         : {q3} transitions")
+                print(f"  Q4 (end)   : {q4} transitions")
+                print("--------------------------------------------------\n")
 
                 transition_action, target_id = world_model.check_epoch_transition(
                     epoch_avg_loss, eval_losses, global_step,

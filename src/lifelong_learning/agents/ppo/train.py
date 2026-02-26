@@ -18,7 +18,7 @@ from collections import deque
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
-from lifelong_learning.agents.ppo.ewc import EWC
+
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import TBLogger
@@ -43,7 +43,6 @@ def train_ppo(
     wm_lr: float = 1e-4,
     surprise_threshold: float = 0.1,
     max_heads: int = 4,
-    ewc_coef: float = 1000.0,
 ):
     """
     Main Dyna-PPO training loop.
@@ -82,6 +81,7 @@ def train_ppo(
     # Model & Optimizer Setup
     # -------------------------------------------------------------------------
 
+    # Shared-trunk multi-head network (shared CNN, per-regime actor/critic heads)
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
@@ -352,8 +352,7 @@ def train_ppo(
             minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
                 ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-                stats = ppo_update(model, optimizer, [ppo_batch], cfg,
-                                   ewc=ewc_tracker, ewc_coef=ewc_coef)
+                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
                 update_stats.append(stats)
         return update_stats
 
@@ -367,16 +366,15 @@ def train_ppo(
     last_spawn_update = -999
     running_reward_loss = 0.0  # tracks baseline reward loss for relative threshold
 
-    # EWC for policy consolidation
-    ewc_tracker = EWC(model, device)
-    prev_active_head = world_model.active_head
-    prev_regime_id = -1  # track actual regime from environment
+    # Track regime for network switching
+    prev_regime_id = -1
 
     for update in range(start_update, num_updates + 1):
         if anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * cfg.lr
-            optimizer.param_groups[0]["lr"] = lrnow
+            for pg in optimizer.param_groups:
+                pg["lr"] = lrnow
         else:
             lrnow = cfg.lr
 
@@ -425,31 +423,27 @@ def train_ppo(
                 print(f"[multihead] Spawned head {best_head} (loss={best_loss:.3f} > threshold={surprise_threshold}, update={update})")
             world_model.active_head = best_head
 
-        # Detect regime switch → snapshot Fisher for EWC
-        # Compute current regime from global_step (matches env's logic)
+        # Switch active head on regime change
         if steps_per_regime and steps_per_regime > 0:
-            current_regime_id = global_step // steps_per_regime
+            current_regime_id = (global_step // steps_per_regime) % 2
         else:
             current_regime_id = 0
-        regime_switched = (
-            (world_model.active_head != prev_active_head) or
-            (current_regime_id != prev_regime_id and prev_regime_id >= 0)
-        )
-        if regime_switched:
-            trigger = "head" if world_model.active_head != prev_active_head else "regime_id"
-            print(f"[ewc] Switch detected via {trigger} (regime {prev_regime_id}→{current_regime_id}, "
-                  f"head {prev_active_head}→{world_model.active_head}), computing Fisher...")
-            ewc_obs = buffer.obs[:].reshape(-1, *obs_shape)
-            ewc_act = buffer.actions[:].reshape(-1)
-            ewc_tracker.update(model, ewc_obs, ewc_act)
-            prev_active_head = world_model.active_head
-            prev_regime_id = current_regime_id
-        elif prev_regime_id < 0:
-            prev_regime_id = current_regime_id  # first-update init
+        if current_regime_id != prev_regime_id and prev_regime_id >= 0:
+            # Spawn a new head pair if this regime hasn't been seen before
+            while current_regime_id >= len(model.actor_heads):
+                new_head = model.spawn_head()
+                # Refresh optimizer to include new head parameters
+                optimizer = torch.optim.Adam(model.parameters(), lr=lrnow, eps=1e-5)
+                print(f"[policy] Spawned head {new_head}")
+            model.active_head = current_regime_id
+            print(f"[policy] Regime switch → regime {current_regime_id}, using head {current_regime_id}")
+        prev_regime_id = current_regime_id
 
         logger.scalar("world_model/active_head", world_model.active_head, global_step)
         logger.scalar("world_model/num_heads", len(world_model.state_heads), global_step)
         logger.scalar("world_model/best_head_loss", best_loss, global_step)
+        logger.scalar("policy/active_head", model.active_head, global_step)
+        logger.scalar("policy/num_heads", len(model.actor_heads), global_step)
 
         # Phase B: Update policy on real data
         update_stats = update_policy(buffer, cfg.update_epochs)
@@ -485,16 +479,20 @@ def train_ppo(
             dream_buffer, _ = generate_dream_experience()
             dream_stats = update_policy(dream_buffer, epochs=1)
 
-            # Cross-regime dreaming: dream on all OTHER heads too
-            saved_head = world_model.active_head
+            # Cross-regime dreaming: dream on all OTHER WM heads
+            saved_wm_head = world_model.active_head
+            saved_policy_head = model.active_head
             for head_idx in range(len(world_model.state_heads)):
-                if head_idx == saved_head:
+                if head_idx == saved_wm_head:
                     continue
                 world_model.active_head = head_idx
+                # Route policy through matching head if it exists
+                model.active_head = head_idx % len(model.actor_heads)
                 cross_dream_buffer, _ = generate_dream_experience()
                 cross_stats = update_policy(cross_dream_buffer, epochs=1)
                 dream_stats.extend(cross_stats)
-            world_model.active_head = saved_head  # restore
+            world_model.active_head = saved_wm_head
+            model.active_head = saved_policy_head
 
         # -----------------------------------------------------------------
         # Logging

@@ -124,6 +124,25 @@ class MixtureOfWorldModels(nn.Module):
         else:
             self.steps_under_threshold[idx] = 0
 
+    def get_active_model_unreduced_losses(
+        self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get unreduced (per-transition) loss of the currently active model.
+        Returns a 1D tensor of combined (state + reward) losses of shape (B,).
+        """
+        model = self.models[self.active_regime_id]
+        next_state_indices = torch.argmax(next_state, dim=1)
+
+        with torch.no_grad():
+            next_obs_pred, pred_reward = model(state, action)
+            state_loss = F.cross_entropy(next_obs_pred, next_state_indices, reduction='none')
+            state_loss_per_batch = state_loss.mean(dim=[1, 2])
+            reward_loss = F.mse_loss(pred_reward, reward, reduction='none')
+            loss = state_loss_per_batch + reward_loss
+
+        return loss
+
     def evaluate_all_models(
         self, state: torch.Tensor, action: torch.Tensor, next_state: torch.Tensor, reward: torch.Tensor
     ) -> list[float]:
@@ -146,7 +165,8 @@ class MixtureOfWorldModels(nn.Module):
         return raw_losses
 
     def check_epoch_transition(
-        self, epoch_avg_loss: float, eval_losses: list[float], global_step: int
+        self, epoch_avg_loss: float, eval_losses: list[float], global_step: int,
+        full_buffer_losses: list[float] = None, num_masked: int = None, mask_ratio: float = None
     ) -> tuple[str, int]:
         """
         Epoch-boundary routing decision. Replaces the old per-step Rescue Routing.
@@ -186,6 +206,16 @@ class MixtureOfWorldModels(nn.Module):
             return ("stay", self.active_regime_id)
 
         print(f"\n[MoWM] Surprise detected! Model {self.active_regime_id} epoch loss ({epoch_avg_loss:.4f}) > threshold ({dynamic_threshold:.4f}).")
+
+        if full_buffer_losses is not None and num_masked is not None and mask_ratio is not None:
+            print(f"[MoWM] Masking reveals {num_masked} highly-surprising transitions (Top {mask_ratio*100:g}%).")
+            print("[MoWM] Model Evaluation Comparison:")
+            print("| Model   | Masked Subset Loss | Full Buffer Loss |")
+            print("|---------|--------------------|------------------|")
+            for i in range(len(self.models)):
+                masked_loss = eval_losses[i]
+                full_loss = full_buffer_losses[i]
+                print(f"| Model {i:<1} | {masked_loss:<18.4f} | {full_loss:<16.4f} |")
 
         # Active model is surprised. Find the best alternative.
         best_candidate = min(range(len(self.models)), key=lambda i: eval_losses[i])

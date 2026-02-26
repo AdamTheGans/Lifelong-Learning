@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.0")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.1")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -629,22 +629,76 @@ def train_ppo(
             avg_wm_stats_pre = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
             epoch_avg_loss = avg_wm_stats_pre.get("world_model/loss_total", 0.0)
 
-            # Evaluate all models across the ENTIRE buffer for stable routing
+            # High-Loss Filtering (Surprise Masking)
             eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=False)
-            eval_loss_accum = None
-            num_eval_batches = 0
-            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ in eval_minibatches:
-                batch_losses = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
-                if eval_loss_accum is None:
-                    eval_loss_accum = [0.0] * len(batch_losses)
-                for i, loss in enumerate(batch_losses):
-                    eval_loss_accum[i] += loss
-                num_eval_batches += 1
+            
+            all_obs, all_acts, all_next, all_rews = [], [], [], []
+            all_unreduced_losses = []
+            
+            eval_loss_accum_full = None
+            num_eval_batches_full = 0
 
-            if eval_loss_accum is not None and num_eval_batches > 0:
-                eval_losses = [total / num_eval_batches for total in eval_loss_accum]
+            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _ in eval_minibatches:
+                # 1. Full-buffer evaluation for all models (Observability)
+                batch_losses_full = world_model.evaluate_all_models(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                if eval_loss_accum_full is None:
+                    eval_loss_accum_full = [0.0] * len(batch_losses_full)
+                for i, loss in enumerate(batch_losses_full):
+                    eval_loss_accum_full[i] += loss
+                num_eval_batches_full += 1
+                
+                # 2. Collect active model's unreduced losses for masking
+                unreduced = world_model.get_active_model_unreduced_losses(eval_obs, eval_acts, eval_next, eval_ext_rews)
+                all_unreduced_losses.append(unreduced)
+                
+                all_obs.append(eval_obs)
+                all_acts.append(eval_acts)
+                all_next.append(eval_next)
+                all_rews.append(eval_ext_rews)
+
+            if eval_loss_accum_full is not None and num_eval_batches_full > 0:
+                full_buffer_losses = [total / num_eval_batches_full for total in eval_loss_accum_full]
+                
+                # Concat the full buffer
+                all_obs = torch.cat(all_obs, dim=0)
+                all_acts = torch.cat(all_acts, dim=0)
+                all_next = torch.cat(all_next, dim=0)
+                all_rews = torch.cat(all_rews, dim=0)
+                all_unreduced_losses = torch.cat(all_unreduced_losses, dim=0)
+                
+                # Isolate the anomaly: Top 20% highest-loss transitions
+                num_transitions = all_unreduced_losses.shape[0]
+                mask_ratio = 0.2
+                num_masked = max(1, int(num_transitions * mask_ratio))
+                
+                _, topk_indices = torch.topk(all_unreduced_losses, k=num_masked)
+                
+                masked_obs = all_obs[topk_indices]
+                masked_acts = all_acts[topk_indices]
+                masked_next = all_next[topk_indices]
+                masked_rews = all_rews[topk_indices]
+                
+                # 3. Targeted Evaluation: Evaluate ALL models on the masked high-loss subset
+                eval_loss_accum_masked = [0.0] * len(world_model.models)
+                num_eval_batches_masked = 0
+                
+                for start in range(0, num_masked, cfg.minibatch_size):
+                    end = min(start + cfg.minibatch_size, num_masked)
+                    mb_obs = masked_obs[start:end]
+                    mb_acts = masked_acts[start:end]
+                    mb_next = masked_next[start:end]
+                    mb_rews = masked_rews[start:end]
+                    
+                    batch_losses_masked = world_model.evaluate_all_models(mb_obs, mb_acts, mb_next, mb_rews)
+                    for i, loss in enumerate(batch_losses_masked):
+                        eval_loss_accum_masked[i] += loss
+                    num_eval_batches_masked += 1
+                    
+                eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
+
                 transition_action, target_id = world_model.check_epoch_transition(
-                    epoch_avg_loss, eval_losses, global_step
+                    epoch_avg_loss, eval_losses, global_step,
+                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio
                 )
 
                 if transition_action == "switch":

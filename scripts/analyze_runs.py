@@ -279,6 +279,12 @@ def plot_run(logdir, run_name):
         "active_head": "world_model/active_head",
         "num_heads": "world_model/num_heads",
         "best_head_loss": "world_model/best_head_loss",
+        "ewc_loss": "loss/ewc",
+        "ewc_active": "ewc/active",
+        "policy_active_head": "policy/active_head",
+        "policy_num_heads": "policy/num_heads",
+        "loss_total": "loss/total",
+        "loss_policy": "loss/policy",
     }
     
     data = load_data_from_logdir(logdir, list(tag_map.values()))
@@ -410,6 +416,77 @@ def plot_run(logdir, run_name):
         plt.savefig(out_file, dpi=150)
         plt.close(fig_ah)
         print(f"  📊 Saved active head plot to: {out_file}")
+
+    # 5. EWC Dynamics (3-panel: EWC loss, policy head, EWC active)
+    df_ewc_loss = data.get(tag_map["ewc_loss"])
+    df_ewc_active = data.get(tag_map["ewc_active"])
+    df_policy_head = data.get(tag_map["policy_active_head"])
+    df_policy_nheads = data.get(tag_map["policy_num_heads"])
+    df_loss_policy = data.get(tag_map["loss_policy"])
+    df_loss_total = data.get(tag_map["loss_total"])
+
+    if df_ewc_loss is not None and not df_ewc_loss.empty:
+        out_file = os.path.join(unique_folder, f"ewc_dynamics_{run_name.replace(os.path.sep, '_')}.png")
+        fig_ewc, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True,
+                                      gridspec_kw={'height_ratios': [3, 1, 1]})
+        fig_ewc.suptitle("EWC Dynamics", fontsize=16, fontweight='bold')
+
+        # --- Panel 1: EWC Loss vs Policy Loss ---
+        ax_e = axes[0]
+        smooth_ewc = df_ewc_loss['value'].rolling(window=50, min_periods=1).mean()
+        ax_e.plot(df_ewc_loss['step'], smooth_ewc, color='tab:red', lw=2, label='EWC Penalty (smoothed)', zorder=3)
+        ax_e.plot(df_ewc_loss['step'], df_ewc_loss['value'], color='tab:red', alpha=0.15, lw=0.5)
+        if df_loss_policy is not None and not df_loss_policy.empty:
+            smooth_pg = df_loss_policy['value'].rolling(window=50, min_periods=1).mean()
+            ax_e.plot(df_loss_policy['step'], smooth_pg.abs(), color='tab:blue', lw=1.5, alpha=0.7, label='|Policy Loss| (smoothed)', zorder=2)
+        ax_e.set_ylabel('Loss Magnitude', fontsize=11)
+        ax_e.set_yscale('symlog', linthresh=1e-4)
+        ax_e.legend(fontsize=9, loc='upper right')
+        ax_e.grid(True, linestyle='--', alpha=0.4)
+        ax_e.set_title('EWC Penalty vs Policy Loss', fontsize=12)
+
+        # --- Panel 2: Active Policy Head ---
+        ax_h = axes[1]
+        if df_policy_head is not None and not df_policy_head.empty:
+            ax_h.step(df_policy_head['step'], df_policy_head['value'], color='tab:purple', lw=2, where='post', label='Active Head')
+            ax_h.set_yticks(range(int(df_policy_head['value'].max()) + 1))
+        if df_policy_nheads is not None and not df_policy_nheads.empty:
+            ax_h.step(df_policy_nheads['step'], df_policy_nheads['value'], color='tab:gray', lw=1, ls='--', where='post', label='Total Heads', alpha=0.6)
+        ax_h.set_ylabel('Head', fontsize=11)
+        ax_h.legend(fontsize=9, loc='upper right')
+        ax_h.grid(True, linestyle='--', alpha=0.4)
+        ax_h.set_title('Policy Head Routing', fontsize=12)
+
+        # --- Panel 3: EWC Active Flag ---
+        ax_a = axes[2]
+        if df_ewc_active is not None and not df_ewc_active.empty:
+            ax_a.fill_between(df_ewc_active['step'], 0, df_ewc_active['value'],
+                              step='post', color='tab:green', alpha=0.4, label='EWC Active')
+            ax_a.step(df_ewc_active['step'], df_ewc_active['value'], color='tab:green', lw=1.5, where='post')
+        ax_a.set_yticks([0, 1])
+        ax_a.set_yticklabels(['Inactive', 'Active'])
+        ax_a.set_ylabel('EWC', fontsize=11)
+        ax_a.set_xlabel('Global Steps', fontsize=12)
+        ax_a.grid(True, linestyle='--', alpha=0.4)
+        ax_a.set_title('EWC Activation', fontsize=12)
+
+        # Regime shading on all panels
+        regime_colors = ['#e6f5ff', '#fff5e6']
+        if boundaries:
+            for ax_panel in axes:
+                for i in range(len(boundaries) - 1):
+                    start = boundaries[i]
+                    end = boundaries[i+1]
+                    if start >= max_step: break
+                    if end > max_step: end = max_step
+                    ax_panel.axvspan(start, end, color=regime_colors[i % 2], alpha=0.4, zorder=0)
+                for switch_step in boundaries[1:-1]:
+                    ax_panel.axvline(switch_step, color='black', linestyle='--', linewidth=1.0, alpha=0.6, zorder=2)
+
+        plt.tight_layout()
+        plt.savefig(out_file, dpi=150)
+        plt.close(fig_ewc)
+        print(f"  📊 Saved EWC dynamics plot to: {out_file}")
 
 
     # --- Generate Main Summary Plot (6 panels) ---

@@ -364,8 +364,8 @@ def train_ppo(
     # =========================================================================
 
     # Spawn guards for multi-head routing
-    spawn_warmup = 10     # don't spawn before this many updates
-    spawn_cooldown = 20   # min updates between spawns
+    spawn_warmup = 5     # don't spawn before this many updates
+    spawn_cooldown = 10   # min updates between spawns
     last_spawn_update = -999
     running_reward_loss = 0.0  # tracks baseline reward loss for relative threshold
 

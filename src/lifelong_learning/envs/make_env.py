@@ -7,7 +7,7 @@ from lifelong_learning.envs.regime_wrapper import RegimeGoalSwapWrapper
 from lifelong_learning.envs.wrappers.action_reduce import ActionReduceWrapper
 from lifelong_learning.envs.wrappers.one_hot import OneHotPartialObsWrapper
 
-def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
+def make_env(env_id: str, seed: int, record_stats: bool = True, render_mode: str | None = None, **kwargs):
     """
     Factory for creating a fully-wrapped MiniGrid environment.
 
@@ -17,7 +17,7 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         3. OneHotPartialObsWrapper — symbolic (H,W,3) → one-hot (21,H,W)
         4. RegimeGoalSwapWrapper — non-stationary reward switching
     """
-    env = gym.make(env_id, render_mode=None, max_episode_steps=256)
+    env = gym.make(env_id, render_mode=render_mode, max_episode_steps=256)
 
     # Full observability: PPO sees the entire 8×8 grid
     env = FullyObsWrapper(env)

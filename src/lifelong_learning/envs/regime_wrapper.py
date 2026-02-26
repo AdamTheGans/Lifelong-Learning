@@ -40,6 +40,11 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
             self.regime_id = (self.start_regime + cycle) % 2
 
     def reset(self, **kwargs):
+        # If this is an AutoReset (not the initial reset), it consumes a vector env step tick.
+        # We must increment cumulative_steps so this env doesn't lag behind the global clock.
+        if self.cumulative_steps > 0:
+            self.cumulative_steps += 1
+            
         self._update_regime_deterministic()
         obs, info = self.env.reset(**kwargs)
         info["regime_id"] = self.regime_id

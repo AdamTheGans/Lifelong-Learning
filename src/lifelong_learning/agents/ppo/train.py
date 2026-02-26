@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.9.2")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.3")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)

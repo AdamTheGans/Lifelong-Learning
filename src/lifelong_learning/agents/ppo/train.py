@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.9.1")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.2")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -85,10 +85,10 @@ def train_ppo(
     # Model & Optimizer Setup
     # -------------------------------------------------------------------------
 
-    model = CNNActorCritic(obs_shape, n_actions, max_regimes=2).to(device)
+    model = CNNActorCritic(obs_shape, n_actions, max_regimes=10).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
-    world_model = MixtureOfWorldModels(obs_shape, n_actions, max_regimes=2).to(device)
+    world_model = MixtureOfWorldModels(obs_shape, n_actions, max_regimes=10).to(device)
     wm_optimizers = [torch.optim.Adam(world_model.models[0].parameters(), lr=wm_lr)]
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 

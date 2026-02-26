@@ -271,16 +271,22 @@ class MixtureOfWorldModels(nn.Module):
         if best_candidate != self.active_regime_id:
             best_loss = eval_losses[best_candidate]
             active_loss = eval_losses[self.active_regime_id]
+            ratio = best_loss / active_loss if active_loss > 0 else float('inf')
             abs_ok = best_loss < self.absolute_spawn_threshold
-            rel_ok = active_loss > 0 and best_loss < active_loss * self.rescue_ratio
+            rel_ok = active_loss > 0 and ratio < self.rescue_ratio
+
+            # Always print the routing math so the decision is transparent
+            print(f"[MoWM] Routing Test: Model {best_candidate} loss={best_loss:.4f}, "
+                  f"Active Model {self.active_regime_id} loss={active_loss:.4f}")
+            print(f"[MoWM]   Absolute: {best_loss:.4f} < {self.absolute_spawn_threshold} ? {'PASS' if abs_ok else 'FAIL'}")
+            print(f"[MoWM]   Relative: {ratio:.4f} < {self.rescue_ratio} ? {'PASS' if rel_ok else 'FAIL'}")
+
             if abs_ok or rel_ok:
-                if abs_ok:
-                    reason = "absolute confidence"
-                else:
-                    reason = f"relative dominance ({best_loss/active_loss:.3f} < {self.rescue_ratio})"
-                print(f"[MoWM] Veteran rescue ({reason}): Model {best_candidate} "
-                      f"(loss: {best_loss:.4f}) beats active Model {self.active_regime_id} (loss: {active_loss:.4f}).")
+                reason = "absolute confidence" if abs_ok else f"relative dominance (ratio={ratio:.3f})"
+                print(f"[MoWM] → Veteran rescue ({reason}): switching to Model {best_candidate}.")
                 return ("switch", best_candidate)
+            else:
+                print(f"[MoWM] → No veteran viable. Spawning new model.")
 
         return ("spawn", -1)
 

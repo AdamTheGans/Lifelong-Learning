@@ -126,38 +126,51 @@ class BrainRolloutBuffer:
         self.values.append(value)
         self.dones.append(done)
 
-    def compute_returns_and_advantages(self, last_value: float, gamma: float, gae_lambda: float):
+    def compute_returns_and_advantages(self, last_values: np.ndarray, gamma: float, gae_lambda: float):
         """Compute GAE advantages for the collected trajectory."""
-        T = len(self.rewards)
-        advantages = np.zeros(T, dtype=np.float32)
-        returns = np.zeros(T, dtype=np.float32)
+        rewards = np.array(self.rewards, dtype=np.float32)
+        values = np.array(self.values, dtype=np.float32)
+        dones = np.array(self.dones, dtype=np.float32)
 
-        last_adv = 0.0
+        T = len(rewards)
+        num_envs = rewards.shape[1] if len(rewards.shape) > 1 else 1
+
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        returns = np.zeros_like(rewards, dtype=np.float32)
+
+        last_adv = np.zeros(num_envs, dtype=np.float32)
         for t in reversed(range(T)):
             if t == T - 1:
-                next_value = last_value
-                next_nonterminal = 1.0 - self.dones[t]
+                next_value = last_values
+                next_nonterminal = 1.0 - dones[t]
             else:
-                next_value = self.values[t + 1]
-                next_nonterminal = 1.0 - self.dones[t]
+                next_value = values[t + 1]
+                next_nonterminal = 1.0 - dones[t]
 
-            delta = self.rewards[t] + gamma * next_value * next_nonterminal - self.values[t]
+            delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
             last_adv = delta + gamma * gae_lambda * next_nonterminal * last_adv
             advantages[t] = last_adv
 
-        returns = advantages + np.array(self.values, dtype=np.float32)
+        returns = advantages + values
         self._advantages = advantages
         self._returns = returns
 
     def get_batches(self, device: torch.device):
-        """Return all data as tensors for PPO update."""
+        """Return all data as flattened tensors for PPO update."""
+        obs = np.array(self.obs, dtype=np.float32).reshape(-1, NUM_SIGNALS)
+        actions = np.array(self.actions, dtype=np.float32).reshape(-1, 4)
+        log_probs = np.array(self.log_probs, dtype=np.float32).reshape(-1)
+        advantages = self._advantages.reshape(-1)
+        returns = self._returns.reshape(-1)
+        values = np.array(self.values, dtype=np.float32).reshape(-1)
+
         return {
-            "obs": torch.tensor(np.array(self.obs), dtype=torch.float32, device=device),
-            "actions": torch.tensor(np.array(self.actions), dtype=torch.float32, device=device),
-            "log_probs": torch.tensor(np.array(self.log_probs), dtype=torch.float32, device=device),
-            "advantages": torch.tensor(self._advantages, dtype=torch.float32, device=device),
-            "returns": torch.tensor(self._returns, dtype=torch.float32, device=device),
-            "values": torch.tensor(np.array(self.values), dtype=torch.float32, device=device),
+            "obs": torch.tensor(obs, device=device),
+            "actions": torch.tensor(actions, device=device),
+            "log_probs": torch.tensor(log_probs, device=device),
+            "advantages": torch.tensor(advantages, device=device),
+            "returns": torch.tensor(returns, device=device),
+            "values": torch.tensor(values, device=device),
         }
 
     def clear(self):

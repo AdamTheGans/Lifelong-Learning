@@ -21,7 +21,7 @@ from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
-from lifelong_learning.utils.logger import TBLogger
+from lifelong_learning.utils.logger import DataLogger
 from lifelong_learning.envs.make_env import make_env
 
 
@@ -76,7 +76,7 @@ class InnerTrainState:
     outcome_window: deque = field(default_factory=lambda: deque(maxlen=100))
 
     # --- Logger ---
-    logger: TBLogger = field(default=None, repr=False)
+    logger: DataLogger = field(default=None, repr=False)
     run_name: str = ""
 
     # --- Checkpointing ---
@@ -181,7 +181,7 @@ def init_inner_training(
     if run_name is None:
         run_name = f"ppo_{env_id}_s{cfg.seed}"
 
-    logger = TBLogger(run_name=run_name, log_dir=log_dir)
+    logger = DataLogger(run_name=run_name, log_dir=log_dir)
     os.makedirs(save_dir, exist_ok=True)
 
     obs, info = envs.reset(seed=cfg.seed)

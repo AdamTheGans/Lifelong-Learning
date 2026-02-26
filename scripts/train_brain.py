@@ -2,16 +2,20 @@
 Training script for the Brain meta-agent.
 
 Usage:
-    python scripts/train_brain.py --inner_total_timesteps 250000 --brain_episodes 50
+    python scripts/train_brain.py --inner_total_timesteps 150000 --brain_episodes 50
 """
 from __future__ import annotations
 
+import os
 import argparse
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
+import gymnasium as gym
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig
+from lifelong_learning.agents.brain.signals import NUM_SIGNALS
 from lifelong_learning.agents.brain.meta_env import MetaEnv
 from lifelong_learning.agents.brain.meta_agent import (
     MLPActorCritic,
@@ -19,7 +23,7 @@ from lifelong_learning.agents.brain.meta_agent import (
     BrainRolloutBuffer,
     brain_ppo_update,
 )
-from lifelong_learning.utils.logger import TBLogger
+from lifelong_learning.utils.logger import DataLogger
 
 
 def train_brain(args):
@@ -29,33 +33,43 @@ def train_brain(args):
     # Inner agent config (passed to MetaEnv)
     # -----------------------------------------------------------------
     inner_cfg = PPOConfig(
+        seed=args.seed,
         total_timesteps=args.inner_total_timesteps,
         num_envs=args.inner_num_envs,
         num_steps=args.inner_num_steps,
-        seed=args.seed,
-        device=args.device,
         mode=args.inner_mode,
+        device=device,
+        # Default starting values (Brain will override these)
+        lr=3e-4,
+        ent_coef=0.01,
     )
 
     # -----------------------------------------------------------------
-    # Meta-environment
+    # Meta-environment Vectorization
     # -----------------------------------------------------------------
-    logger = TBLogger(run_name=args.run_name or "brain_training")
+    logger = DataLogger(run_name=args.run_name or "brain_training")
 
-    meta_env = MetaEnv(
-        env_id=args.env_id,
-        inner_cfg=inner_cfg,
-        decision_interval=args.decision_interval,
-        steps_per_regime=args.inner_steps_per_regime,
-        start_regime=0,
-        reward_alpha=args.reward_alpha,
-        reward_beta=args.reward_beta,
-        anneal_lr=False,  # Brain controls LR
-        intrinsic_coef=args.inner_intrinsic_coef,
-        imagined_horizon=args.inner_imagined_horizon,
-        wm_lr=args.inner_wm_lr,
-        inner_log_dir=logger.full_dir,
-    )
+    def get_env_maker(log_dir_str, env_idx):
+        def _make_env_fn():
+            return MetaEnv(
+                env_id=args.env_id,
+                inner_cfg=inner_cfg,
+                decision_interval=args.decision_interval,
+                steps_per_regime=args.inner_steps_per_regime,
+                start_regime=0,
+                reward_alpha=args.reward_alpha,
+                reward_beta=args.reward_beta,
+                anneal_lr=False,  # Brain controls LR
+                intrinsic_coef=args.inner_intrinsic_coef,
+                imagined_horizon=args.inner_imagined_horizon,
+                wm_lr=args.inner_wm_lr,
+                inner_log_dir=log_dir_str,
+                env_index=env_idx,
+            )
+        return _make_env_fn
+
+    # Note: SyncVectorEnv blocks on inner updates, running them sequentially but returning batched results
+    meta_env = gym.vector.SyncVectorEnv([get_env_maker(logger.full_dir, i) for i in range(args.brain_num_envs)])
 
     # -----------------------------------------------------------------
     # Brain agent
@@ -69,54 +83,140 @@ def train_brain(args):
     brain_model = MLPActorCritic().to(device)
     brain_optimizer = torch.optim.Adam(brain_model.parameters(), lr=brain_cfg.lr, eps=1e-5)
 
-    # logger already created above, before MetaEnv
-
-    # -----------------------------------------------------------------
-    # Training loop: each episode = one full inner training run
-    # -----------------------------------------------------------------
-    print(f"Training Brain on {device} for {brain_cfg.brain_episodes} episodes")
+    print(f"Training Brain on {device} for {brain_cfg.brain_episodes} RL episodes")
     print(f"  Inner: {args.inner_total_timesteps} timesteps, "
           f"regime switch every {args.inner_steps_per_regime} steps")
+    print(f"  Parallel Envs: {args.brain_num_envs}")
     print(f"  Decision interval: {args.decision_interval} inner updates")
 
+    # -----------------------------------------------------------------
+    # Imitation Learning: Pretraining
+    # -----------------------------------------------------------------
+    if args.pretrain_episodes > 0:
+        print(f"\n--- Starting Imitation Learning Pretraining for {args.pretrain_episodes} episodes ---")
+        for pre_ep in range(1, args.pretrain_episodes + 1):
+            ep_start = time.time()
+            obs, info = meta_env.reset()
+            steps = 0
+            
+            # Since all vectorized inner envs step synchronously and have deterministic max steps,
+            # they will all return True for done at the exact same time.
+            while True:
+                # Observation shape: [num_envs, 15]
+                # Index 1 is success_rate (from signals.py)
+                success_rates = obs[:, 1]
+                
+                target_actions = np.zeros((args.brain_num_envs, 4), dtype=np.float32)
+                for i in range(args.brain_num_envs):
+                    if success_rates[i] < 0.5:
+                        # Explore: increase lr, ent, curiosity; decrease horizon slightly or keep 0
+                        target_actions[i] = [0.5, 0.5, 0.5, 0.0]
+                    else:
+                        # Exploit: decrease lr, ent, curiosity; 
+                        target_actions[i] = [-0.5, -0.5, -0.5, 0.0]
+
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+                target_a_t = torch.tensor(target_actions, dtype=torch.float32, device=device)
+
+                # MSE Loss for pretraining
+                action_mean, value = brain_model.forward(obs_t)
+                loss = F.mse_loss(action_mean, target_a_t)
+
+                brain_optimizer.zero_grad()
+                loss.backward()
+                brain_optimizer.step()
+
+                next_obs, rewards, terminations, truncations, infos = meta_env.step(target_actions)
+                obs = next_obs
+                steps += 1
+
+                if terminations.any() or truncations.any():
+                    break
+                    
+            ep_time = time.time() - ep_start
+            print(f"Pretrain Episode {pre_ep}/{args.pretrain_episodes} | steps={steps} | time={ep_time:.1f}s | last_loss={loss.item():.4f}")
+
+    # -----------------------------------------------------------------
+    # Training loop: RL
+    # -----------------------------------------------------------------
+    print("\n--- Starting Meta-RL PPO Training ---")
     all_episode_rewards = []
 
     for episode in range(1, brain_cfg.brain_episodes + 1):
         ep_start = time.time()
         rollout = BrainRolloutBuffer()
-        total_reward = 0.0
+        total_rewards = np.zeros(args.brain_num_envs, dtype=np.float32)
         steps = 0
+        
+        episode_lrs = []
+        episode_ent_coefs = []
+        episode_intrinsic_coefs = []
+        episode_horizons = []
+        
+        episode_action_lrs = []
+        episode_action_ents = []
+        episode_action_intrs = []
+        episode_action_horizons = []
 
         obs, info = meta_env.reset()
 
         while True:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 action, log_prob, entropy, value = brain_model.act(obs_t)
 
-            action_np = action.squeeze(0).cpu().numpy()
-            next_obs, reward, terminated, truncated, info = meta_env.step(action_np)
+            action_np = action.cpu().numpy() # Shape: [num_envs, 4]
+            next_obs, rewards, terminations, truncations, infos = meta_env.step(action_np)
+            
+            # Track inner hyperparameter stats from envs
+            if "inner_stats" in infos:
+                inner_stats = infos["inner_stats"]
+                if isinstance(inner_stats, dict) and "current_lr" in inner_stats:
+                    # SyncVectorEnv batches dicts so that value is an array
+                    episode_lrs.append(float(np.mean(inner_stats.get("current_lr", 0.0))))
+                    episode_ent_coefs.append(float(np.mean(inner_stats.get("current_ent_coef", 0.0))))
+                    episode_intrinsic_coefs.append(float(np.mean(inner_stats.get("current_intrinsic_coef", 0.0))))
+                    episode_horizons.append(float(np.mean(inner_stats.get("current_imagined_horizon", 0.0))))
+                elif isinstance(inner_stats, (list, tuple)):
+                    lrs = [s.get("current_lr", 0.0) for s in inner_stats if isinstance(s, dict) and "current_lr" in s]
+                    if lrs: episode_lrs.append(float(np.mean(lrs)))
+                    ents = [s.get("current_ent_coef", 0.0) for s in inner_stats if isinstance(s, dict) and "current_ent_coef" in s]
+                    if ents: episode_ent_coefs.append(float(np.mean(ents)))
+                    intrs = [s.get("current_intrinsic_coef", 0.0) for s in inner_stats if isinstance(s, dict) and "current_intrinsic_coef" in s]
+                    if intrs: episode_intrinsic_coefs.append(float(np.mean(intrs)))
+                    horz = [s.get("current_imagined_horizon", 0.0) for s in inner_stats if isinstance(s, dict) and "current_imagined_horizon" in s]
+                    if horz: episode_horizons.append(float(np.mean(horz)))
+                
+            # Track average Brain action taken
+            episode_action_lrs.append(float(np.mean(action_np[:, 0])))
+            episode_action_ents.append(float(np.mean(action_np[:, 1])))
+            episode_action_intrs.append(float(np.mean(action_np[:, 2])))
+            episode_action_horizons.append(float(np.mean(action_np[:, 3])))
 
+            # Store batched experience
+            dones = (terminations | truncations).astype(np.float32)
             rollout.add(
                 obs=obs,
                 action=action_np,
-                log_prob=log_prob.item(),
-                reward=reward,
-                value=value.item(),
-                done=float(terminated or truncated),
+                log_prob=log_prob.cpu().numpy(),
+                reward=rewards,
+                value=value.cpu().numpy(),
+                done=dones,
             )
 
-            total_reward += reward
+            total_rewards += rewards
             steps += 1
             obs = next_obs
 
-            if terminated or truncated:
+            # All inner runs share the exact same lifespan configured by inner_total_timesteps
+            if dones.any():
                 break
 
         # Compute advantages
+        # Since episode just ended, next value is exactly 0
         rollout.compute_returns_and_advantages(
-            last_value=0.0,  # Episode ended
+            last_values=np.zeros(args.brain_num_envs, dtype=np.float32),
             gamma=brain_cfg.gamma,
             gae_lambda=brain_cfg.gae_lambda,
         )
@@ -125,12 +225,13 @@ def train_brain(args):
         batch = rollout.get_batches(device)
         update_stats = brain_ppo_update(brain_model, brain_optimizer, batch, brain_cfg)
 
-        # Log
+        # Log Mean across vector environments
         ep_time = time.time() - ep_start
-        all_episode_rewards.append(total_reward)
-        avg_reward_10 = np.mean(all_episode_rewards[-10:])
+        mean_reward_across_envs = float(np.mean(total_rewards))
+        all_episode_rewards.append(mean_reward_across_envs)
+        avg_reward_10 = float(np.mean(all_episode_rewards[-10:]))
 
-        logger.scalar("brain/episode_reward", total_reward, episode)
+        logger.scalar("brain/episode_reward", mean_reward_across_envs, episode)
         logger.scalar("brain/episode_steps", steps, episode)
         logger.scalar("brain/episode_time_s", ep_time, episode)
         logger.scalar("brain/avg_reward_10ep", avg_reward_10, episode)
@@ -138,38 +239,59 @@ def train_brain(args):
         for k, v in update_stats.items():
             logger.scalar(k, v, episode)
 
-        # Log HP trajectories from last inner stats
-        inner_stats = info.get("inner_stats", {})
-        logger.scalar("brain/inner_final_success_rate", inner_stats.get("success_rate", 0.0), episode)
-        logger.scalar("brain/inner_final_lr", inner_stats.get("current_lr", 0.0), episode)
-        logger.scalar("brain/inner_final_ent_coef", inner_stats.get("current_ent_coef", 0.0), episode)
-        logger.scalar("brain/inner_final_intrinsic_coef", inner_stats.get("current_intrinsic_coef", 0.0), episode)
-        logger.scalar("brain/inner_final_imagined_horizon", inner_stats.get("current_imagined_horizon", 0.0), episode)
+        # Log mean episodic action choices
+        if episode_action_lrs:
+            logger.scalar("brain_action/mean_lr_adjustment", float(np.mean(episode_action_lrs)), episode)
+            logger.scalar("brain_action/mean_ent_adjustment", float(np.mean(episode_action_ents)), episode)
+            logger.scalar("brain_action/mean_intrinsic_adjustment", float(np.mean(episode_action_intrs)), episode)
+            logger.scalar("brain_action/mean_horizon_adjustment", float(np.mean(episode_action_horizons)), episode)
+
+        # Log mean inner hyperparameters actually realized during the episode
+        if episode_lrs:
+            logger.scalar("brain_hyperparams/mean_inner_lr", float(np.mean(episode_lrs)), episode)
+        if episode_ent_coefs:
+            logger.scalar("brain_hyperparams/mean_inner_ent_coef", float(np.mean(episode_ent_coefs)), episode)
+        if episode_intrinsic_coefs:
+            logger.scalar("brain_hyperparams/mean_inner_intrinsic_coef", float(np.mean(episode_intrinsic_coefs)), episode)
+        if episode_horizons:
+            logger.scalar("brain_hyperparams/mean_inner_imagined_horizon", float(np.mean(episode_horizons)), episode)
+
+        # Extract final inner training metrics from the first environment
+        final_info = infos.get("final_info", [{}])[0]
+        if final_info and "inner_stats" in final_info:
+            inner_stats = final_info["inner_stats"]
+            logger.scalar("brain/inner_final_success_rate", inner_stats.get("success_rate", 0.0), episode)
 
         print(f"Episode {episode}/{brain_cfg.brain_episodes} | "
-              f"reward={total_reward:.4f} | avg10={avg_reward_10:.4f} | "
+              f"reward={mean_reward_across_envs:.4f} | avg10={avg_reward_10:.4f} | "
               f"steps={steps} | time={ep_time:.1f}s")
+              
+    # Generate final overall Brain trend charts
+    plot_dir = os.path.join(logger.full_dir, "brain_trends")
+    logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
 
     meta_env.close()
     logger.close()
-    print(f"\nBrain training complete. Total episodes: {brain_cfg.brain_episodes}")
+    print(f"\nBrain training complete. Total RL episodes: {brain_cfg.brain_episodes}")
 
 
 def main():
     p = argparse.ArgumentParser(description="Train the Brain meta-agent")
 
     # Inner agent settings
-    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-8x8-v0")
-    p.add_argument("--inner_total_timesteps", type=int, default=250_000)
+    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-5x5-v0")
+    p.add_argument("--inner_total_timesteps", type=int, default=150_000)
     p.add_argument("--inner_num_envs", type=int, default=8)
     p.add_argument("--inner_num_steps", type=int, default=128)
-    p.add_argument("--inner_steps_per_regime", type=int, default=15000)
+    p.add_argument("--inner_steps_per_regime", type=int, default=None)
     p.add_argument("--inner_mode", type=str, default="dyna", choices=["dyna", "passive"])
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
     p.add_argument("--inner_imagined_horizon", type=int, default=10)
     p.add_argument("--inner_wm_lr", type=float, default=1e-4)
 
     # Brain meta-agent settings
+    p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")
+    p.add_argument("--pretrain_episodes", type=int, default=5, help="Number of Imitation Learning pretrain episodes")
     p.add_argument("--brain_episodes", type=int, default=50)
     p.add_argument("--brain_lr", type=float, default=3e-4)
     p.add_argument("--decision_interval", type=int, default=10,

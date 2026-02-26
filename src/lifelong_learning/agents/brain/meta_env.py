@@ -6,6 +6,8 @@ N inner PPO updates and returns training signals as observations.
 """
 from __future__ import annotations
 
+import copy
+import os
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -53,9 +55,11 @@ class MetaEnv(gym.Env):
         imagined_horizon: int = 10,
         wm_lr: float = 1e-4,
         inner_log_dir: str | None = None,
+        env_index: int = 0,
     ):
         super().__init__()
 
+        self.env_index = env_index
         self.env_id = env_id
         self.inner_cfg = inner_cfg or PPOConfig()
         self.decision_interval = decision_interval
@@ -97,13 +101,20 @@ class MetaEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        self.start_regime = int(self.np_random.integers(0, 2))
 
         # Clean up any previous inner training
         if self._state is not None:
+            # Generate plots for every single inner agent episode into its own specific run folder
+            if self._episode_counter > 0:
+                if hasattr(self._state, 'logger') and hasattr(self._state.logger, 'plot'):
+                    # Save the plot directly in the agent's unique run directory rather than a shared folder
+                    plot_dir = self._state.logger.full_dir if hasattr(self._state.logger, 'full_dir') else os.path.join(self.inner_log_dir or "runs", "inner_agent_charts")
+                    self._state.logger.plot(save_dir=plot_dir, title=f"Inner Agent: Ep {self._episode_counter} | Env {self.env_index}")
             close_inner_training(self._state)
 
         self._episode_counter += 1
-        run_name = self.inner_run_name or f"brain_inner_ep{self._episode_counter}"
+        run_name = self.inner_run_name or f"ep{self._episode_counter}_env{self.env_index}"
 
         init_kwargs = dict(
             env_id=self.env_id,
@@ -152,11 +163,8 @@ class MetaEnv(gym.Env):
         mean_return = stats.get("mean_episodic_return", 0.0)
         failure_rate = stats.get("failure_rate", 0.0)
 
-        delta_success = success_rate - self._prev_success_rate
-        delta_return = mean_return - self._prev_mean_return
-        delta_failure = failure_rate - self._prev_failure_rate
-
-        reward = delta_success + self.reward_alpha * delta_return - self.reward_beta * delta_failure
+        # Compute absolute reward (AUC proxy over the episode)
+        reward = success_rate + self.reward_alpha * mean_return - self.reward_beta * failure_rate
 
         self._prev_success_rate = success_rate
         self._prev_mean_return = mean_return
@@ -220,5 +228,10 @@ class MetaEnv(gym.Env):
 
     def close(self):
         if self._state is not None:
+            if self._episode_counter > 0:
+                if hasattr(self._state, 'logger') and hasattr(self._state.logger, 'plot'):
+                    plot_dir = self._state.logger.full_dir if hasattr(self._state.logger, 'full_dir') else os.path.join(self.inner_log_dir or "runs", "inner_agent_charts")
+                    self._state.logger.plot(save_dir=plot_dir, title=f"Inner Agent: Ep {self._episode_counter} | Env {self.env_index}")
             close_inner_training(self._state)
             self._state = None
+        super().close()

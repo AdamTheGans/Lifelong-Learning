@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.7")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.8")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -508,14 +508,15 @@ def train_ppo(
 
         return active_wm_stats if active_wm_stats else [{"world_model/loss_total": 0.0, "world_model/loss_state": 0.0, "world_model/loss_reward": 0.0}]
 
-    def generate_dream_experience(reservoir, min_states=16):
+    def generate_dream_experience(reservoir, dream_regime_id=None, min_states=16):
         """Phase C: Generate imagined trajectories using WM as simulator."""
         num_models = len(world_model.models)
-        if num_models > 1:
-            inactive_regimes = [i for i in range(num_models) if i != world_model.active_regime_id]
-            dream_regime_id = inactive_regimes[torch.randint(0, len(inactive_regimes), (1,)).item()]
-        else:
-            dream_regime_id = world_model.active_regime_id
+        if dream_regime_id is None:
+            if num_models > 1:
+                inactive_regimes = [i for i in range(num_models) if i != world_model.active_regime_id]
+                dream_regime_id = inactive_regimes[torch.randint(0, len(inactive_regimes), (1,)).item()]
+            else:
+                dream_regime_id = world_model.active_regime_id
             
         dream_regime_tensor = torch.full((num_envs,), dream_regime_id, dtype=torch.long, device=device)
 
@@ -840,9 +841,30 @@ def train_ppo(
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
         if cfg.mode == "dyna" and imagined_horizon > 0:
-            current_dreaming_ratio = 1.0 if len(world_model.models) > 1 else 0.25
-            num_dream_rollouts = int(max(1, cfg.num_steps // imagined_horizon) * current_dreaming_ratio)
-            if num_dream_rollouts > 0:
+            num_models = len(world_model.models)
+            inactive_regimes = [i for i in range(num_models) if i != world_model.active_regime_id]
+
+            if len(inactive_regimes) > 0:
+                # Dynamic ratio: target ~30% of total batch as dream data
+                # real = num_steps * num_envs, dream_per_rollout = horizon * num_envs
+                # target: dream_total / (real + dream_total) = 0.30
+                # → dream_total = 0.30/0.70 * real
+                real_transitions = cfg.num_steps * num_envs
+                dream_target = 0.30 / 0.70 * real_transitions
+                transitions_per_rollout = imagined_horizon * num_envs
+                total_dream_rollouts = max(1, int(dream_target / transitions_per_rollout))
+
+                # Distribute equally across inactive regimes
+                rollouts_per_regime = max(1, total_dream_rollouts // len(inactive_regimes))
+
+                for regime_id in inactive_regimes:
+                    for _ in range(rollouts_per_regime):
+                        db, _ = generate_dream_experience(state_reservoir, dream_regime_id=regime_id)
+                        if db is not None:
+                            dream_buffers.append(db)
+            else:
+                # Only 1 model: light dreaming for exploration
+                num_dream_rollouts = max(1, int(cfg.num_steps // imagined_horizon * 0.25))
                 for _ in range(num_dream_rollouts):
                     db, _ = generate_dream_experience(state_reservoir)
                     if db is not None:

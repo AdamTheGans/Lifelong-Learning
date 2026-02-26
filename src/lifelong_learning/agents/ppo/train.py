@@ -18,6 +18,7 @@ from collections import deque
 from lifelong_learning.agents.ppo.ppo import PPOConfig, ppo_update
 from lifelong_learning.agents.ppo.network import CNNActorCritic
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
+from lifelong_learning.agents.ppo.ewc import EWC
 
 from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.utils.seeding import seed_everything
@@ -43,6 +44,7 @@ def train_ppo(
     wm_lr: float = 1e-4,
     surprise_threshold: float = 0.1,
     max_heads: int = 4,
+    ewc_lambda: float = 1000.0,
 ):
     """
     Main Dyna-PPO training loop.
@@ -84,6 +86,7 @@ def train_ppo(
     # Shared-trunk multi-head network (shared CNN, per-regime actor/critic heads)
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
+    ewc = EWC(model, device, param_prefix="encoder.")
 
     world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
     wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
@@ -352,7 +355,7 @@ def train_ppo(
             minibatches = target_buffer.get_minibatches(cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
                 ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-                stats = ppo_update(model, optimizer, [ppo_batch], cfg)
+                stats = ppo_update(model, optimizer, [ppo_batch], cfg, ewc=ewc, ewc_lambda=ewc_lambda)
                 update_stats.append(stats)
         return update_stats
 
@@ -429,6 +432,11 @@ def train_ppo(
         else:
             current_regime_id = 0
         if current_regime_id != prev_regime_id and prev_regime_id >= 0:
+            # EWC: snapshot Fisher on encoder before switching
+            flat_obs = buffer.obs.reshape(-1, *obs_shape)
+            flat_actions = buffer.actions.reshape(-1)
+            ewc.update(model, flat_obs, flat_actions)
+            print(f"[ewc] Fisher updated on regime switch {prev_regime_id} → {current_regime_id} (lambda={ewc_lambda})")
             # Spawn a new head pair if this regime hasn't been seen before
             while current_regime_id >= len(model.actor_heads):
                 new_head = model.spawn_head()
@@ -444,6 +452,7 @@ def train_ppo(
         logger.scalar("world_model/best_head_loss", best_loss, global_step)
         logger.scalar("policy/active_head", model.active_head, global_step)
         logger.scalar("policy/num_heads", len(model.actor_heads), global_step)
+        logger.scalar("ewc/active", float(ewc.is_active), global_step)
 
         # Phase B: Update policy on real data
         update_stats = update_policy(buffer, cfg.update_epochs)

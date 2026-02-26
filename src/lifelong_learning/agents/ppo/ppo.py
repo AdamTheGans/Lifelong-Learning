@@ -33,7 +33,7 @@ def ppo_update(
     minibatches,
     cfg: PPOConfig,
     ewc=None,
-    ewc_coef: float = 0.0,
+    ewc_lambda: float = 0.0,
 ):
     """
     Performs one round of PPO clipped updates over the given minibatches.
@@ -71,11 +71,11 @@ def ppo_update(
 
         loss = pg_loss - cfg.ent_coef * ent_loss + cfg.vf_coef * v_loss
 
-        # EWC penalty (discourages forgetting previous regimes)
-        ewc_loss = torch.tensor(0.0)
-        if ewc is not None and ewc.is_active and ewc_coef > 0:
-            ewc_loss = ewc.penalty(model)
-            loss = loss + ewc_coef * ewc_loss
+        # EWC penalty: protect shared encoder from drifting
+        if ewc is not None and ewc.is_active and ewc_lambda > 0:
+            ewc_pen = ewc_lambda * ewc.penalty(model)
+            loss = loss + ewc_pen
+            total_ewc += float(ewc_pen.detach().cpu())
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -86,14 +86,13 @@ def ppo_update(
         total_v += float(v_loss.detach().cpu())
         total_ent += float(ent_loss.detach().cpu())
         total_loss += float(loss.detach().cpu())
-        total_ewc += float(ewc_loss.detach().cpu())
         n += 1
 
     return {
         "loss/policy": total_pg / max(n, 1),
         "loss/value": total_v / max(n, 1),
         "loss/entropy": total_ent / max(n, 1),
-        "loss/total": total_loss / max(n, 1),
         "loss/ewc": total_ewc / max(n, 1),
+        "loss/total": total_loss / max(n, 1),
     }
 

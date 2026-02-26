@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.8")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.0")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -646,9 +646,10 @@ def train_ppo(
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
         # Phase A.5: Pre-Training Evaluation Pass (BEFORE training corrupts the model)
-        # Compute unreduced losses with the clean model to get an unbiased surprise signal.
-        # These are cached for use in Phase B.5 routing.
-        cached_pre_training = None
+        # Evaluate first, route second, train third. All candidate scoring uses
+        # uncorrupted (pre-training) weights so the "fair fight" comparison is clean.
+        spawn_occurred = False
+        pre_training_epoch_loss = None
         if not oracle_mode:
             pre_eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=False)
 
@@ -679,196 +680,185 @@ def train_ppo(
                     pre_all_rews.append(v_rews)
 
             if pre_loss_count > 0:
-                cached_pre_training = {
-                    "all_obs": torch.cat(pre_all_obs, dim=0),
-                    "all_acts": torch.cat(pre_all_acts, dim=0),
-                    "all_next": torch.cat(pre_all_next, dim=0),
-                    "all_rews": torch.cat(pre_all_rews, dim=0),
-                    "all_unreduced_losses": torch.cat(pre_all_unreduced_losses, dim=0),
-                    "epoch_avg_loss": pre_loss_sum / pre_loss_count,
-                }
+                all_obs = torch.cat(pre_all_obs, dim=0)
+                all_acts = torch.cat(pre_all_acts, dim=0)
+                all_next = torch.cat(pre_all_next, dim=0)
+                all_rews = torch.cat(pre_all_rews, dim=0)
+                all_unreduced_losses = torch.cat(pre_all_unreduced_losses, dim=0)
+                epoch_avg_loss = pre_loss_sum / pre_loss_count
+                pre_training_epoch_loss = epoch_avg_loss
 
-        # Phase B: Train World Model (trains on freshly collected buffer)
-        wm_stats = update_world_model()
+                # Full-buffer evaluation (pre-training weights — clean, unbiased)
+                eval_loss_accum_full = [0.0] * len(world_model.models)
+                num_eval_batches_full = 0
+                for start in range(0, all_obs.shape[0], cfg.minibatch_size):
+                    end = min(start + cfg.minibatch_size, all_obs.shape[0])
+                    batch_losses_full = world_model.evaluate_all_models(
+                        all_obs[start:end], all_acts[start:end], all_next[start:end], all_rews[start:end]
+                    )
+                    for i, loss in enumerate(batch_losses_full):
+                        eval_loss_accum_full[i] += loss
+                    num_eval_batches_full += 1
 
-        # Phase B.5: Epoch Boundary Routing (uses CACHED pre-training losses)
-        spawn_occurred = False
-        if not oracle_mode and cached_pre_training is not None:
-            # Use the clean, pre-training epoch average loss for threshold comparison
-            epoch_avg_loss = cached_pre_training["epoch_avg_loss"]
+                full_buffer_losses = [total / max(1, num_eval_batches_full) for total in eval_loss_accum_full]
 
-            all_obs = cached_pre_training["all_obs"]
-            all_acts = cached_pre_training["all_acts"]
-            all_next = cached_pre_training["all_next"]
-            all_rews = cached_pre_training["all_rews"]
-            all_unreduced_losses = cached_pre_training["all_unreduced_losses"]
+                # Isolate the anomaly: Absolute Threshold Masking (pre-training losses)
+                # Only select transitions where the active model's loss exceeds the dynamic
+                # surprise threshold, filtering out "normally hard" navigation noise.
+                num_transitions = all_unreduced_losses.shape[0]
+                active_ema = world_model.ema_losses[world_model.active_regime_id]
+                dynamic_threshold = max(active_ema, world_model.anomaly_floor) * world_model.anomaly_multiplier
 
-            # Full-buffer evaluation (post-training weights, for observability table)
-            eval_loss_accum_full = [0.0] * len(world_model.models)
-            num_eval_batches_full = 0
-            for start in range(0, all_obs.shape[0], cfg.minibatch_size):
-                end = min(start + cfg.minibatch_size, all_obs.shape[0])
-                batch_losses_full = world_model.evaluate_all_models(
-                    all_obs[start:end], all_acts[start:end], all_next[start:end], all_rews[start:end]
-                )
-                for i, loss in enumerate(batch_losses_full):
-                    eval_loss_accum_full[i] += loss
-                num_eval_batches_full += 1
+                threshold_mask = all_unreduced_losses > dynamic_threshold
+                masked_indices = torch.where(threshold_mask)[0]
 
-            full_buffer_losses = [total / max(1, num_eval_batches_full) for total in eval_loss_accum_full]
+                # Fallback: if no transitions exceed threshold, use topk(50) as safety net
+                if len(masked_indices) == 0:
+                    fallback_k = min(50, num_transitions)
+                    _, masked_indices = torch.topk(all_unreduced_losses, k=fallback_k)
+                    masking_method = f"fallback topk({fallback_k})"
+                else:
+                    masking_method = f"threshold (>{dynamic_threshold:.4f})"
 
-            # Isolate the anomaly: Absolute Threshold Masking (from PRE-TRAINING losses)
-            # Only select transitions where the active model's loss exceeds the dynamic
-            # surprise threshold, filtering out "normally hard" navigation noise.
-            num_transitions = all_unreduced_losses.shape[0]
-            active_ema = world_model.ema_losses[world_model.active_regime_id]
-            dynamic_threshold = max(active_ema, world_model.anomaly_floor) * world_model.anomaly_multiplier
+                num_masked = len(masked_indices)
+                mask_ratio = num_masked / num_transitions
 
-            threshold_mask = all_unreduced_losses > dynamic_threshold
-            masked_indices = torch.where(threshold_mask)[0]
+                masked_obs = all_obs[masked_indices]
+                masked_acts = all_acts[masked_indices]
+                masked_next = all_next[masked_indices]
+                masked_rews = all_rews[masked_indices]
 
-            # Fallback: if no transitions exceed threshold, use topk(50) as safety net
-            if len(masked_indices) == 0:
-                fallback_k = min(50, num_transitions)
-                _, masked_indices = torch.topk(all_unreduced_losses, k=fallback_k)
-                masking_method = f"fallback topk({fallback_k})"
-            else:
-                masking_method = f"threshold (>{dynamic_threshold:.4f})"
+                # Targeted Evaluation: Evaluate ALL models on the masked subset (with state/reward breakdown)
+                # All models evaluated with pre-training weights for a fair comparison.
+                masked_detailed_accum = None
+                num_eval_batches_masked = 0
 
-            num_masked = len(masked_indices)
-            mask_ratio = num_masked / num_transitions
+                for start in range(0, num_masked, cfg.minibatch_size):
+                    end = min(start + cfg.minibatch_size, num_masked)
+                    batch_detailed = world_model.evaluate_all_models_detailed(
+                        masked_obs[start:end], masked_acts[start:end],
+                        masked_next[start:end], masked_rews[start:end]
+                    )
+                    if masked_detailed_accum is None:
+                        masked_detailed_accum = [{'total': 0.0, 'state': 0.0, 'reward': 0.0} for _ in batch_detailed]
+                    for i, d in enumerate(batch_detailed):
+                        masked_detailed_accum[i]['total'] += d['total']
+                        masked_detailed_accum[i]['state'] += d['state']
+                        masked_detailed_accum[i]['reward'] += d['reward']
+                    num_eval_batches_masked += 1
 
-            masked_obs = all_obs[masked_indices]
-            masked_acts = all_acts[masked_indices]
-            masked_next = all_next[masked_indices]
-            masked_rews = all_rews[masked_indices]
+                # Average the accumulated detailed losses
+                masked_detailed = []
+                for d in masked_detailed_accum:
+                    n = max(1, num_eval_batches_masked)
+                    masked_detailed.append({'total': d['total']/n, 'state': d['state']/n, 'reward': d['reward']/n})
+                eval_losses = [d['total'] for d in masked_detailed]
 
-            # Targeted Evaluation: Evaluate ALL models on the masked subset (with state/reward breakdown)
-            masked_detailed_accum = None
-            num_eval_batches_masked = 0
-
-            for start in range(0, num_masked, cfg.minibatch_size):
-                end = min(start + cfg.minibatch_size, num_masked)
-                batch_detailed = world_model.evaluate_all_models_detailed(
-                    masked_obs[start:end], masked_acts[start:end],
-                    masked_next[start:end], masked_rews[start:end]
-                )
-                if masked_detailed_accum is None:
-                    masked_detailed_accum = [{'total': 0.0, 'state': 0.0, 'reward': 0.0} for _ in batch_detailed]
-                for i, d in enumerate(batch_detailed):
-                    masked_detailed_accum[i]['total'] += d['total']
-                    masked_detailed_accum[i]['state'] += d['state']
-                    masked_detailed_accum[i]['reward'] += d['reward']
-                num_eval_batches_masked += 1
-
-            # Average the accumulated detailed losses
-            masked_detailed = []
-            for d in masked_detailed_accum:
-                n = max(1, num_eval_batches_masked)
-                masked_detailed.append({'total': d['total']/n, 'state': d['state']/n, 'reward': d['reward']/n})
-            eval_losses = [d['total'] for d in masked_detailed]
-
-            if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
-                # --- DIAGNOSTICS: Inspect the Masked Subset ---
-                print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
-                print(f"Masking method: {masking_method}")
-                print(f"Masked Subset Size: {num_masked} transitions ({mask_ratio*100:.1f}% of {num_transitions})")
-                
-                # 1. Rewards Distribution
-                unique_rews, counts = torch.unique(masked_rews, return_counts=True)
-                print("Rewards in Masked Subset:")
-                for r, c in zip(unique_rews.tolist(), counts.tolist()):
-                    print(f"  Reward {r:+.3f}: {c} occurrences")
+                if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
+                    # --- DIAGNOSTICS: Inspect the Masked Subset ---
+                    print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
+                    print(f"Masking method: {masking_method}")
+                    print(f"Masked Subset Size: {num_masked} transitions ({mask_ratio*100:.1f}% of {num_transitions})")
                     
-                # 2. Chronological Distribution
-                step_indices = masked_indices // num_envs
-                
-                q1 = (step_indices < buffer.num_steps / 4).sum().item()
-                q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
-                q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
-                q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
+                    # 1. Rewards Distribution
+                    unique_rews, counts = torch.unique(masked_rews, return_counts=True)
+                    print("Rewards in Masked Subset:")
+                    for r, c in zip(unique_rews.tolist(), counts.tolist()):
+                        print(f"  Reward {r:+.3f}: {c} occurrences")
+                        
+                    # 2. Chronological Distribution
+                    step_indices = masked_indices // num_envs
+                    
+                    q1 = (step_indices < buffer.num_steps / 4).sum().item()
+                    q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
+                    q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
+                    q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
 
-                print("Chronological placement in current epoch (by quartiles Q1->Q4):")
-                print(f"  Q1 (start) : {q1} transitions")
-                print(f"  Q2         : {q2} transitions")
-                print(f"  Q3         : {q3} transitions")
-                print(f"  Q4 (end)   : {q4} transitions")
+                    print("Chronological placement in current epoch (by quartiles Q1->Q4):")
+                    print(f"  Q1 (start) : {q1} transitions")
+                    print(f"  Q2         : {q2} transitions")
+                    print(f"  Q3         : {q3} transitions")
+                    print(f"  Q4 (end)   : {q4} transitions")
 
-                # 3. Per-transition reward prediction probe
-                num_samples = min(10, num_masked)
-                sample_idx = torch.randperm(num_masked)[:num_samples]
-                sample_obs = masked_obs[sample_idx]
-                sample_acts = masked_acts[sample_idx]
-                sample_rews = masked_rews[sample_idx]
+                    # 3. Per-transition reward prediction probe
+                    num_samples = min(10, num_masked)
+                    sample_idx = torch.randperm(num_masked)[:num_samples]
+                    sample_obs = masked_obs[sample_idx]
+                    sample_acts = masked_acts[sample_idx]
+                    sample_rews = masked_rews[sample_idx]
 
-                print(f"\nPer-transition reward predictions (sample of {num_samples}):")
-                header = "| # | Actual Reward |"
-                divider = "|---|---------------|"
-                for m_id in range(len(world_model.models)):
-                    header += f" Model {m_id} Pred | M{m_id} MSE    |"
-                    divider += "----------------|-----------|"
-                print(header)
-                print(divider)
+                    print(f"\nPer-transition reward predictions (sample of {num_samples}):")
+                    header = "| # | Actual Reward |"
+                    divider = "|---|---------------|"
+                    for m_id in range(len(world_model.models)):
+                        header += f" Model {m_id} Pred | M{m_id} MSE    |"
+                        divider += "----------------|-----------|"
+                    print(header)
+                    print(divider)
 
-                with torch.no_grad():
-                    preds_per_model = []
-                    for m_id, m in enumerate(world_model.models):
-                        _, pred_r = m(sample_obs, sample_acts)
-                        preds_per_model.append(pred_r)
+                    with torch.no_grad():
+                        preds_per_model = []
+                        for m_id, m in enumerate(world_model.models):
+                            _, pred_r = m(sample_obs, sample_acts)
+                            preds_per_model.append(pred_r)
 
-                    for j in range(num_samples):
-                        actual = sample_rews[j].item()
-                        row = f"| {j:<1} | {actual:>+13.3f} |"
-                        for m_id in range(len(world_model.models)):
-                            pred = preds_per_model[m_id][j].item()
-                            mse = (pred - actual) ** 2
-                            row += f" {pred:>+14.3f} | {mse:>9.4f} |"
-                        print(row)
+                        for j in range(num_samples):
+                            actual = sample_rews[j].item()
+                            row = f"| {j:<1} | {actual:>+13.3f} |"
+                            for m_id in range(len(world_model.models)):
+                                pred = preds_per_model[m_id][j].item()
+                                mse = (pred - actual) ** 2
+                                row += f" {pred:>+14.3f} | {mse:>9.4f} |"
+                            print(row)
 
-                print("--------------------------------------------------\n")
+                    print("--------------------------------------------------\n")
 
-            # Oracle Routing: bypass masking logic and use ground truth
-            if oracle_routing and last_true_regime is not None and len(world_model.models) > 1:
-                true_id = last_true_regime
-                if true_id != world_model.active_regime_id:
-                    old_id = world_model.active_regime_id
-                    world_model.rollback_safe_state(
-                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                # ---- Routing Decision (pre-training weights, fair fight) ----
+                # Oracle Routing: bypass masking logic and use ground truth
+                if oracle_routing and last_true_regime is not None and len(world_model.models) > 1:
+                    true_id = last_true_regime
+                    if true_id != world_model.active_regime_id:
+                        old_id = world_model.active_regime_id
+                        world_model.rollback_safe_state(
+                            old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                        )
+                        print(f"[ORACLE ROUTING] Forced switch: Model {old_id} → Model {true_id} at step {global_step}.")
+                        world_model.active_regime_id = true_id
+                        current_regime.fill_(true_id)
+                    # Still call check_epoch_transition for logging/EMA updates, but ignore its action
+                    world_model.check_epoch_transition(
+                        epoch_avg_loss, eval_losses, global_step,
+                        full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
+                        masked_detailed=masked_detailed
                     )
-                    print(f"[ORACLE ROUTING] Forced switch: Model {old_id} → Model {true_id} at step {global_step}.")
-                    world_model.active_regime_id = true_id
-                    current_regime.fill_(true_id)
-                # Still call check_epoch_transition for logging/EMA updates, but ignore its action
-                world_model.check_epoch_transition(
-                    epoch_avg_loss, eval_losses, global_step,
-                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
-                    masked_detailed=masked_detailed
-                )
-            else:
-                transition_action, target_id = world_model.check_epoch_transition(
-                    epoch_avg_loss, eval_losses, global_step,
-                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
-                    masked_detailed=masked_detailed
-                )
-
-                if transition_action == "switch":
-                    old_id = world_model.active_regime_id
-                    world_model.rollback_safe_state(
-                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                else:
+                    transition_action, target_id = world_model.check_epoch_transition(
+                        epoch_avg_loss, eval_losses, global_step,
+                        full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio,
+                        masked_detailed=masked_detailed
                     )
-                    print(f"[MoWM] Regime Switch: Model {old_id} → Model {target_id} at step {global_step}.")
-                    world_model.active_regime_id = target_id
-                    current_regime.fill_(target_id)
 
-                elif transition_action == "spawn":
-                    old_id = world_model.active_regime_id
-                    new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
-                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
-                    world_model.rollback_safe_state(
-                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
-                    )
-                    current_regime.fill_(new_id)
-                    spawn_occurred = True
+                    if transition_action == "switch":
+                        old_id = world_model.active_regime_id
+                        world_model.rollback_safe_state(
+                            old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                        )
+                        print(f"[MoWM] Regime Switch: Model {old_id} → Model {target_id} at step {global_step}.")
+                        world_model.active_regime_id = target_id
+                        current_regime.fill_(target_id)
+
+                    elif transition_action == "spawn":
+                        old_id = world_model.active_regime_id
+                        new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
+                        wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                        world_model.rollback_safe_state(
+                            old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                        )
+                        current_regime.fill_(new_id)
+                        spawn_occurred = True
+
+        # Phase B: Train World Model (trains the correctly-routed active model)
+        wm_stats = update_world_model()
 
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
@@ -932,8 +922,8 @@ def train_ppo(
         avg_max_loss = avg_wm_stats.get("world_model/loss_max", avg_total_loss)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
         logger.scalar("mowm/epoch_avg_max_loss", avg_max_loss, global_step)
-        if cached_pre_training is not None:
-            logger.scalar("mowm/pre_training_epoch_loss", cached_pre_training["epoch_avg_loss"], global_step)
+        if pre_training_epoch_loss is not None:
+            logger.scalar("mowm/pre_training_epoch_loss", pre_training_epoch_loss, global_step)
         logger.scalar("mowm/spawn_occurred", float(spawn_occurred), global_step)
 
         if dream_buffers:

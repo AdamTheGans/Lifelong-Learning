@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.4")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.5")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -711,17 +711,31 @@ def train_ppo(
 
             full_buffer_losses = [total / max(1, num_eval_batches_full) for total in eval_loss_accum_full]
 
-            # Isolate the anomaly: Top 20% highest-loss transitions (from PRE-TRAINING losses)
+            # Isolate the anomaly: Absolute Threshold Masking (from PRE-TRAINING losses)
+            # Only select transitions where the active model's loss exceeds the dynamic
+            # surprise threshold, filtering out "normally hard" navigation noise.
             num_transitions = all_unreduced_losses.shape[0]
-            mask_ratio = 0.2
-            num_masked = max(1, int(num_transitions * mask_ratio))
+            active_ema = world_model.ema_losses[world_model.active_regime_id]
+            dynamic_threshold = max(active_ema, world_model.anomaly_floor) * world_model.anomaly_multiplier
 
-            _, topk_indices = torch.topk(all_unreduced_losses, k=num_masked)
+            threshold_mask = all_unreduced_losses > dynamic_threshold
+            masked_indices = torch.where(threshold_mask)[0]
 
-            masked_obs = all_obs[topk_indices]
-            masked_acts = all_acts[topk_indices]
-            masked_next = all_next[topk_indices]
-            masked_rews = all_rews[topk_indices]
+            # Fallback: if no transitions exceed threshold, use topk(50) as safety net
+            if len(masked_indices) == 0:
+                fallback_k = min(50, num_transitions)
+                _, masked_indices = torch.topk(all_unreduced_losses, k=fallback_k)
+                masking_method = f"fallback topk({fallback_k})"
+            else:
+                masking_method = f"threshold (>{dynamic_threshold:.4f})"
+
+            num_masked = len(masked_indices)
+            mask_ratio = num_masked / num_transitions
+
+            masked_obs = all_obs[masked_indices]
+            masked_acts = all_acts[masked_indices]
+            masked_next = all_next[masked_indices]
+            masked_rews = all_rews[masked_indices]
 
             # Targeted Evaluation: Evaluate ALL models on the masked high-loss subset
             eval_loss_accum_masked = [0.0] * len(world_model.models)
@@ -742,7 +756,8 @@ def train_ppo(
             if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
                 # --- DIAGNOSTICS: Inspect the Masked Subset ---
                 print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
-                print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
+                print(f"Masking method: {masking_method}")
+                print(f"Masked Subset Size: {num_masked} transitions ({mask_ratio*100:.1f}% of {num_transitions})")
                 
                 # 1. Rewards Distribution
                 unique_rews, counts = torch.unique(masked_rews, return_counts=True)
@@ -751,11 +766,8 @@ def train_ppo(
                     print(f"  Reward {r:+.3f}: {c} occurrences")
                     
                 # 2. Chronological Distribution
-                # topk_indices range from 0 to (num_steps * num_envs - 1). 
-                # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
-                step_indices = topk_indices // num_envs
+                step_indices = masked_indices // num_envs
                 
-                # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
                 q1 = (step_indices < buffer.num_steps / 4).sum().item()
                 q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
                 q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()

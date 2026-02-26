@@ -53,7 +53,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.8.3")
+    print("MoWM Dyna-PPO Trainer Version: 0.8.4")
     seed_everything(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     num_envs = max(cfg.num_envs, 16)
@@ -639,145 +639,158 @@ def train_ppo(
             _, last_value = model.forward(obs_t, current_regime)
         buffer.compute_returns_and_advantages(last_value, cfg.gamma, cfg.gae_lambda)
 
+        # Phase A.5: Pre-Training Evaluation Pass (BEFORE training corrupts the model)
+        # Compute unreduced losses with the clean model to get an unbiased surprise signal.
+        # These are cached for use in Phase B.5 routing.
+        cached_pre_training = None
+        if not oracle_mode:
+            pre_eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=False)
+
+            pre_all_obs, pre_all_acts, pre_all_next, pre_all_rews = [], [], [], []
+            pre_all_unreduced_losses = []
+            pre_loss_sum = 0.0
+            pre_loss_count = 0
+
+            with torch.no_grad():
+                for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _, eval_is_dummy in pre_eval_minibatches:
+                    valid_mask = ~eval_is_dummy
+                    if not valid_mask.any():
+                        continue
+
+                    v_obs = eval_obs[valid_mask]
+                    v_acts = eval_acts[valid_mask]
+                    v_next = eval_next[valid_mask]
+                    v_rews = eval_ext_rews[valid_mask]
+
+                    unreduced = world_model.get_active_model_unreduced_losses(v_obs, v_acts, v_next, v_rews)
+                    pre_all_unreduced_losses.append(unreduced)
+                    pre_loss_sum += unreduced.sum().item()
+                    pre_loss_count += unreduced.shape[0]
+
+                    pre_all_obs.append(v_obs)
+                    pre_all_acts.append(v_acts)
+                    pre_all_next.append(v_next)
+                    pre_all_rews.append(v_rews)
+
+            if pre_loss_count > 0:
+                cached_pre_training = {
+                    "all_obs": torch.cat(pre_all_obs, dim=0),
+                    "all_acts": torch.cat(pre_all_acts, dim=0),
+                    "all_next": torch.cat(pre_all_next, dim=0),
+                    "all_rews": torch.cat(pre_all_rews, dim=0),
+                    "all_unreduced_losses": torch.cat(pre_all_unreduced_losses, dim=0),
+                    "epoch_avg_loss": pre_loss_sum / pre_loss_count,
+                }
+
         # Phase B: Train World Model (trains on freshly collected buffer)
         wm_stats = update_world_model()
 
-        # Phase B.5: Epoch Boundary Routing (replaces per-step Rescue Routing)
+        # Phase B.5: Epoch Boundary Routing (uses CACHED pre-training losses)
         spawn_occurred = False
-        if not oracle_mode:
-            # Get the active model's epoch average loss for threshold comparison
-            avg_wm_stats_pre = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
-            epoch_avg_loss = avg_wm_stats_pre.get("world_model/loss_total", 0.0)
+        if not oracle_mode and cached_pre_training is not None:
+            # Use the clean, pre-training epoch average loss for threshold comparison
+            epoch_avg_loss = cached_pre_training["epoch_avg_loss"]
 
-            # High-Loss Filtering (Surprise Masking)
-            eval_minibatches = buffer.get_minibatches(cfg.minibatch_size, shuffle=False)
-            
-            all_obs, all_acts, all_next, all_rews = [], [], [], []
-            all_unreduced_losses = []
-            
-            eval_loss_accum_full = None
+            all_obs = cached_pre_training["all_obs"]
+            all_acts = cached_pre_training["all_acts"]
+            all_next = cached_pre_training["all_next"]
+            all_rews = cached_pre_training["all_rews"]
+            all_unreduced_losses = cached_pre_training["all_unreduced_losses"]
+
+            # Full-buffer evaluation (post-training weights, for observability table)
+            eval_loss_accum_full = [0.0] * len(world_model.models)
             num_eval_batches_full = 0
-
-            for eval_obs, eval_acts, _, _, _, _, eval_next, _, eval_ext_rews, _, eval_is_dummy in eval_minibatches:
-                # Filter out dummy AutoReset frames
-                valid_mask = ~eval_is_dummy
-                if not valid_mask.any():
-                    continue
-
-                eval_obs_valid = eval_obs[valid_mask]
-                eval_acts_valid = eval_acts[valid_mask]
-                eval_next_valid = eval_next[valid_mask]
-                eval_ext_rews_valid = eval_ext_rews[valid_mask]
-
-                # 1. Full-buffer evaluation for all models (Observability)
-                batch_losses_full = world_model.evaluate_all_models(eval_obs_valid, eval_acts_valid, eval_next_valid, eval_ext_rews_valid)
-                if eval_loss_accum_full is None:
-                    eval_loss_accum_full = [0.0] * len(batch_losses_full)
+            for start in range(0, all_obs.shape[0], cfg.minibatch_size):
+                end = min(start + cfg.minibatch_size, all_obs.shape[0])
+                batch_losses_full = world_model.evaluate_all_models(
+                    all_obs[start:end], all_acts[start:end], all_next[start:end], all_rews[start:end]
+                )
                 for i, loss in enumerate(batch_losses_full):
                     eval_loss_accum_full[i] += loss
                 num_eval_batches_full += 1
-                
-                # 2. Collect active model's unreduced losses for masking
-                unreduced = world_model.get_active_model_unreduced_losses(eval_obs_valid, eval_acts_valid, eval_next_valid, eval_ext_rews_valid)
-                all_unreduced_losses.append(unreduced)
-                
-                all_obs.append(eval_obs_valid)
-                all_acts.append(eval_acts_valid)
-                all_next.append(eval_next_valid)
-                all_rews.append(eval_ext_rews_valid)
 
-            if eval_loss_accum_full is not None and num_eval_batches_full > 0:
-                full_buffer_losses = [total / num_eval_batches_full for total in eval_loss_accum_full]
-                
-                # Concat the full buffer
-                all_obs = torch.cat(all_obs, dim=0)
-                all_acts = torch.cat(all_acts, dim=0)
-                all_next = torch.cat(all_next, dim=0)
-                all_rews = torch.cat(all_rews, dim=0)
-                all_unreduced_losses = torch.cat(all_unreduced_losses, dim=0)
-                
-                # Isolate the anomaly: Top 20% highest-loss transitions
-                num_transitions = all_unreduced_losses.shape[0]
-                mask_ratio = 0.2
-                num_masked = max(1, int(num_transitions * mask_ratio))
-                
-                _, topk_indices = torch.topk(all_unreduced_losses, k=num_masked)
-                
-                masked_obs = all_obs[topk_indices]
-                masked_acts = all_acts[topk_indices]
-                masked_next = all_next[topk_indices]
-                masked_rews = all_rews[topk_indices]
-                
-                # 3. Targeted Evaluation: Evaluate ALL models on the masked high-loss subset
-                eval_loss_accum_masked = [0.0] * len(world_model.models)
-                num_eval_batches_masked = 0
-                
-                for start in range(0, num_masked, cfg.minibatch_size):
-                    end = min(start + cfg.minibatch_size, num_masked)
-                    mb_obs = masked_obs[start:end]
-                    mb_acts = masked_acts[start:end]
-                    mb_next = masked_next[start:end]
-                    mb_rews = masked_rews[start:end]
-                    
-                    batch_losses_masked = world_model.evaluate_all_models(mb_obs, mb_acts, mb_next, mb_rews)
-                    for i, loss in enumerate(batch_losses_masked):
-                        eval_loss_accum_masked[i] += loss
-                    num_eval_batches_masked += 1
-                    
-                eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
+            full_buffer_losses = [total / max(1, num_eval_batches_full) for total in eval_loss_accum_full]
 
-                if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
-                    # --- DIAGNOSTICS: Inspect the Masked Subset ---
-                    print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
-                    print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
-                    
-                    # 1. Rewards Distribution
-                    unique_rews, counts = torch.unique(masked_rews, return_counts=True)
-                    print("Rewards in Masked Subset:")
-                    for r, c in zip(unique_rews.tolist(), counts.tolist()):
-                        print(f"  Reward {r:+.3f}: {c} occurrences")
-                        
-                    # 2. Chronological Distribution
-                    # topk_indices range from 0 to (num_steps * num_envs - 1). 
-                    # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
-                    step_indices = topk_indices // num_envs
-                    
-                    # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
-                    q1 = (step_indices < buffer.num_steps / 4).sum().item()
-                    q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
-                    q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
-                    q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
+            # Isolate the anomaly: Top 20% highest-loss transitions (from PRE-TRAINING losses)
+            num_transitions = all_unreduced_losses.shape[0]
+            mask_ratio = 0.2
+            num_masked = max(1, int(num_transitions * mask_ratio))
 
-                    print("Chronological placement in current epoch (by quartiles Q1->Q4):")
-                    print(f"  Q1 (start) : {q1} transitions")
-                    print(f"  Q2         : {q2} transitions")
-                    print(f"  Q3         : {q3} transitions")
-                    print(f"  Q4 (end)   : {q4} transitions")
-                    print("--------------------------------------------------\n")
+            _, topk_indices = torch.topk(all_unreduced_losses, k=num_masked)
 
-                transition_action, target_id = world_model.check_epoch_transition(
-                    epoch_avg_loss, eval_losses, global_step,
-                    full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio
+            masked_obs = all_obs[topk_indices]
+            masked_acts = all_acts[topk_indices]
+            masked_next = all_next[topk_indices]
+            masked_rews = all_rews[topk_indices]
+
+            # Targeted Evaluation: Evaluate ALL models on the masked high-loss subset
+            eval_loss_accum_masked = [0.0] * len(world_model.models)
+            num_eval_batches_masked = 0
+
+            for start in range(0, num_masked, cfg.minibatch_size):
+                end = min(start + cfg.minibatch_size, num_masked)
+                batch_losses_masked = world_model.evaluate_all_models(
+                    masked_obs[start:end], masked_acts[start:end],
+                    masked_next[start:end], masked_rews[start:end]
                 )
+                for i, loss in enumerate(batch_losses_masked):
+                    eval_loss_accum_masked[i] += loss
+                num_eval_batches_masked += 1
 
-                if transition_action == "switch":
-                    old_id = world_model.active_regime_id
-                    world_model.rollback_safe_state(
-                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
-                    )
-                    print(f"[MoWM] Regime Switch: Model {old_id} \u2192 Model {target_id} at step {global_step}.")
-                    world_model.active_regime_id = target_id
-                    current_regime.fill_(target_id)
+            eval_losses = [total / max(1, num_eval_batches_masked) for total in eval_loss_accum_masked]
 
-                elif transition_action == "spawn":
-                    old_id = world_model.active_regime_id
-                    new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
-                    wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
-                    world_model.rollback_safe_state(
-                        old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
-                    )
-                    current_regime.fill_(new_id)
-                    spawn_occurred = True
+            if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
+                # --- DIAGNOSTICS: Inspect the Masked Subset ---
+                print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
+                print(f"Masked Subset Size: {num_masked} transitions (Top 20% of {num_transitions})")
+                
+                # 1. Rewards Distribution
+                unique_rews, counts = torch.unique(masked_rews, return_counts=True)
+                print("Rewards in Masked Subset:")
+                for r, c in zip(unique_rews.tolist(), counts.tolist()):
+                    print(f"  Reward {r:+.3f}: {c} occurrences")
+                    
+                # 2. Chronological Distribution
+                # topk_indices range from 0 to (num_steps * num_envs - 1). 
+                # Dividing by num_envs gives the step index (0 to num_steps - 1) in the epoch.
+                step_indices = topk_indices // num_envs
+                
+                # Cut the epoch into 4 segments to see if the anomalies are clustered at the end
+                q1 = (step_indices < buffer.num_steps / 4).sum().item()
+                q2 = ((step_indices >= buffer.num_steps / 4) & (step_indices < buffer.num_steps / 2)).sum().item()
+                q3 = ((step_indices >= buffer.num_steps / 2) & (step_indices < 3 * buffer.num_steps / 4)).sum().item()
+                q4 = (step_indices >= 3 * buffer.num_steps / 4).sum().item()
+
+                print("Chronological placement in current epoch (by quartiles Q1->Q4):")
+                print(f"  Q1 (start) : {q1} transitions")
+                print(f"  Q2         : {q2} transitions")
+                print(f"  Q3         : {q3} transitions")
+                print(f"  Q4 (end)   : {q4} transitions")
+                print("--------------------------------------------------\n")
+
+            transition_action, target_id = world_model.check_epoch_transition(
+                epoch_avg_loss, eval_losses, global_step,
+                full_buffer_losses=full_buffer_losses, num_masked=num_masked, mask_ratio=mask_ratio
+            )
+
+            if transition_action == "switch":
+                old_id = world_model.active_regime_id
+                world_model.rollback_safe_state(
+                    old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                )
+                print(f"[MoWM] Regime Switch: Model {old_id} \u2192 Model {target_id} at step {global_step}.")
+                world_model.active_regime_id = target_id
+                current_regime.fill_(target_id)
+
+            elif transition_action == "spawn":
+                old_id = world_model.active_regime_id
+                new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
+                wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                world_model.rollback_safe_state(
+                    old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
+                )
+                current_regime.fill_(new_id)
+                spawn_occurred = True
 
         # Phase C: Dream and build mixed buffers (skipped in passive mode)
         dream_buffers = []
@@ -820,6 +833,8 @@ def train_ppo(
         avg_max_loss = avg_wm_stats.get("world_model/loss_max", avg_total_loss)
         logger.scalar("mowm/epoch_avg_loss", avg_total_loss, global_step)
         logger.scalar("mowm/epoch_avg_max_loss", avg_max_loss, global_step)
+        if cached_pre_training is not None:
+            logger.scalar("mowm/pre_training_epoch_loss", cached_pre_training["epoch_avg_loss"], global_step)
         logger.scalar("mowm/spawn_occurred", float(spawn_occurred), global_step)
 
         if dream_buffers:

@@ -54,7 +54,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.9.3")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.4")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -580,6 +580,14 @@ def train_ppo(
                 b_actions = buf.actions.reshape(batch_size)
                 b_logprobs = buf.logprobs.reshape(batch_size)
                 b_advantages = buf.advantages.reshape(batch_size)
+                
+                # Normalize advantages INDEPENDENTLY per buffer to preserve gradient flow
+                # for both the actively learning task and the mastered dream task.
+                std = b_advantages.std()
+                if std < 1e-6:
+                    std = torch.tensor(1.0, device=b_advantages.device)
+                b_advantages = (b_advantages - b_advantages.mean()) / (std + 1e-8)
+                
                 b_returns = buf.returns.reshape(batch_size)
                 b_values = buf.values.reshape(batch_size)
                 b_regime_ids = buf.regime_ids.reshape(batch_size)
@@ -599,13 +607,6 @@ def train_ppo(
             c_returns = torch.cat(all_returns, dim=0)
             c_values = torch.cat(all_values, dim=0)
             c_regime_ids = torch.cat(all_regime_ids, dim=0)
-            
-            # Normalize advantages AFTER concatenation across all buffers
-            # so real and dream signals retain their relative magnitudes.
-            std = c_advantages.std()
-            if std < 1e-6:
-                std = torch.tensor(1.0, device=c_advantages.device)
-            c_advantages = (c_advantages - c_advantages.mean()) / (std + 1e-8)
             
             total_size = c_obs.size(0)
             idxs = np.arange(total_size)
@@ -754,7 +755,7 @@ def train_ppo(
                     masked_detailed.append({'total': d['total']/n, 'state': d['state']/n, 'reward': d['reward']/n})
                 eval_losses = [d['total'] for d in masked_detailed]
 
-                if (global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
+                if False: #(global_step > 600000 and global_step < 650000) or (global_step > 300000 and global_step < 350000):
                     # --- DIAGNOSTICS: Inspect the Masked Subset ---
                     print(f"\n[MoWM DIAGNOSTICS - step {global_step}] --- Masked Subset Analysis ---")
                     print(f"Masking method: {masking_method}")

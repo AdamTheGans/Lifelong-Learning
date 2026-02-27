@@ -48,6 +48,15 @@ def train_brain(args):
     # Meta-environment Vectorization
     # -----------------------------------------------------------------
     logger = DataLogger(run_name=args.run_name or "brain_training")
+    
+    # Save all configuration arguments to a txt file in the run directory
+    config_path = os.path.join(logger.full_dir, "config.txt")
+    with open(config_path, "w") as f:
+        f.write("Brain Training Configuration:\n")
+        f.write("-" * 40 + "\n")
+        for key, value in sorted(vars(args).items()):
+            f.write(f"{key}: {value}\n")
+    print(f"Saved configuration to: {config_path}")
 
     def get_env_maker(log_dir_str, env_idx):
         def _make_env_fn():
@@ -276,10 +285,35 @@ def train_brain(args):
         print(f"Episode {episode}/{brain_cfg.brain_episodes} | "
               f"reward={mean_reward_across_envs:.4f} | avg10={avg_reward_10:.4f} | "
               f"steps={steps} | time={ep_time:.1f}s")
+
+        # Save Brain checkpoint every 10 episodes
+        if episode % 10 == 0:
+            ckpt_dir = os.path.join(logger.full_dir, "brain_checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"brain_ep{episode}.pt")
+            torch.save({
+                "model_state_dict": brain_model.state_dict(),
+                "optimizer_state_dict": brain_optimizer.state_dict(),
+                "episode": episode,
+                "avg_reward_10": avg_reward_10,
+                "episodes_trained": episode,
+                "args": vars(args),
+            }, ckpt_path)
+            print(f"  [brain ckpt] {ckpt_path}")
               
     # Generate final overall Brain trend charts
     plot_dir = os.path.join(logger.full_dir, "brain_trends")
     logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
+
+    # Save Brain model checkpoint for evaluation
+    brain_save_path = os.path.join(logger.full_dir, "brain_model.pt")
+    torch.save({
+        "model_state_dict": brain_model.state_dict(),
+        "optimizer_state_dict": brain_optimizer.state_dict(),
+        "episodes_trained": brain_cfg.brain_episodes,
+        "args": vars(args),
+    }, brain_save_path)
+    print(f"Saved Brain model to: {brain_save_path}")
 
     meta_env.close()
     logger.close()

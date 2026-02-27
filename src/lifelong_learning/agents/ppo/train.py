@@ -89,6 +89,9 @@ class InnerTrainState:
     save_dir: str = "checkpoints"
     save_every_updates: int = 50
 
+    # --- Regime switching ---
+    regime_step_counter: list = field(default_factory=lambda: [0])
+
 
 def init_inner_training(
     env_id: str,
@@ -124,6 +127,9 @@ def init_inner_training(
     # Environment Setup
     # -----------------------------------------------------------------
 
+    # Shared step counter so all sub-envs switch regime simultaneously
+    regime_step_counter = [0]
+
     def make_thunk(i: int):
         def thunk():
             return make_env(
@@ -133,6 +139,7 @@ def init_inner_training(
                 episodes_per_regime=episodes_per_regime,
                 start_regime=start_regime,
                 record_stats=False,
+                shared_step_counter=regime_step_counter,
             )
         return thunk
 
@@ -234,6 +241,7 @@ def init_inner_training(
         save_every_updates=save_every_updates,
         episodic_memory=ep_memory,
         episodic_memory_capacity=episodic_memory_capacity,
+        regime_step_counter=regime_step_counter,
     )
 
 
@@ -292,6 +300,10 @@ def run_inner_update(state: InnerTrainState) -> dict:
 
         next_obs, reward, terminated, truncated, infos = s.envs.step(action.cpu().numpy())
         done = np.logical_or(terminated, truncated)
+
+        # Increment shared regime step counter once per envs.step() call
+        if hasattr(s, 'regime_step_counter'):
+            s.regime_step_counter[0] += 1
 
         # Log regime_id for regime switch visualization
         if "regime_id" in infos:

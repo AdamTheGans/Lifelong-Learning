@@ -35,6 +35,7 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         episodes_per_regime=kwargs.get("episodes_per_regime"),
         start_regime=kwargs.get("start_regime", 0),
         seed=seed,
+        shared_step_counter=kwargs.get("shared_step_counter"),
     )
 
     return env

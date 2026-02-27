@@ -143,3 +143,18 @@ python scripts/train_brain.py \
 # View Brain + inner agent tensorboard logs
 tensorboard --logdir runs
 ```
+
+### 2.3 Recommended Robust Training Command
+
+Use this command for a full-scale Meta-RL training run that prioritizes robust generalization and recovery from catastrophic forgetting, utilizing the new Episodic Memory system:
+
+```bash
+python scripts/train_brain.py \
+    --brain_episodes 65 \
+    --inner_total_timesteps 450000 \
+    --brain_num_envs 2 \
+    --pretrain_episodes 1 \
+    --inner_steps_per_regime 8000 \
+    --episodic_memory_capacity 10000 \
+    --run_name brain_episodic_run_ep65ts450Ken8re8K_1
+```

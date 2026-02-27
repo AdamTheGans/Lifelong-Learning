@@ -19,6 +19,7 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         episodes_per_regime: int | None = None,
         start_regime: int = 0,
         seed: int = 0,
+        shared_step_counter: list | None = None,
     ):
         super().__init__(env)
         self.steps_per_regime = steps_per_regime
@@ -28,11 +29,17 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         self.regime_id: int = start_regime
         self.cumulative_steps: int = 0
         self.cumulative_episodes: int = 0
+        # Shared mutable counter across all envs in SyncVectorEnv
+        # When provided, all envs read from the same counter so
+        # regime switches happen simultaneously.
+        self._shared_step_counter = shared_step_counter
 
     def _update_regime_deterministic(self):
+        # Use shared counter if available, else per-env counter
+        step_count = self._shared_step_counter[0] if self._shared_step_counter is not None else self.cumulative_steps
         # Update based on steps
         if self.steps_per_regime:
-            cycle = self.cumulative_steps // self.steps_per_regime
+            cycle = step_count // self.steps_per_regime
             self.regime_id = (self.start_regime + cycle) % 2
         # Update based on episodes
         elif self.episodes_per_regime:

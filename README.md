@@ -156,5 +156,35 @@ python scripts/train_brain.py \
     --pretrain_episodes 1 \
     --inner_steps_per_regime 8000 \
     --episodic_memory_capacity 10000 \
-    --run_name brain_episodic_run_ep65ts450Ken8re8K_1
+    --run_name brain_episodic_run_1
+### 2.4 Evaluation
+
+Evaluate a trained Brain checkpoint on a fresh inner agent (inference-only):
+
+```powershell
+.\myenv\Scripts\python.exe scripts\eval_brain.py --brain_checkpoint runs\brain_episodic_run_1_20260226-005533\brain_model.pt --total_timesteps 1150000 --steps_per_regime 18500 --episodic_memory_capacity 10000 --run_name eval_brain_run1
 ```
+
+---
+
+## Part 3: Configuration & Hyperparameters
+
+Understanding the key CLI flags for `train_brain.py` and `eval_brain.py`:
+
+### Environment Complexity
+* `--env_id MiniGrid-DualGoal-5x5-v0` : Default. A compact 5x5 grid (8x8 with walls). Good for fast prototyping.
+* `--env_id MiniGrid-DualGoal-8x8-v0` : A larger 8x8 grid (11x11 with walls). Significantly harder navigation task; usually requires higher `inner_total_timesteps` to master.
+
+### Meta-RL Training (The Brain)
+* `--brain_episodes` : Number of complete inner agent training runs.
+* `--brain_num_envs` : Number of parallel meta-environments. Higher values (e.g., 4 or 8) give the Brain smoother gradients and more stable learning, but use more RAM/VRAM. Start with 2 or 4.
+* `--pretrain_episodes` : Number of initial episodes where the Brain uses Imitation Learning (behavioral cloning) on a hardcoded "explore vs exploit" heuristic before switching to PPO. Highly recommended to keep at 1–3 to seed the Brain with a good starting policy.
+* `--brain_lr` : Learning rate for the Brain's PPO optimizer.
+* `--brain_ent_coef` : Entropy coefficient for the Brain's PPO optimizer.
+
+### Inner Agent Forgetting & Adaptation
+* `--inner_total_timesteps` : Total steps the inner agent trains for per Brain episode.
+* `--inner_steps_per_regime` : How often the environment flips the goal rewards (Regime 0 ↔ Regime 1). Shorter intervals force faster adaptation.
+* `--decision_interval` : How often the Brain adjusts hyperparameters (in terms of inner PPO updates). Default is 10 (roughly every 20,000 inner steps).
+* `--episodic_memory_capacity` : Size of the ring buffer for past experiences. A capacity of 10,000 holds roughly the last 5 PPO updates. Useful for rehearsing old knowledge to prevent catastrophic forgetting.
+

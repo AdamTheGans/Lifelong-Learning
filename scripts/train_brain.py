@@ -87,6 +87,7 @@ def train_brain(args):
     brain_cfg = BrainConfig(
         brain_episodes=args.brain_episodes,
         lr=args.brain_lr,
+        ent_coef=args.brain_ent_coef,
         device=args.device,
     )
 
@@ -339,6 +340,8 @@ def main():
     p.add_argument("--pretrain_episodes", type=int, default=5, help="Number of Imitation Learning pretrain episodes")
     p.add_argument("--brain_episodes", type=int, default=50)
     p.add_argument("--brain_lr", type=float, default=3e-4)
+    p.add_argument("--brain_ent_coef", type=float, default=0.0,
+                   help="Entropy coefficient for the Brain to encourage exploration")
     p.add_argument("--decision_interval", type=int, default=10,
                    help="Number of inner PPO updates per Brain decision")
 

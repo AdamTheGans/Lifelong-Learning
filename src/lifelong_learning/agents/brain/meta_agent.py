@@ -49,7 +49,7 @@ class MLPActorCritic(nn.Module):
         )
 
         self.actor_mean = nn.Linear(hidden_dim, act_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(act_dim))
+        self.actor_log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
 
         self.critic = nn.Linear(hidden_dim, 1)
 

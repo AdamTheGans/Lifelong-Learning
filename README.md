@@ -157,6 +157,14 @@ python scripts/train_brain.py \
     --inner_steps_per_regime 8000 \
     --episodic_memory_capacity 10000 \
     --run_name brain_episodic_run_1
+```
+
+Train a Brain with 4 regimes on the 8x8 environment:
+
+```powershell
+.\myenv\Scripts\python.exe scripts\train_brain.py --env_id MiniGrid-MultiGoal-8x8-v0 --num_regimes 4 --brain_episodes 65 --inner_total_timesteps 450000 --brain_num_envs 2 --pretrain_episodes 1 --inner_steps_per_regime 18500 --episodic_memory_capacity 10000 --run_name brain_4_regimes_8x8
+```
+
 ### 2.4 Evaluation
 
 Evaluate a trained Brain checkpoint on a fresh inner agent (inference-only):
@@ -164,6 +172,21 @@ Evaluate a trained Brain checkpoint on a fresh inner agent (inference-only):
 ```powershell
 .\myenv\Scripts\python.exe scripts\eval_brain.py --brain_checkpoint runs\brain_episodic_run_1_20260226-005533\brain_model.pt --total_timesteps 1150000 --steps_per_regime 18500 --episodic_memory_capacity 10000 --run_name eval_brain_run1
 ```
+
+Evaluate with 4 regimes on the 8x8 environment:
+
+```powershell
+.\myenv\Scripts\python.exe scripts\eval_brain.py --env_id MiniGrid-MultiGoal-8x8-v0 --num_regimes 4 --steps_per_regime 18500 --brain_checkpoint runs\brain_episodic_run_1_20260226-005533\brain_model.pt --total_timesteps 1150000 --run_name eval_brain_4_regimes
+```
+
+### 2.5 Resume Training
+
+To resume training the Brain from a checkpoint:
+
+```powershell
+.\myenv\Scripts\python.exe scripts\train_brain.py --resume_path runs\brain_episodic_run_1_20260226-005533\brain_model.pt --brain_episodes 100
+```
+*Note: This will restore the model weights, optimizer state, bypass initial imitation learning, and pick up exactly at the episode you left off.*
 
 ---
 

@@ -6,10 +6,12 @@ import numpy as np
 
 class RegimeGoalSwapWrapper(gym.Wrapper):
     """
-    Non-stationarity wrapper that inverts reward mapping.
+    Non-stationarity wrapper that shifts which goal color gives a positive reward.
     
-    Regime 0: Green Goal is +1, Blue Goal is -1
-    Regime 1: Green Goal is -1, Blue Goal is +1
+    Regime 0: Goal 0 is +5, all others are -1
+    Regime 1: Goal 1 is +5, all others are -1
+    ...
+    Regime N: Goal N is +5, all others are -1
     """
 
     def __init__(
@@ -18,6 +20,7 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         steps_per_regime: int | None = None,
         episodes_per_regime: int | None = None,
         start_regime: int = 0,
+        num_regimes: int = 2,
         seed: int = 0,
         shared_step_counter: list | None = None,
     ):
@@ -25,13 +28,11 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         self.steps_per_regime = steps_per_regime
         self.episodes_per_regime = episodes_per_regime
         self.start_regime = start_regime
+        self.num_regimes = num_regimes
         
         self.regime_id: int = start_regime
         self.cumulative_steps: int = 0
         self.cumulative_episodes: int = 0
-        # Shared mutable counter across all envs in SyncVectorEnv
-        # When provided, all envs read from the same counter so
-        # regime switches happen simultaneously.
         self._shared_step_counter = shared_step_counter
 
     def _update_regime_deterministic(self):
@@ -40,11 +41,11 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         # Update based on steps
         if self.steps_per_regime:
             cycle = step_count // self.steps_per_regime
-            self.regime_id = (self.start_regime + cycle) % 2
+            self.regime_id = (self.start_regime + cycle) % self.num_regimes
         # Update based on episodes
         elif self.episodes_per_regime:
             cycle = self.cumulative_episodes // self.episodes_per_regime
-            self.regime_id = (self.start_regime + cycle) % 2
+            self.regime_id = (self.start_regime + cycle) % self.num_regimes
 
     def reset(self, **kwargs):
         self._update_regime_deterministic()
@@ -68,35 +69,20 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         final_reward = -0.01
         
         # Only override reward if the environment actually terminated (reached a goal)
-        # We assume original_reward > 0 implies a goal was hit in MiniGrid
         if terminated and original_reward > 0:
-            base_env = self.unwrapped
             
-            # SAFEGUARD: Check if attributes exist (handles Empty-8x8 vs DualGoal)
-            if hasattr(base_env, "green_goal_pos") and hasattr(base_env, "blue_goal_pos"):
-                agent_pos = tuple(base_env.agent_pos)
-                green_pos = tuple(base_env.green_goal_pos)
-                blue_pos = tuple(base_env.blue_goal_pos)
+            # Use 'hit_goal_index' from MultiGoalEnv if present
+            if "hit_goal_index" in info:
+                hit_index = info["hit_goal_index"]
                 
-                hit_green = (agent_pos == green_pos)
-                hit_blue = (agent_pos == blue_pos)
-                
-                if self.regime_id == 0:
-                    # Regime 0: Green Good (+5), Blue Bad (-1)
-                    if hit_green:
-                        final_reward += 5.0
-                        info["reached_good_goal"] = 1.0
-                    elif hit_blue:
-                        final_reward += -1.0
-                        info["reached_bad_goal"] = 1.0
+                if hit_index == self.regime_id:
+                    # Hit the correct goal for this regime
+                    final_reward += 5.0
+                    info["reached_good_goal"] = 1.0
                 else:
-                    # Regime 1: Green Bad (-1), Blue Good (+5)
-                    if hit_green:
-                        final_reward += -1.0
-                        info["reached_bad_goal"] = 1.0
-                    elif hit_blue:
-                        final_reward += 5.0
-                        info["reached_good_goal"] = 1.0
+                    # Hit a wrong goal
+                    final_reward += -1.0
+                    info["reached_bad_goal"] = 1.0
             else:
                 # Fallback for standard MiniGrid environments (like Empty)
                 if self.regime_id == 0:

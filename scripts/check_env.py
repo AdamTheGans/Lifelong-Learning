@@ -6,10 +6,11 @@ from lifelong_learning.envs.make_env import make_env
 
 def main():
     parser = argparse.ArgumentParser(description="Sanity check: regime switching behavior")
-    parser.add_argument("--env_id", type=str, default="MiniGrid-Empty-8x8-v0")
+    parser.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-8x8-v0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps_per_regime", type=int, default=None)
     parser.add_argument("--episodes_per_regime", type=int, default=None)
+    parser.add_argument("--num_regimes", type=int, default=2)
     parser.add_argument("--steps", type=int, default=100)
     args = parser.parse_args()
 
@@ -20,6 +21,7 @@ def main():
         seed=args.seed,
         steps_per_regime=args.steps_per_regime,
         episodes_per_regime=args.episodes_per_regime,
+        num_regimes=args.num_regimes,
     )
 
     obs, info = env.reset(seed=args.seed)

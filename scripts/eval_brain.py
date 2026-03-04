@@ -66,7 +66,7 @@ def eval_brain(args):
     # -----------------------------------------------------------------
     # Logger
     # -----------------------------------------------------------------
-    logger = DataLogger(run_name=args.run_name or "eval_brain")
+    logger = DataLogger(run_name=args.run_name or "eval_brain", log_dir="evals")
 
     # Save eval config
     config_path = os.path.join(logger.full_dir, "config.txt")
@@ -88,6 +88,7 @@ def eval_brain(args):
         cfg=inner_cfg,
         steps_per_regime=args.steps_per_regime,
         start_regime=0,
+        num_regimes=args.num_regimes,
         run_name=args.run_name or "eval_brain",
         save_every_updates=args.save_every_updates,
         anneal_lr=False,  # Brain controls LR
@@ -200,9 +201,10 @@ def main():
                    help="Path to brain_model.pt from a training run")
 
     # Environment
-    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-5x5-v0")
+    p.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-5x5-v0")
     p.add_argument("--total_timesteps", type=int, default=1_150_000)
     p.add_argument("--steps_per_regime", type=int, default=18500)
+    p.add_argument("--num_regimes", type=int, default=2)
     p.add_argument("--num_envs", type=int, default=8)
     p.add_argument("--num_steps", type=int, default=128)
     p.add_argument("--mode", type=str, default="dyna", choices=["dyna", "passive"])

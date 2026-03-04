@@ -100,6 +100,7 @@ def init_inner_training(
     steps_per_regime: int | None = None,
     episodes_per_regime: int | None = None,
     start_regime: int = 0,
+    num_regimes: int = 2,
     run_name: str | None = None,
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
@@ -138,6 +139,7 @@ def init_inner_training(
                 steps_per_regime=steps_per_regime,
                 episodes_per_regime=episodes_per_regime,
                 start_regime=start_regime,
+                num_regimes=num_regimes,
                 record_stats=False,
                 shared_step_counter=regime_step_counter,
             )
@@ -576,7 +578,6 @@ def run_inner_update(state: InnerTrainState) -> dict:
     s.logger.scalar("charts/replay_ratio", s.replay_ratio, s.global_step)
     s.logger.scalar("charts/episodic_memory_fullness", s.episodic_memory.fullness if s.episodic_memory else 0.0, s.global_step)
 
-    # Checkpointing
     if update % s.save_every_updates == 0 or update == s.num_updates:
         ckpt_path = os.path.join(s.save_dir, f"{s.run_name}_update{update}.pt")
         torch.save(
@@ -592,8 +593,13 @@ def run_inner_update(state: InnerTrainState) -> dict:
         )
         print(f"[save] {ckpt_path}")
 
-    if update % 10 == 0:
+    # Live plotting and logging every 10 updates or at the very end
+    if update % 10 == 0 or update == s.num_updates:
         print(f"update {update}/{s.num_updates} | step={s.global_step} | SPS={sps}")
+        
+        if s.logger is not None:
+            plot_dir = getattr(s.logger, 'full_dir', s.save_dir)
+            s.logger.plot(save_dir=plot_dir, title=f"Inner Agent: {s.run_name}")
 
     s.current_update += 1
 
@@ -657,6 +663,7 @@ def train_ppo(
     steps_per_regime: int | None = None,
     episodes_per_regime: int | None = None,
     start_regime: int = 0,
+    num_regimes: int = 2,
     run_name: str | None = None,
     save_dir: str = "checkpoints",
     save_every_updates: int = 50,
@@ -682,6 +689,7 @@ def train_ppo(
         steps_per_regime=steps_per_regime,
         episodes_per_regime=episodes_per_regime,
         start_regime=start_regime,
+        num_regimes=num_regimes,
         run_name=run_name,
         save_dir=save_dir,
         save_every_updates=save_every_updates,

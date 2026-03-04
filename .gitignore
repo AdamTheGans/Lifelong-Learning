@@ -35792,3 +35792,6 @@ myenv/Include/site/python3.11/pygame/_surface.h
 myenv/Include/site/python3.11/pygame/_pygame.h
 myenv/Include/site/python3.11/pygame/_camera.h
 myenv/Include/site/python3.11/pygame/_blit_info.h
+
+# Evaluation Runs
+evals/

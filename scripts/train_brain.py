@@ -30,6 +30,35 @@ def train_brain(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # -----------------------------------------------------------------
+    # Checkpoint Loading & Config Restoration
+    # -----------------------------------------------------------------
+    start_episode = 1
+    checkpoint = None
+    if args.resume_path:
+        print(f"Loading checkpoint configs from: {args.resume_path}")
+        checkpoint = torch.load(args.resume_path, map_location=device, weights_only=False)
+        
+        if isinstance(checkpoint, dict) and "args" in checkpoint:
+            saved_args = checkpoint["args"]
+            
+            # Find arguments explicitly passed in the command line
+            import sys
+            explicit_args = set()
+            for arg_str in sys.argv[1:]:
+                if arg_str.startswith("--"):
+                    key = arg_str[2:].split("=")[0]
+                    # Handle if the user passes dashes instead of underscores
+                    explicit_args.add(key.replace("-", "_"))
+            
+            # Restore saved arguments ONLY IF they were not explicitly passed
+            for k, v in saved_args.items():
+                if k not in explicit_args:
+                    setattr(args, k, v)
+                    
+            print(f"Successfully restored environment and inner agent config from checkpoint.")
+            print(f"Kept explicit CLI arguments: {list(explicit_args.intersection(saved_args.keys()))}")
+
+    # -----------------------------------------------------------------
     # Inner agent config (passed to MetaEnv)
     # -----------------------------------------------------------------
     inner_cfg = PPOConfig(
@@ -66,6 +95,7 @@ def train_brain(args):
                 decision_interval=args.decision_interval,
                 steps_per_regime=args.inner_steps_per_regime,
                 start_regime=0,
+                num_regimes=args.num_regimes,
                 reward_alpha=args.reward_alpha,
                 reward_beta=args.reward_beta,
                 anneal_lr=False,  # Brain controls LR
@@ -94,6 +124,18 @@ def train_brain(args):
     brain_model = MLPActorCritic().to(device)
     brain_optimizer = torch.optim.Adam(brain_model.parameters(), lr=brain_cfg.lr, eps=1e-5)
 
+    if checkpoint:
+        print("Restoring Brain model and optimizer weights...")
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            brain_model.load_state_dict(checkpoint["model_state_dict"])
+            if "optimizer_state_dict" in checkpoint:
+                brain_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "episodes_trained" in checkpoint:
+                start_episode = checkpoint.get("episode", checkpoint["episodes_trained"]) + 1
+                print(f"Resuming at episode {start_episode}")
+        else:
+            brain_model.load_state_dict(checkpoint)
+
     print(f"Training Brain on {device} for {brain_cfg.brain_episodes} RL episodes")
     print(f"  Inner: {args.inner_total_timesteps} timesteps, "
           f"regime switch every {args.inner_steps_per_regime} steps")
@@ -103,7 +145,8 @@ def train_brain(args):
     # -----------------------------------------------------------------
     # Imitation Learning: Pretraining
     # -----------------------------------------------------------------
-    if args.pretrain_episodes > 0:
+    # Only run pretraining if starting from scratch
+    if args.pretrain_episodes > 0 and start_episode == 1:
         print(f"\n--- Starting Imitation Learning Pretraining for {args.pretrain_episodes} episodes ---")
         for pre_ep in range(1, args.pretrain_episodes + 1):
             ep_start = time.time()
@@ -150,10 +193,17 @@ def train_brain(args):
     # -----------------------------------------------------------------
     # Training loop: RL
     # -----------------------------------------------------------------
-    print("\n--- Starting Meta-RL PPO Training ---")
+    target_episodes = brain_cfg.brain_episodes
+    if start_episode > target_episodes:
+        print(f"Note: Checkpoint is already at episode {start_episode - 1}.")
+        print(f"Adding {args.brain_episodes} additional episodes to target.")
+        target_episodes = (start_episode - 1) + args.brain_episodes
+        brain_cfg.brain_episodes = target_episodes
+
+    print(f"\n--- Starting Meta-RL PPO Training (Target: {target_episodes}) ---")
     all_episode_rewards = []
 
-    for episode in range(1, brain_cfg.brain_episodes + 1):
+    for episode in range(start_episode, target_episodes + 1):
         ep_start = time.time()
         rollout = BrainRolloutBuffer()
         total_rewards = np.zeros(args.brain_num_envs, dtype=np.float32)
@@ -287,9 +337,9 @@ def train_brain(args):
               f"reward={mean_reward_across_envs:.4f} | avg10={avg_reward_10:.4f} | "
               f"steps={steps} | time={ep_time:.1f}s")
 
-        # Save Brain checkpoint every 10 episodes
-        if episode % 10 == 0:
-            ckpt_dir = os.path.join(logger.full_dir, "brain_checkpoints")
+        # Save Brain checkpoint every episode
+        if True:
+            ckpt_dir = os.path.join(logger.full_dir, f"episode_{episode}")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"brain_ep{episode}.pt")
             torch.save({
@@ -301,6 +351,10 @@ def train_brain(args):
                 "args": vars(args),
             }, ckpt_path)
             print(f"  [brain ckpt] {ckpt_path}")
+
+            # Live plotting for brain
+            plot_dir = os.path.join(logger.full_dir, "brain_trends")
+            logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
               
     # Generate final overall Brain trend charts
     plot_dir = os.path.join(logger.full_dir, "brain_trends")
@@ -325,10 +379,11 @@ def main():
     p = argparse.ArgumentParser(description="Train the Brain meta-agent")
 
     # Inner agent settings
-    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-5x5-v0")
+    p.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-5x5-v0")
     p.add_argument("--inner_total_timesteps", type=int, default=150_000)
     p.add_argument("--inner_num_envs", type=int, default=8)
     p.add_argument("--inner_num_steps", type=int, default=128)
+    p.add_argument("--num_regimes", type=int, default=2)
     p.add_argument("--inner_steps_per_regime", type=int, default=None)
     p.add_argument("--inner_mode", type=str, default="dyna", choices=["dyna", "passive"])
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
@@ -339,7 +394,7 @@ def main():
     p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")
     p.add_argument("--pretrain_episodes", type=int, default=5, help="Number of Imitation Learning pretrain episodes")
     p.add_argument("--brain_episodes", type=int, default=50)
-    p.add_argument("--brain_lr", type=float, default=3e-4)
+    p.add_argument("--brain_lr", type=float, default=1e-4)
     p.add_argument("--brain_ent_coef", type=float, default=0.0,
                    help="Entropy coefficient for the Brain to encourage exploration")
     p.add_argument("--decision_interval", type=int, default=10,
@@ -357,6 +412,7 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--resume_path", type=str, default=None, help="Path to brain checkpoint.pt to resume from")
 
     args = p.parse_args()
     train_brain(args)

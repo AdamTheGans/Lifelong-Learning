@@ -39,12 +39,13 @@ class MetaEnv(gym.Env):
 
     def __init__(
         self,
-        env_id: str = "MiniGrid-DualGoal-8x8-v0",
+        env_id: str = "MiniGrid-MultiGoal-8x8-v0",
         inner_cfg: PPOConfig | None = None,
         decision_interval: int = 10,
         steps_per_regime: int | None = 15000,
         episodes_per_regime: int | None = None,
         start_regime: int = 0,
+        num_regimes: int = 2,
         reward_alpha: float = 0.1,
         reward_beta: float = 0.5,
         inner_run_name: str | None = None,
@@ -67,6 +68,7 @@ class MetaEnv(gym.Env):
         self.steps_per_regime = steps_per_regime
         self.episodes_per_regime = episodes_per_regime
         self.start_regime = start_regime
+        self.num_regimes = num_regimes
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
         self.inner_run_name = inner_run_name
@@ -104,7 +106,7 @@ class MetaEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.start_regime = int(self.np_random.integers(0, 2))
+        self.start_regime = int(self.np_random.integers(0, self.num_regimes))
 
         # Clean up any previous inner training
         if self._state is not None:
@@ -125,6 +127,7 @@ class MetaEnv(gym.Env):
             steps_per_regime=self.steps_per_regime,
             episodes_per_regime=self.episodes_per_regime,
             start_regime=self.start_regime,
+            num_regimes=self.num_regimes,
             run_name=run_name,
             save_every_updates=9999 if not self.save_checkpoints else 50,
             anneal_lr=self.anneal_lr,
@@ -135,7 +138,10 @@ class MetaEnv(gym.Env):
             episodic_memory_capacity=self.episodic_memory_capacity,
         )
         if self.inner_log_dir is not None:
-            init_kwargs["log_dir"] = self.inner_log_dir
+            ep_log_dir = os.path.join(self.inner_log_dir, f"episode_{self._episode_counter}")
+            init_kwargs["log_dir"] = ep_log_dir
+            init_kwargs["save_dir"] = os.path.join(ep_log_dir, "inner_checkpoints")
+            
         self._state = init_inner_training(**init_kwargs)
 
         self._signal_extractor = SignalExtractor()

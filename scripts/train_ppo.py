@@ -6,11 +6,12 @@ from lifelong_learning.agents.ppo.train import train_ppo
 
 
 def main():
-    p = argparse.ArgumentParser(description="Train PPO / Dyna-PPO on MiniGrid-DualGoal")
-    p.add_argument("--env_id", type=str, default="MiniGrid-DualGoal-8x8-v0")
+    p = argparse.ArgumentParser(description="Train PPO / Dyna-PPO on MiniGrid-MultiGoal")
+    p.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-8x8-v0")
     p.add_argument("--total_timesteps", type=int, default=300_000)
     p.add_argument("--num_envs", type=int, default=8)
     p.add_argument("--num_steps", type=int, default=128)
+    p.add_argument("--num_regimes", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda")
 
@@ -60,6 +61,7 @@ def main():
         steps_per_regime=args.steps_per_regime,
         episodes_per_regime=args.episodes_per_regime,
         start_regime=args.start_regime,
+        num_regimes=args.num_regimes,
         run_name=args.run_name,
         anneal_lr=args.anneal_lr,
         resume_path=args.resume_path,

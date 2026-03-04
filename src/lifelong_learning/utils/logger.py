@@ -99,6 +99,30 @@ class DataLogger:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         
+        # Save separate unsmoothed success rate graph
+        if "charts/success_rate" in self.data and len(self.data["charts/success_rate"]) > 0:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            points = self.data["charts/success_rate"]
+            steps, values = zip(*points)
+            
+            ax.plot(steps, values, color='green', alpha=0.9, linewidth=1.5, label="Raw Success Rate")
+            
+            # Draw regime switch lines
+            if regime_switch_steps:
+                for rs_step in regime_switch_steps:
+                    ax.axvline(x=rs_step, color='red', linestyle='--', alpha=0.5, linewidth=1.5)
+            
+            ax.set_title("Unsmoothed Success Rate vs Steps", fontsize=14)
+            ax.set_xlabel('Steps', fontsize=12)
+            ax.set_ylabel('Success Rate', fontsize=12)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            
+            plt.tight_layout()
+            sr_save_path = os.path.join(save_dir, f"{self.run_name}_success_rate.png")
+            plt.savefig(sr_save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        
     def close(self) -> None:
         # Compatibility method, does nothing now
         pass

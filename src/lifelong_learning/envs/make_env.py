@@ -17,7 +17,17 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         3. OneHotPartialObsWrapper — symbolic (H,W,3) → one-hot (21,H,W)
         4. RegimeGoalSwapWrapper — non-stationary reward switching
     """
-    env = gym.make(env_id, render_mode=None, max_episode_steps=256)
+    # Extract num_regimes to pass to the env as num_goals.
+    # MiniGrid-MultiGoal environments accept a num_goals kwarg.
+    num_regimes = kwargs.get("num_regimes", 2)
+    
+    # We pass num_goals to gym.make config explicitly
+    env = gym.make(
+        env_id, 
+        render_mode=None, 
+        max_episode_steps=256,
+        num_goals=num_regimes
+    )
 
     # Full observability: PPO sees the entire 8×8 grid
     env = FullyObsWrapper(env)
@@ -28,12 +38,13 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
     # One-Hot encode observations: (H, W, 3) → (21, H, W) float tensor
     env = OneHotPartialObsWrapper(env, dict_mode=False)
 
-    # Regime switching: swaps which goal color is "good" vs "bad"
+    # Regime switching: swaps which goal is "good" vs "bad"
     env = RegimeGoalSwapWrapper(
         env,
         steps_per_regime=kwargs.get("steps_per_regime"),
         episodes_per_regime=kwargs.get("episodes_per_regime"),
         start_regime=kwargs.get("start_regime", 0),
+        num_regimes=num_regimes,
         seed=seed,
         shared_step_counter=kwargs.get("shared_step_counter"),
     )

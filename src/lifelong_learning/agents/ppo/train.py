@@ -44,6 +44,8 @@ def train_ppo(
     dreaming_ratio: float = 1.0,
     oracle_mode: bool = False,
     oracle_routing: bool = False,
+    max_regimes: int = 10,
+    save_buffer: bool = True,
 ):
     """
     Main Dyna-PPO training loop.
@@ -85,10 +87,10 @@ def train_ppo(
     # Model & Optimizer Setup
     # -------------------------------------------------------------------------
 
-    model = CNNActorCritic(obs_shape, n_actions, max_regimes=10).to(device)
+    model = CNNActorCritic(obs_shape, n_actions, max_regimes=max_regimes).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
-    world_model = MixtureOfWorldModels(obs_shape, n_actions, max_regimes=10).to(device)
+    world_model = MixtureOfWorldModels(obs_shape, n_actions, max_regimes=max_regimes, save_buffer=save_buffer).to(device)
     wm_optimizers = [torch.optim.Adam(world_model.models[0].parameters(), lr=wm_lr)]
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
 
@@ -105,7 +107,8 @@ def train_ppo(
         world_model.has_mastered.append(False)
         world_model.steps_under_threshold.append(0)
         world_model.spawn_steps.append(0)
-        world_model.safe_state_buffer.append(deque(maxlen=3))
+        if save_buffer:
+            world_model.safe_state_buffer.append(deque(maxlen=3))
         
         wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
 
@@ -233,14 +236,17 @@ def train_ppo(
 
         # Diagnostics: Context-Ignorance Lazy Policy Check
         with torch.no_grad():
-            r0 = torch.zeros(num_envs, dtype=torch.long, device=device)
-            r1 = torch.ones(num_envs, dtype=torch.long, device=device)
-            logits0, _ = model(obs_t, r0)
-            logits1, _ = model(obs_t, r1)
-            p0 = torch.nn.functional.softmax(logits0, dim=-1)
-            p1 = torch.nn.functional.softmax(logits1, dim=-1)
-            # KL(P0 || P1) = sum(P0 * log(P0 / P1))
-            kl_div = (p0 * (torch.log(p0 + 1e-8) - torch.log(p1 + 1e-8))).sum(dim=-1).mean().item()
+            if model.max_regimes > 1:
+                r0 = torch.zeros(num_envs, dtype=torch.long, device=device)
+                r1 = torch.ones(num_envs, dtype=torch.long, device=device)
+                logits0, _ = model(obs_t, r0)
+                logits1, _ = model(obs_t, r1)
+                p0 = torch.nn.functional.softmax(logits0, dim=-1)
+                p1 = torch.nn.functional.softmax(logits1, dim=-1)
+                # KL(P0 || P1) = sum(P0 * log(P0 / P1))
+                kl_div = (p0 * (torch.log(p0 + 1e-8) - torch.log(p1 + 1e-8))).sum(dim=-1).mean().item()
+            else:
+                kl_div = 0.0
 
         for t in range(cfg.num_steps):
             global_step += num_envs
@@ -471,7 +477,8 @@ def train_ppo(
                 world_model.active_regime_id = original_id
 
                 # Refresh safe state if this model is currently stable
-                world_model.refresh_safe_state(m_id, m_model, m_opt, global_step=global_step)
+                if save_buffer:
+                    world_model.refresh_safe_state(m_id, m_model, m_opt, global_step=global_step)
                 
             if m_id == active_id:
                 active_wm_stats = wm_stats

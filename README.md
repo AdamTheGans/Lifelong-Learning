@@ -73,26 +73,20 @@ python scripts/train_ppo.py --mode passive --total_timesteps 5000 --run_name smo
 
 ```bash
 # Stationary (no regime switching)
-python scripts/train_ppo.py --mode passive --total_timesteps 1000000 --run_name ppo_stationary
+python scripts/train_ppo.py --mode passive --total_timesteps 800000 --run_name ppo_stationary
 
-# Regime switching (slow)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --total_timesteps 2500000 --steps_per_regime 27500 --run_name ppo_regime_switch_slow
-
-# Regime switching (fast)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --total_timesteps 1500000 --steps_per_regime 12500 --run_name ppo_regime_switch_fast
+# Regime switching
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --total_timesteps 800000 --steps_per_regime 18500 --run_name ppo_regime_switch
 ```
 
 ### 1.4 Train Dyna-PPO
 
 ```bash
 # Stationary (no regime switching)
-python scripts/train_ppo.py --mode dyna --total_timesteps 1000000 --run_name dyna_stationary
+python scripts/train_ppo.py --mode dyna --max_regime 1 --no_save_buffer --total_timesteps 800000 --run_name dyna_stationary
 
-# Regime switching (slow)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --total_timesteps 2500000 --steps_per_regime 27500 --run_name dyna_regime_switch_slow
-
-# Regime switching (fast)
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --total_timesteps 1500000 --steps_per_regime 12500 --run_name dyna_regime_switch_fast
+# Regime switching
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --max_regime 1 --no_save_buffer --total_timesteps 800000 --steps_per_regime 18500 --run_name dyna_regime_switch
 ```
 
 ### 1.5 View Results
@@ -105,11 +99,14 @@ tensorboard --logdir runs
 python scripts/analyze_runs.py
 ```
 
-### 1.6 Resume Training
 
-To resume training from a checkpoint:
+
+# Part 2: Run the new MoWM code
 
 ```bash
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 1500000 --run_name ppo_stationary --resume_path checkpoints/ppo_stationary_update170.pt
+# Stationary (no regime switching)
+python scripts/train_ppo.py --mode dyna --total_timesteps 800000 --run_name mowm_stationary
+
+# Regime switching
+python scripts/train_ppo.py --mode dyna --total_timesteps 800000 --steps_per_regime 18500 --run_name mowm_regime_switch
 ```
-*Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*

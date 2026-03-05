@@ -35,6 +35,8 @@ def main():
 
     # Configurable Defaults
     p.add_argument("--dreaming_ratio", type=float, default=0.25, help="Multiplier for the number of dream rollouts. Set to 0.0 to disable dreaming. Default: 0.25")
+    p.add_argument("--max_regimes", type=int, default=10, help="Max capacity for world models (1 for standard Dyna-PPO)")
+    p.add_argument("--no_save_buffer", action="store_true", default=False, help="Disable safe state buffer rewinding")
     
     # Oracle Baseline
     p.add_argument("--oracle", action="store_true", default=False, help="Enable Oracle Baseline mode (perfect routing, frequent interleaving, no dreaming)")
@@ -81,6 +83,8 @@ def main():
         dreaming_ratio=args.dreaming_ratio,
         oracle_mode=args.oracle,
         oracle_routing=args.oracle_routing,
+        max_regimes=args.max_regimes,
+        save_buffer=not args.no_save_buffer,
     )
 
 

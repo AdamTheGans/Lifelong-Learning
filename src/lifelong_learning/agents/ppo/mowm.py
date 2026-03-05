@@ -14,12 +14,13 @@ class MixtureOfWorldModels(nn.Module):
     exceeds a dynamically tracked threshold (EMA).
     """
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256, max_regimes: int = 2):
+    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int, hidden_dim: int = 256, max_regimes: int = 2, save_buffer: bool = True):
         super().__init__()
         self.obs_shape = obs_shape
         self.n_actions = n_actions
         self.hidden_dim = hidden_dim
         self.max_regimes = max_regimes
+        self.save_buffer = save_buffer
 
         # Initialize with a single world model
         initial_model = SimpleWorldModel(obs_shape, n_actions, hidden_dim)
@@ -50,7 +51,7 @@ class MixtureOfWorldModels(nn.Module):
         # Safe State Rollback: rolling buffer of last 2 snapshots per model.
         # Each entry is a deque(maxlen=3) of tuples: (state_dict, optimizer_state, ema_loss, step)
         # Rollback uses deque[0] (oldest) to guarantee the snapshot predates any lag-period corruption.
-        self.safe_state_buffer = [collections.deque(maxlen=3)]
+        self.safe_state_buffer = [collections.deque(maxlen=3)] if self.save_buffer else []
 
         # State tracking
         self.force_active_until = 0
@@ -66,6 +67,9 @@ class MixtureOfWorldModels(nn.Module):
         Appends to a rolling deque(maxlen=3). Snapshots are stored on CPU
         to avoid doubling GPU VRAM usage.
         """
+        if not getattr(self, "save_buffer", True):
+            return
+
         is_stable = (
             self.ema_losses[regime_id] < self.mastery_loss_threshold
             and global_step >= self.force_active_until
@@ -92,6 +96,9 @@ class MixtureOfWorldModels(nn.Module):
 
         Returns True if rollback occurred, False if no safe state was available.
         """
+        if not getattr(self, "save_buffer", True):
+            return False
+
         buf = self.safe_state_buffer[regime_id]
         if len(buf) == 0:
             print(f"[MoWM] Rollback skipped for Model {regime_id}: no safe state available (newborn).")
@@ -309,7 +316,8 @@ class MixtureOfWorldModels(nn.Module):
         self.spawn_steps.append(global_step)
         if hasattr(self, 'timeout_triggered'):
             self.timeout_triggered.append(False)
-        self.safe_state_buffer.append(collections.deque(maxlen=3))
+        if getattr(self, "save_buffer", True):
+            self.safe_state_buffer.append(collections.deque(maxlen=3))
         self.force_active_until = global_step + self.newborn_grace_period
 
         print(f"\n[MoWM] Spawned new World Model {new_id} at step {global_step}.")

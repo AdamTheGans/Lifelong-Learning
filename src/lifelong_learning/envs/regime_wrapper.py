@@ -19,11 +19,13 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         episodes_per_regime: int | None = None,
         start_regime: int = 0,
         seed: int = 0,
+        total_regimes: int = 2,
     ):
         super().__init__(env)
         self.steps_per_regime = steps_per_regime
         self.episodes_per_regime = episodes_per_regime
         self.start_regime = start_regime
+        self.total_regimes = total_regimes
         
         self.regime_id: int = start_regime
         self.cumulative_steps: int = 0
@@ -33,11 +35,11 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         # Update based on steps
         if self.steps_per_regime:
             cycle = self.cumulative_steps // self.steps_per_regime
-            self.regime_id = (self.start_regime + cycle) % 2
+            self.regime_id = (self.start_regime + cycle) % self.total_regimes
         # Update based on episodes
         elif self.episodes_per_regime:
             cycle = self.cumulative_episodes // self.episodes_per_regime
-            self.regime_id = (self.start_regime + cycle) % 2
+            self.regime_id = (self.start_regime + cycle) % self.total_regimes
 
     def reset(self, **kwargs):
         # If this is an AutoReset (not the initial reset), it consumes a vector env step tick.
@@ -54,7 +56,14 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
         self.cumulative_steps += 1
         self._update_regime_deterministic()
 
-        obs, original_reward, terminated, truncated, info = self.env.step(action)
+        # Action cycling for regimes 2 and 3
+        # Assuming action space is Discrete(3): 0=Left, 1=Right, 2=Forward
+        if self.regime_id in [2, 3]:
+            action_shifted = (int(action) + 1) % 3
+        else:
+            action_shifted = action
+
+        obs, original_reward, terminated, truncated, info = self.env.step(action_shifted)
         info["regime_id"] = self.regime_id
 
         # Success counters (set on every step so log/ keys always have a value)
@@ -79,16 +88,16 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
                 hit_green = (agent_pos == green_pos)
                 hit_blue = (agent_pos == blue_pos)
                 
-                if self.regime_id == 0:
-                    # Regime 0: Green Good (+5), Blue Bad (-1)
+                if self.regime_id in [0, 3]:
+                    # Regime 0/3: Green Good (+5), Blue Bad (-1)
                     if hit_green:
                         final_reward += 5.0
                         info["reached_good_goal"] = 1.0
                     elif hit_blue:
                         final_reward += -1.0
                         info["reached_bad_goal"] = 1.0
-                else:
-                    # Regime 1: Green Bad (-1), Blue Good (+5)
+                else: # self.regime_id in [1, 2]
+                    # Regime 1/2: Green Bad (-1), Blue Good (+5)
                     if hit_green:
                         final_reward += -1.0
                         info["reached_bad_goal"] = 1.0
@@ -97,7 +106,7 @@ class RegimeGoalSwapWrapper(gym.Wrapper):
                         info["reached_good_goal"] = 1.0
             else:
                 # Fallback for standard MiniGrid environments (like Empty)
-                if self.regime_id == 0:
+                if self.regime_id in [0, 3]:
                     final_reward += 5.0
                     info["reached_good_goal"] = 1.0
                 else:

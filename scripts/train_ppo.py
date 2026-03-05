@@ -18,6 +18,7 @@ def main():
     p.add_argument("--steps_per_regime", type=int, default=None, help="Steps per env before regime switch")
     p.add_argument("--episodes_per_regime", type=int, default=None, help="Episodes per env before regime switch")
     p.add_argument("--start_regime", type=int, default=0)
+    p.add_argument("--total_env_regimes", type=int, default=2, choices=[2, 4], help="How many underlying env regimes to cycle through.")
 
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint.pt to resume from")
@@ -81,10 +82,10 @@ def main():
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
         dreaming_ratio=args.dreaming_ratio,
-        oracle_mode=args.oracle,
         oracle_routing=args.oracle_routing,
         max_regimes=args.max_regimes,
         save_buffer=not args.no_save_buffer,
+        total_env_regimes=args.total_env_regimes,
     )
 
 

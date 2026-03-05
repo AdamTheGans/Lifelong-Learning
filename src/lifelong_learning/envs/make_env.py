@@ -35,6 +35,7 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, render_mode: str
         episodes_per_regime=kwargs.get("episodes_per_regime"),
         start_regime=kwargs.get("start_regime", 0),
         seed=seed,
+        total_regimes=kwargs.get("total_regimes", 2),
     )
 
     return env

@@ -42,10 +42,10 @@ def train_ppo(
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
     dreaming_ratio: float = 1.0,
-    oracle_mode: bool = False,
     oracle_routing: bool = False,
     max_regimes: int = 10,
     save_buffer: bool = True,
+    total_env_regimes: int = 2,
 ):
     """
     Main Dyna-PPO training loop.
@@ -76,6 +76,7 @@ def train_ppo(
                 episodes_per_regime=episodes_per_regime,
                 start_regime=start_regime,
                 record_stats=False,
+                total_regimes=total_env_regimes,
             )
         return thunk
 

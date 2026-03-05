@@ -114,6 +114,44 @@ def test_rewards():
     expected = 5.0 - 0.01
     assert np.isclose(reward, expected), f"Expected {expected}, got {reward}"
 
+    # --- Re-initialize to test 4 regimes for Regime 2 and 3 ---
+    base_env = DualGoalEnv(size=8, max_steps=100)
+    env = RegimeGoalSwapWrapper(base_env, start_regime=2, steps_per_regime=1000, total_regimes=4)
+
+    # --- Regime 2: Actions Cycled, Green = -1, Blue = +5 ---
+    obs, info = env.reset()
+    assert info["regime_id"] == 2, f"Should be regime 2, got {info['regime_id']}"
+
+    blue_pos = env.unwrapped.blue_goal_pos
+    start_pos, direction = find_valid_start_pos(env, blue_pos)
+    env.unwrapped.agent_pos = start_pos
+    env.unwrapped.agent_dir = direction
+
+    # In Regime 2, sending "Right" (1) gets cycled +1 mod 3 to "Forward" (2)
+    obs, reward, terminated, truncated, info = env.step(env.unwrapped.actions.right)
+    print(f"Regime 2 Hit Blue Reward: {reward}")
+    expected = 5.0 - 0.01
+    assert np.isclose(reward, expected), f"Expected {expected}, got {reward}"
+    assert terminated
+
+    # --- Regime 3: Actions Cycled, Green = +5, Blue = -1 ---
+    # Advance to Regime 3
+    env.cumulative_steps = 1005
+    obs, info = env.reset()
+    assert info["regime_id"] == 3, f"Should be regime 3, got {info['regime_id']}"
+
+    green_pos = env.unwrapped.green_goal_pos
+    start_pos, direction = find_valid_start_pos(env, green_pos)
+    env.unwrapped.agent_pos = start_pos
+    env.unwrapped.agent_dir = direction
+
+    # In Regime 3, sending "Right" (1) gets cycled +1 mod 3 to "Forward" (2)
+    obs, reward, terminated, truncated, info = env.step(env.unwrapped.actions.right)
+    print(f"Regime 3 Hit Green Reward: {reward}")
+    expected = 5.0 - 0.01
+    assert np.isclose(reward, expected), f"Expected {expected}, got {reward}"
+    assert terminated
+
     print("\nALL REWARD TESTS PASSED!")
 
 if __name__ == "__main__":

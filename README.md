@@ -83,10 +83,10 @@ python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode passive --t
 
 ```bash
 # Stationary (no regime switching)
-python scripts/train_ppo.py --mode dyna --max_regime 1 --no_save_buffer --total_timesteps 800000 --run_name dyna_stationary
+python scripts/train_ppo.py --mode dyna --max_regimes 1 --no_save_buffer --total_timesteps 800000 --run_name dyna_stationary
 
 # Regime switching
-python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --max_regime 1 --no_save_buffer --total_timesteps 800000 --steps_per_regime 18500 --run_name dyna_regime_switch
+python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --max_regimes 1 --no_save_buffer --total_timesteps 800000 --steps_per_regime 18500 --run_name dyna_regime_switch
 ```
 
 ### 1.5 View Results
@@ -109,4 +109,18 @@ python scripts/train_ppo.py --mode dyna --total_timesteps 800000 --run_name mowm
 
 # Regime switching
 python scripts/train_ppo.py --mode dyna --total_timesteps 800000 --steps_per_regime 18500 --run_name mowm_regime_switch
+```
+
+
+# Part 3: Run all tests with 4 regimes
+
+```bash
+# PPO 4 regimes
+python scripts/train_ppo.py --mode passive --total_timesteps 2250000 --steps_per_regime 18500 --total_env_regimes 4 --run_name ppo_4_regimes
+
+# Dyna-PPO 4 regimes
+python scripts/train_ppo.py --mode dyna --max_regimes 1 --no_save_buffer --total_timesteps 2250000 --steps_per_regime 18500 --total_env_regimes 4 --run_name dyna_4_regimes
+
+# MoWM 4 regimes
+python scripts/train_ppo.py --mode dyna --total_timesteps 2250000 --steps_per_regime 18500 --total_env_regimes 4 --run_name mowm_4_regimes
 ```

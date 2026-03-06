@@ -68,12 +68,13 @@ class SignalExtractor:
     delta computation.
     """
 
-    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50):
+    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50, max_inner_lr: float = 0.01):
         self.normalizer = RunningNormalizer(NUM_SIGNALS)
         self.surprise_history = deque(maxlen=history_len)
         self.spike_threshold = surprise_spike_threshold
         self.steps_since_spike = 0
         self.prev_surprise = 0.0
+        self.max_inner_lr = max_inner_lr
 
     def extract(self, stats: dict) -> np.ndarray:
         """
@@ -118,7 +119,47 @@ class SignalExtractor:
         ], dtype=np.float32)
 
         self.normalizer.update(raw)
-        return self.normalizer.normalize(raw)
+        normed = self.normalizer.normalize(raw)
+
+        # Override explicitly bounded signals with static normalization to preserve absolute magnitude awareness.
+        # This prevents the Brain from losing track of absolute HP values when they saturate.
+        
+        # 1: success_rate -> [0, 1] mapped to [-1, 1]
+        normed[1] = stats.get("success_rate", 0.0) * 2.0 - 1.0
+        # 2: failure_rate -> [0, 1] mapped to [-1, 1]
+        normed[2] = stats.get("failure_rate", 0.0) * 2.0 - 1.0
+        
+        # 10: current_lr -> log scale [1e-5, max_inner_lr] mapped to [-1, 1]
+        lr = stats.get("current_lr", 1e-4)
+        normed[10] = (np.log(max(lr, 1e-8)) - np.log(1e-5)) / (np.log(self.max_inner_lr) - np.log(1e-5)) * 2.0 - 1.0
+        normed[10] = np.clip(normed[10], -1.0, 1.0)
+        
+        # 11: current_ent_coef -> log scale [0.001, 0.1] mapped to [-1, 1]
+        ent = stats.get("current_ent_coef", 0.01)
+        normed[11] = (np.log(max(ent, 1e-8)) - np.log(0.001)) / (np.log(0.1) - np.log(0.001)) * 2.0 - 1.0
+        normed[11] = np.clip(normed[11], -1.0, 1.0)
+        
+        # 12: current_intrinsic_coef -> log scale [0.001, 0.5] mapped to [-1, 1]
+        ic = stats.get("current_intrinsic_coef", 0.015)
+        normed[12] = (np.log(max(ic, 1e-8)) - np.log(0.001)) / (np.log(0.5) - np.log(0.001)) * 2.0 - 1.0
+        normed[12] = np.clip(normed[12], -1.0, 1.0)
+        
+        # 13: current_imagined_horizon -> linear [1, 30] mapped to [-1, 1]
+        hor = stats.get("current_imagined_horizon", 10.0)
+        normed[13] = (hor - 1.0) / (30.0 - 1.0) * 2.0 - 1.0
+        normed[13] = np.clip(normed[13], -1.0, 1.0)
+        
+        # 15: current_replay_ratio -> linear [0.0, 0.5] mapped to [-1, 1]
+        rr = stats.get("current_replay_ratio", 0.0)
+        normed[15] = (rr - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
+        normed[15] = np.clip(normed[15], -1.0, 1.0)
+        
+        # 16: episodic_memory_fullness -> [0, 1] mapped to [-1, 1]
+        full = stats.get("episodic_memory_fullness", 0.0)
+        normed[16] = full * 2.0 - 1.0
+        normed[16] = np.clip(normed[16], -1.0, 1.0)
+
+        return normed
 
     def _detect_spike(self, surprise: float) -> bool:
         """

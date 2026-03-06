@@ -105,6 +105,8 @@ def train_brain(args):
                 inner_log_dir=log_dir_str,
                 env_index=env_idx,
                 episodic_memory_capacity=args.episodic_memory_capacity,
+                max_inner_lr=args.max_inner_lr,
+                start_episode=start_episode,
             )
         return _make_env_fn
 
@@ -148,6 +150,8 @@ def train_brain(args):
     # Only run pretraining if starting from scratch
     if args.pretrain_episodes > 0 and start_episode == 1:
         print(f"\n--- Starting Imitation Learning Pretraining for {args.pretrain_episodes} episodes ---")
+        meta_env.set_attr("_episode_prefix", "pretrain")
+        meta_env.set_attr("_episode_counter", 0)
         for pre_ep in range(1, args.pretrain_episodes + 1):
             ep_start = time.time()
             obs, info = meta_env.reset()
@@ -163,11 +167,13 @@ def train_brain(args):
                 target_actions = np.zeros((args.brain_num_envs, 5), dtype=np.float32)
                 for i in range(args.brain_num_envs):
                     if success_rates[i] < 0.5:
-                        # Explore: increase lr, ent, curiosity; no replay of old task
-                        target_actions[i] = [0.5, 0.5, 0.5, 0.0, -0.5]
+                        # Explore: map towards higher values (actions > 0)
+                        # LR ~max, Ent ~high, Intr ~high, Horizon ~max, ReplayRatio ~0
+                        target_actions[i] = [0.8, 0.8, 0.8, 0.8, -0.9]
                     else:
-                        # Exploit: decrease lr, ent, curiosity; rehearse old knowledge
-                        target_actions[i] = [-0.5, -0.5, -0.5, 0.0, 0.5]
+                        # Exploit: map towards lower values (actions < 0)
+                        # LR ~min, Ent ~min, Intr ~min, Horizon ~min, ReplayRatio ~0.5 (action=1)
+                        target_actions[i] = [-0.8, -0.8, -0.8, -0.8, 0.8]
 
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
                 target_a_t = torch.tensor(target_actions, dtype=torch.float32, device=device)
@@ -202,6 +208,11 @@ def train_brain(args):
 
     print(f"\n--- Starting Meta-RL PPO Training (Target: {target_episodes}) ---")
     all_episode_rewards = []
+    
+    # Restore the prefix and starting episode counter count since pretraining modified it
+    if args.pretrain_episodes > 0 and start_episode == 1:
+        meta_env.set_attr("_episode_prefix", "episode")
+        meta_env.set_attr("_episode_counter", start_episode - 1)
 
     for episode in range(start_episode, target_episodes + 1):
         ep_start = time.time()
@@ -389,6 +400,7 @@ def main():
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
     p.add_argument("--inner_imagined_horizon", type=int, default=10)
     p.add_argument("--inner_wm_lr", type=float, default=1e-4)
+    p.add_argument("--max_inner_lr", type=float, default=0.01, help="Maximum absolute bound for the inner agent's learning rate")
 
     # Brain meta-agent settings
     p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")

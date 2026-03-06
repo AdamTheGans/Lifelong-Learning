@@ -572,6 +572,9 @@ def run_inner_update(state: InnerTrainState) -> dict:
     s.logger.scalar("charts/reward_step_mean", s.buffer.rewards.mean().item(), s.global_step)
     s.logger.scalar("charts/reward_step_max", s.buffer.rewards.max().item(), s.global_step)
     s.logger.scalar("charts/reward_step_std", s.buffer.rewards.std().item(), s.global_step)
+    s.logger.scalar("brain/ent_coef", s.cfg.ent_coef, s.global_step)
+    s.logger.scalar("brain/intrinsic_coef", s.intrinsic_coef, s.global_step)
+    s.logger.scalar("brain/imagined_horizon", float(s.imagined_horizon), s.global_step)
 
     sps = int(s.global_step / max(1e-9, (time.time() - s.start_time)))
     s.logger.scalar("charts/SPS", sps, s.global_step)
@@ -593,15 +596,22 @@ def run_inner_update(state: InnerTrainState) -> dict:
         )
         print(f"[save] {ckpt_path}")
 
-    # Live plotting and logging every 10 updates or at the very end
+    # Log progress every 10 updates or at the very end
     if update % 10 == 0 or update == s.num_updates:
         print(f"update {update}/{s.num_updates} | step={s.global_step} | SPS={sps}")
         
-        if s.logger is not None:
-            plot_dir = getattr(s.logger, 'full_dir', s.save_dir)
-            s.logger.plot(save_dir=plot_dir, title=f"Inner Agent: {s.run_name}")
-
     s.current_update += 1
+    
+    # Plot only at the very end of the run
+    if s.current_update > s.num_updates and s.logger is not None:
+        plot_dir = getattr(s.logger, 'full_dir', "")
+        if not plot_dir:
+            # Fallback if full_dir not set
+            plot_dir = s.save_dir.replace("inner_checkpoints", "")
+        # Remove trailing slash if any and ensure it exists
+        plot_dir = plot_dir.rstrip("\\/")
+        os.makedirs(plot_dir, exist_ok=True)
+        s.logger.plot(save_dir=plot_dir, title=f"Inner Agent: {s.run_name}")
 
     # -----------------------------------------------------------------
     # Build stats dict for the Brain

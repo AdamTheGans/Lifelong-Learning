@@ -27,10 +27,11 @@ class MetaEnv(gym.Env):
     Gymnasium environment where:
       - Observation: 15-dim vector of normalized training signals
       - Action: 4-dim continuous vector controlling hyperparameter adjustments
-        [0] lr scale        ∈ [-1, 1] → mapped to multiply by [0.5, 2.0]
-        [1] ent_coef scale  ∈ [-1, 1] → mapped to multiply by [0.5, 2.0]
-        [2] intrinsic_coef  ∈ [-1, 1] → mapped to multiply by [0.5, 2.0]
-        [3] imagined_horizon ∈ [-1, 1] → mapped to delta {-2, -1, 0, +1, +2}
+        [0] lr scale        ∈ [-1, 1] → mapped linearly to [lr_min, lr_max]
+        [1] ent_coef scale  ∈ [-1, 1] → mapped linearly to [ent_min, ent_max]
+        [2] intrinsic_coef  ∈ [-1, 1] → mapped linearly to [intr_min, intr_max]
+        [3] imagined_horizon ∈ [-1, 1] → mapped linearly to [1, 30]
+        [4] replay_ratio    ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
       - Reward: recovery-based metric (Δ success_rate + α·Δ return - β·failure_rate)
       - Episode: one full inner training run
     """
@@ -58,9 +59,12 @@ class MetaEnv(gym.Env):
         inner_log_dir: str | None = None,
         env_index: int = 0,
         episodic_memory_capacity: int = 50000,
+        max_inner_lr: float = 0.01,
+        start_episode: int = 1,
     ):
         super().__init__()
 
+        self.start_episode = start_episode
         self.env_index = env_index
         self.env_id = env_id
         self.inner_cfg = inner_cfg or PPOConfig()
@@ -80,6 +84,7 @@ class MetaEnv(gym.Env):
         self.wm_lr = wm_lr
         self.inner_log_dir = inner_log_dir
         self.episodic_memory_capacity = episodic_memory_capacity
+        self.max_inner_lr = max_inner_lr
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -90,7 +95,7 @@ class MetaEnv(gym.Env):
         )
 
         # HP bounds (absolute min/max)
-        self.lr_bounds = (1e-5, 1e-2)
+        self.lr_bounds = (1e-5, self.max_inner_lr)
         self.ent_coef_bounds = (0.001, 0.1)
         self.intrinsic_coef_bounds = (0.001, 0.5)
         self.imagined_horizon_bounds = (1, 30)
@@ -102,7 +107,8 @@ class MetaEnv(gym.Env):
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
-        self._episode_counter = 0
+        self._episode_counter = self.start_episode - 1
+        self._episode_prefix = "episode"
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -110,12 +116,6 @@ class MetaEnv(gym.Env):
 
         # Clean up any previous inner training
         if self._state is not None:
-            # Generate plots for every single inner agent episode into its own specific run folder
-            if self._episode_counter > 0:
-                if hasattr(self._state, 'logger') and hasattr(self._state.logger, 'plot'):
-                    # Save the plot directly in the agent's unique run directory rather than a shared folder
-                    plot_dir = self._state.logger.full_dir if hasattr(self._state.logger, 'full_dir') else os.path.join(self.inner_log_dir or "runs", "inner_agent_charts")
-                    self._state.logger.plot(save_dir=plot_dir, title=f"Inner Agent: Ep {self._episode_counter} | Env {self.env_index}")
             close_inner_training(self._state)
 
         self._episode_counter += 1
@@ -138,13 +138,13 @@ class MetaEnv(gym.Env):
             episodic_memory_capacity=self.episodic_memory_capacity,
         )
         if self.inner_log_dir is not None:
-            ep_log_dir = os.path.join(self.inner_log_dir, f"episode_{self._episode_counter}")
+            ep_log_dir = os.path.join(self.inner_log_dir, f"{self._episode_prefix}_{self._episode_counter}")
             init_kwargs["log_dir"] = ep_log_dir
             init_kwargs["save_dir"] = os.path.join(ep_log_dir, "inner_checkpoints")
             
         self._state = init_inner_training(**init_kwargs)
 
-        self._signal_extractor = SignalExtractor()
+        self._signal_extractor = SignalExtractor(max_inner_lr=self.max_inner_lr)
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
@@ -196,59 +196,32 @@ class MetaEnv(gym.Env):
         return stats
 
     def _apply_action(self, action: np.ndarray):
-        """Map Brain action [-1, 1]^4 to HP adjustments and apply to inner state."""
+        """Map Brain action [-1, 1]^5 to absolute HP values and apply to inner state."""
         s = self._state
 
-        # Action[0]: lr scale → multiply by [0.5, 2.0]
-        lr_multiplier = self._action_to_multiplier(action[0])
-        new_lr = np.clip(
-            s.optimizer.param_groups[0]["lr"] * lr_multiplier,
-            *self.lr_bounds
-        )
+        # Helper to map [-1, 1] to [min_val, max_val]
+        def map_to_range(a: float, bounds: tuple[float, float]) -> float:
+            return float(bounds[0] + (a + 1.0) / 2.0 * (bounds[1] - bounds[0]))
+
+        # Action[0]: lr scale
+        new_lr = map_to_range(action[0], self.lr_bounds)
         s.optimizer.param_groups[0]["lr"] = new_lr
 
-        # Action[1]: ent_coef scale → multiply by [0.5, 2.0]
-        ent_multiplier = self._action_to_multiplier(action[1])
-        s.cfg.ent_coef = float(np.clip(
-            s.cfg.ent_coef * ent_multiplier,
-            *self.ent_coef_bounds
-        ))
+        # Action[1]: ent_coef
+        s.cfg.ent_coef = map_to_range(action[1], self.ent_coef_bounds)
 
-        # Action[2]: intrinsic_coef scale → multiply by [0.5, 2.0]
-        ic_multiplier = self._action_to_multiplier(action[2])
-        s.intrinsic_coef = float(np.clip(
-            s.intrinsic_coef * ic_multiplier,
-            *self.intrinsic_coef_bounds
-        ))
+        # Action[2]: intrinsic_coef
+        s.intrinsic_coef = map_to_range(action[2], self.intrinsic_coef_bounds)
 
-        # Action[3]: imagined_horizon delta → {-2, -1, 0, +1, +2}
-        horizon_delta = int(np.round(action[3] * 2))  # [-1,1] → [-2,2]
-        s.imagined_horizon = int(np.clip(
-            s.imagined_horizon + horizon_delta,
-            *self.imagined_horizon_bounds
-        ))
+        # Action[3]: imagined_horizon (integer mapping)
+        horizon_float = map_to_range(action[3], self.imagined_horizon_bounds)
+        s.imagined_horizon = int(np.clip(round(horizon_float), *self.imagined_horizon_bounds))
 
-        # Action[4]: replay_ratio → linear map [-1, 1] → [0.0, 0.5]
-        replay_ratio = float((action[4] + 1.0) / 2.0 * 0.5)  # [-1,1] → [0, 0.5]
-        s.replay_ratio = float(np.clip(
-            replay_ratio,
-            *self.replay_ratio_bounds
-        ))
-
-    @staticmethod
-    def _action_to_multiplier(a: float) -> float:
-        """Map action ∈ [-1, 1] to multiplier ∈ [0.5, 2.0]."""
-        # Linear: -1 → 0.5, 0 → 1.0, 1 → 2.0
-        # Using exponential mapping for smoother behavior:
-        #   a=-1 → 2^(-1) = 0.5, a=0 → 2^0 = 1.0, a=1 → 2^1 = 2.0
-        return float(2.0 ** a)
+        # Action[4]: replay_ratio
+        s.replay_ratio = map_to_range(action[4], self.replay_ratio_bounds)
 
     def close(self):
         if self._state is not None:
-            if self._episode_counter > 0:
-                if hasattr(self._state, 'logger') and hasattr(self._state.logger, 'plot'):
-                    plot_dir = self._state.logger.full_dir if hasattr(self._state.logger, 'full_dir') else os.path.join(self.inner_log_dir or "runs", "inner_agent_charts")
-                    self._state.logger.plot(save_dir=plot_dir, title=f"Inner Agent: Ep {self._episode_counter} | Env {self.env_index}")
             close_inner_training(self._state)
             self._state = None
         super().close()

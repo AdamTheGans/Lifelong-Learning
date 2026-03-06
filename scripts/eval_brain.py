@@ -99,10 +99,10 @@ def eval_brain(args):
         episodic_memory_capacity=args.episodic_memory_capacity,
     )
 
-    sig = SignalExtractor()
+    sig = SignalExtractor(max_inner_lr=args.max_inner_lr)
 
     # HP bounds (same as MetaEnv)
-    lr_bounds = (1e-5, 1e-2)
+    lr_bounds = (1e-5, args.max_inner_lr)
     ent_coef_bounds = (0.001, 0.1)
     intrinsic_coef_bounds = (0.001, 0.5)
     imagined_horizon_bounds = (1, 30)
@@ -141,35 +141,29 @@ def eval_brain(args):
                 action_mean, value = brain_model.forward(obs_t)
                 action = action_mean.squeeze(0).cpu().numpy()
 
-            # Apply Brain's actions to inner agent hyperparameters
-            # action[0]: LR multiplier (tanh → 2^a scaling)
-            a = float(action[0])  # in [-1, 1]
-            new_lr = state.optimizer.param_groups[0]["lr"] * (2.0 ** a)
-            new_lr = float(np.clip(new_lr, *lr_bounds))
+            # Helper to map [-1, 1] to [min_val, max_val]
+            def map_to_range(a_val: float, bounds: tuple[float, float]) -> float:
+                return float(bounds[0] + (a_val + 1.0) / 2.0 * (bounds[1] - bounds[0]))
+
+            # Action[0]: lr scale
+            new_lr = map_to_range(float(action[0]), lr_bounds)
             state.optimizer.param_groups[0]["lr"] = new_lr
 
-            # action[1]: entropy coefficient multiplier
-            a = float(action[1])
-            new_ent = state.cfg.ent_coef * (2.0 ** a)
-            new_ent = float(np.clip(new_ent, *ent_coef_bounds))
+            # Action[1]: entropy coefficient
+            new_ent = map_to_range(float(action[1]), ent_coef_bounds)
             state.cfg.ent_coef = new_ent
 
-            # action[2]: intrinsic curiosity coefficient multiplier
-            a = float(action[2])
-            new_ic = state.intrinsic_coef * (2.0 ** a)
-            new_ic = float(np.clip(new_ic, *intrinsic_coef_bounds))
+            # Action[2]: intrinsic curiosity coefficient
+            new_ic = map_to_range(float(action[2]), intrinsic_coef_bounds)
             state.intrinsic_coef = new_ic
 
-            # action[3]: imagined horizon multiplier
-            a = float(action[3])
-            new_ih = state.imagined_horizon * (2.0 ** a)
-            new_ih = int(np.clip(round(new_ih), *imagined_horizon_bounds))
+            # Action[3]: imagined horizon
+            horizon_float = map_to_range(float(action[3]), imagined_horizon_bounds)
+            new_ih = int(np.clip(round(horizon_float), *imagined_horizon_bounds))
             state.imagined_horizon = new_ih
 
-            # action[4]: replay ratio (linear map [-1,1] → [0, 0.5])
-            a = float(action[4])
-            new_rr = (a + 1.0) / 2.0 * replay_ratio_bounds[1]
-            new_rr = float(np.clip(new_rr, *replay_ratio_bounds))
+            # Action[4]: replay ratio
+            new_rr = map_to_range(float(action[4]), replay_ratio_bounds)
             state.replay_ratio = new_rr
 
             # Log Brain decisions
@@ -214,6 +208,7 @@ def main():
     p.add_argument("--imagined_horizon", type=int, default=10)
     p.add_argument("--wm_lr", type=float, default=1e-4)
     p.add_argument("--episodic_memory_capacity", type=int, default=50000)
+    p.add_argument("--max_inner_lr", type=float, default=0.01, help="Maximum absolute bound for the inner agent's learning rate")
 
     # Brain settings
     p.add_argument("--decision_interval", type=int, default=10)

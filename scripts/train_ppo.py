@@ -82,6 +82,7 @@ def main():
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
         dreaming_ratio=args.dreaming_ratio,
+        oracle_mode=args.oracle,
         oracle_routing=args.oracle_routing,
         max_regimes=args.max_regimes,
         save_buffer=not args.no_save_buffer,

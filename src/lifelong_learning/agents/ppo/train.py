@@ -42,6 +42,7 @@ def train_ppo(
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
     dreaming_ratio: float = 1.0,
+    oracle_mode: bool = False,
     oracle_routing: bool = False,
     max_regimes: int = 10,
     save_buffer: bool = True,

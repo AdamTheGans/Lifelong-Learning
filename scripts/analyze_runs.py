@@ -62,31 +62,39 @@ def load_data_from_logdir(logdir, tags=None):
 
 def detect_switches(data):
     """
-    Detects regime switches by analyzing r_regime_0 and r_regime_1 logs.
+    Detects regime switches by analyzing r_regime_* logs.
     Returns a list of steps where switches probably occurred.
     """
-    if "charts/r_regime_0" not in data or "charts/r_regime_1" not in data:
+    regime_dfs = []
+    for i in range(4):
+        key = f"charts/r_regime_{i}"
+        if key in data and not data[key].empty:
+            df = data[key].copy()
+            df["regime"] = i
+            regime_dfs.append(df)
+            
+    if len(regime_dfs) < 2:
         return None
-
-    df0 = data["charts/r_regime_0"].copy()
-    df1 = data["charts/r_regime_1"].copy()
-    
-    df0["regime"] = 0
-    df1["regime"] = 1
-    
+        
     # Combine and sort by step
-    combined = pd.concat([df0, df1]).sort_values("step")
+    combined = pd.concat(regime_dfs).sort_values("step")
     
     if combined.empty:
         return None
 
-    # Calculate rolling mean of regime label (0 or 1)
+    # Smooth the combined data to avoid noisy flip-flops during transition phases
+    # Easiest way is to one-hot encode the sampled regimes, mean-smooth them, and argmax
+    one_hots = pd.get_dummies(combined["regime"])
     window_size = 20
-    combined["smoothed_regime"] = combined["regime"].rolling(window=window_size, center=True, min_periods=1).mean()
+    smoothed = one_hots.rolling(window=window_size, center=True, min_periods=1).mean()
     
-    # Find crossings of 0.5
-    combined["pred_regime"] = (combined["smoothed_regime"] > 0.5).astype(int)
-    combined["switch"] = combined["pred_regime"].diff().abs()
+    # Assign the most probable regime based on the smoothed window
+    combined["pred_regime"] = smoothed.idxmax(axis=1)
+    
+    # A switch happens when pred_regime changes
+    combined["switch"] = (combined["pred_regime"] != combined["pred_regime"].shift(1)).astype(int)
+    # The first row will naturally flag as True (1) because shift is NaN, ignore that
+    combined.iloc[0, combined.columns.get_loc('switch')] = 0
     
     # Filter for actual switches (value == 1)
     switch_points = combined[combined["switch"] == 1]
@@ -223,7 +231,7 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
     ax.axhline(0, color='black', linewidth=0.8, alpha=0.3, zorder=1)
 
     # 4. Regime Shading
-    regime_colors = ['#e6f5ff', '#fff5e6'] # Light blue, Light orange
+    regime_colors = ['#e6f5ff', '#fff5e6', '#e6ffe6', '#f2e6ff'] # Blue, Orange, Green, Purple
     y_min, y_max = ax.get_ylim()
 
     if regime_boundaries:
@@ -234,13 +242,13 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
             if end > max_step: end = max_step
             
             regime_idx = i
-            color = regime_colors[regime_idx % 2]
+            color = regime_colors[regime_idx % len(regime_colors)]
             
             ax.axvspan(start, end, color=color, alpha=0.5, zorder=0)
             
             # Label
-            if end - start > (max_step * 0.05): 
-                ax.text(start + (end-start)/2, y_max, f"Regime {regime_idx % 2}", 
+            if end - start > (max_step * 0.05):
+                ax.text(start + (end-start)/2, y_max, f"Regime {regime_idx % len(regime_colors)}", 
                          ha='center', va='bottom', fontsize=8, fontweight='bold', color='gray')
 
     if return_fig:
@@ -273,6 +281,8 @@ def plot_run(logdir, run_name):
         "intrinsic_ratio": "ppo/intrinsic_reward_ratio",
         "regime0": "charts/r_regime_0",
         "regime1": "charts/r_regime_1",
+        "regime2": "charts/r_regime_2",
+        "regime3": "charts/r_regime_3",
         "step_rew": "charts/reward_step_mean",
         "mowm_active": "mowm/active_regime_id",
         "mowm_num": "mowm/num_regimes",
@@ -310,11 +320,15 @@ def plot_run(logdir, run_name):
         boundaries = [0, max_step]
 
     # Ground truth regime values based on boundaries
+    # Figure out how many unique regimes we are cycling through based on data found
+    num_regimes_tracked = sum(1 for k in data.keys() if k.startswith("charts/r_regime_") and not data[k].empty)
+    cycle_size = max(2, num_regimes_tracked) # fallback to 2
+    
     def get_true_regime(step):
         for i, b in enumerate(boundaries[:-1]):
             if step >= b and step < boundaries[i+1]:
-                return i % 2
-        return (len(boundaries) - 2) % 2
+                return i % cycle_size
+        return (len(boundaries) - 2) % cycle_size
 
     # --- Generate Separate Regime Plots ---
     # Ensure graphs directory exists
@@ -470,7 +484,7 @@ def plot_run(logdir, run_name):
         # Plot true regime for comparison (very thick & transparent to prevent hiding predicted lines)
         steps = np.linspace(0, max_step, 10000)
         true_regimes = [get_true_regime(s) for s in steps]
-        line_true, = ax6.plot(steps, true_regimes, c="gray", lw=8, alpha=0.3, drawstyle='steps-post', label="True Regime (0/1)")
+        line_true, = ax6.plot(steps, true_regimes, c="gray", lw=8, alpha=0.3, drawstyle='steps-post', label=f"True Regime ({cycle_size}-cycle)")
 
         # Plot predicted regime
         line_pred, = ax6.plot(df_active['step'], df_active['value'], c="purple", lw=1.5, drawstyle='steps-post', label="Predicted Regime (active_id)")

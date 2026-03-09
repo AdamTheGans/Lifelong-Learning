@@ -42,6 +42,7 @@ class MixtureOfWorldModels(nn.Module):
         # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
         self.rescue_ratio = 0.3               # Relative rescue: veteran wins if loss < active * ratio
+        self.rescue_absolute_ceiling = 0.5    # Max loss for a veteran to qualify for relative rescue
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -280,13 +281,14 @@ class MixtureOfWorldModels(nn.Module):
             active_loss = eval_losses[self.active_regime_id]
             ratio = best_loss / active_loss if active_loss > 0 else float('inf')
             abs_ok = best_loss < self.absolute_spawn_threshold
-            rel_ok = active_loss > 0 and ratio < self.rescue_ratio
+            rel_ok = active_loss > 0 and ratio < self.rescue_ratio and best_loss < self.rescue_absolute_ceiling
 
             # Always print the routing math so the decision is transparent
             print(f"[MoWM] Routing Test: Model {best_candidate} loss={best_loss:.4f}, "
                   f"Active Model {self.active_regime_id} loss={active_loss:.4f}")
             print(f"[MoWM]   Absolute: {best_loss:.4f} < {self.absolute_spawn_threshold} ? {'PASS' if abs_ok else 'FAIL'}")
-            print(f"[MoWM]   Relative: {ratio:.4f} < {self.rescue_ratio} ? {'PASS' if rel_ok else 'FAIL'}")
+            print(f"[MoWM]   Relative: {ratio:.4f} < {self.rescue_ratio} AND {best_loss:.4f} < {self.rescue_absolute_ceiling} ? {'PASS' if rel_ok else 'FAIL'}")
+
 
             if abs_ok or rel_ok:
                 reason = "absolute confidence" if abs_ok else f"relative dominance (ratio={ratio:.3f})"

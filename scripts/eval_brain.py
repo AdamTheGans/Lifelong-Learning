@@ -99,12 +99,19 @@ def eval_brain(args):
         episodic_memory_capacity=args.episodic_memory_capacity,
     )
 
-    sig = SignalExtractor(max_inner_lr=args.max_inner_lr)
+    sig = SignalExtractor(
+        max_inner_lr=args.max_inner_lr,
+        min_inner_lr=args.min_inner_lr,
+        min_ent_coef=args.min_ent_coef,
+        max_ent_coef=args.max_ent_coef,
+        min_intrinsic_coef=args.min_intrinsic_coef,
+        max_intrinsic_coef=args.max_intrinsic_coef,
+    )
 
     # HP bounds (same as MetaEnv)
-    lr_bounds = (1e-5, args.max_inner_lr)
-    ent_coef_bounds = (0.001, 0.1)
-    intrinsic_coef_bounds = (0.001, 0.5)
+    lr_bounds = (args.min_inner_lr, args.max_inner_lr)
+    ent_coef_bounds = (args.min_ent_coef, args.max_ent_coef)
+    intrinsic_coef_bounds = (args.min_intrinsic_coef, args.max_intrinsic_coef)
     imagined_horizon_bounds = (1, 30)
     replay_ratio_bounds = (0.0, 0.5)
 
@@ -176,12 +183,25 @@ def eval_brain(args):
             state.logger.scalar("brain/value_estimate", value.item(), state.global_step)
 
     elapsed = time.time() - start_time
-    print(f"\nEvaluation complete in {elapsed:.1f}s ({update_count} updates)")
+    print(f"Evaluation complete in {elapsed:.1f}s ({update_count} updates)")
 
     # Plot results
     plot_dir = state.logger.full_dir
     state.logger.plot(save_dir=plot_dir, title=f"Brain Eval: {args.run_name}")
     print(f"Charts saved to: {plot_dir}")
+    
+    # Generate extremely high scale specific plotting script automatically
+    try:
+        import subprocess
+        import sys
+        
+        plot_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "plot_high_scale.py")
+        print(f"Generating high resolution charts via {plot_script}...")
+        
+        subprocess.run([sys.executable, plot_script, "--folder", plot_dir], check=True)
+        print("High resolution charts generated successfully.")
+    except Exception as e:
+        print(f"Failed to generate high-res plots automatically: {e}")
 
     close_inner_training(state)
     logger.close()
@@ -208,7 +228,12 @@ def main():
     p.add_argument("--imagined_horizon", type=int, default=10)
     p.add_argument("--wm_lr", type=float, default=1e-4)
     p.add_argument("--episodic_memory_capacity", type=int, default=50000)
-    p.add_argument("--max_inner_lr", type=float, default=0.01, help="Maximum absolute bound for the inner agent's learning rate")
+    p.add_argument("--max_inner_lr", type=float, default=0.003, help="Maximum absolute bound for the inner agent's learning rate")
+    p.add_argument("--min_inner_lr", type=float, default=1e-4, help="Minimum absolute bound for the inner agent's learning rate")
+    p.add_argument("--min_ent_coef", type=float, default=0.001, help="Minimum bound for inner entropy coefficient")
+    p.add_argument("--max_ent_coef", type=float, default=0.2, help="Maximum bound for inner entropy coefficient")
+    p.add_argument("--min_intrinsic_coef", type=float, default=0.001, help="Minimum bound for inner intrinsic curiosity coefficient")
+    p.add_argument("--max_intrinsic_coef", type=float, default=1.0, help="Maximum bound for inner intrinsic curiosity coefficient")
 
     # Brain settings
     p.add_argument("--decision_interval", type=int, default=10)

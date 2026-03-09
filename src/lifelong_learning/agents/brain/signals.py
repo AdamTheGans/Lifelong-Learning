@@ -68,13 +68,18 @@ class SignalExtractor:
     delta computation.
     """
 
-    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50, max_inner_lr: float = 0.01):
+    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50, max_inner_lr: float = 0.003, min_inner_lr: float = 1e-4, min_ent_coef: float = 0.001, max_ent_coef: float = 0.2, min_intrinsic_coef: float = 0.001, max_intrinsic_coef: float = 1.0):
         self.normalizer = RunningNormalizer(NUM_SIGNALS)
         self.surprise_history = deque(maxlen=history_len)
         self.spike_threshold = surprise_spike_threshold
         self.steps_since_spike = 0
         self.prev_surprise = 0.0
         self.max_inner_lr = max_inner_lr
+        self.min_inner_lr = min_inner_lr
+        self.min_ent_coef = min_ent_coef
+        self.max_ent_coef = max_ent_coef
+        self.min_intrinsic_coef = min_intrinsic_coef
+        self.max_intrinsic_coef = max_intrinsic_coef
 
     def extract(self, stats: dict) -> np.ndarray:
         """
@@ -129,19 +134,19 @@ class SignalExtractor:
         # 2: failure_rate -> [0, 1] mapped to [-1, 1]
         normed[2] = stats.get("failure_rate", 0.0) * 2.0 - 1.0
         
-        # 10: current_lr -> log scale [1e-5, max_inner_lr] mapped to [-1, 1]
+        # 10: current_lr -> log scale [min_inner_lr, max_inner_lr] mapped to [-1, 1]
         lr = stats.get("current_lr", 1e-4)
-        normed[10] = (np.log(max(lr, 1e-8)) - np.log(1e-5)) / (np.log(self.max_inner_lr) - np.log(1e-5)) * 2.0 - 1.0
+        normed[10] = (np.log(max(lr, 1e-8)) - np.log(self.min_inner_lr)) / (np.log(self.max_inner_lr) - np.log(self.min_inner_lr)) * 2.0 - 1.0
         normed[10] = np.clip(normed[10], -1.0, 1.0)
         
-        # 11: current_ent_coef -> log scale [0.001, 0.1] mapped to [-1, 1]
+        # 11: current_ent_coef -> log scale [min_ent_coef, max_ent_coef] mapped to [-1, 1]
         ent = stats.get("current_ent_coef", 0.01)
-        normed[11] = (np.log(max(ent, 1e-8)) - np.log(0.001)) / (np.log(0.1) - np.log(0.001)) * 2.0 - 1.0
+        normed[11] = (np.log(max(ent, 1e-8)) - np.log(self.min_ent_coef)) / (np.log(self.max_ent_coef) - np.log(self.min_ent_coef)) * 2.0 - 1.0
         normed[11] = np.clip(normed[11], -1.0, 1.0)
         
-        # 12: current_intrinsic_coef -> log scale [0.001, 0.5] mapped to [-1, 1]
+        # 12: current_intrinsic_coef -> log scale [min_intrinsic_coef, max_intrinsic_coef] mapped to [-1, 1]
         ic = stats.get("current_intrinsic_coef", 0.015)
-        normed[12] = (np.log(max(ic, 1e-8)) - np.log(0.001)) / (np.log(0.5) - np.log(0.001)) * 2.0 - 1.0
+        normed[12] = (np.log(max(ic, 1e-8)) - np.log(self.min_intrinsic_coef)) / (np.log(self.max_intrinsic_coef) - np.log(self.min_intrinsic_coef)) * 2.0 - 1.0
         normed[12] = np.clip(normed[12], -1.0, 1.0)
         
         # 13: current_imagined_horizon -> linear [1, 30] mapped to [-1, 1]

@@ -98,6 +98,7 @@ def train_brain(args):
                 num_regimes=args.num_regimes,
                 reward_alpha=args.reward_alpha,
                 reward_beta=args.reward_beta,
+                reward_mode=args.reward_mode,
                 anneal_lr=False,  # Brain controls LR
                 intrinsic_coef=args.inner_intrinsic_coef,
                 imagined_horizon=args.inner_imagined_horizon,
@@ -106,6 +107,11 @@ def train_brain(args):
                 env_index=env_idx,
                 episodic_memory_capacity=args.episodic_memory_capacity,
                 max_inner_lr=args.max_inner_lr,
+                min_inner_lr=args.min_inner_lr,
+                min_ent_coef=args.min_ent_coef,
+                max_ent_coef=args.max_ent_coef,
+                min_intrinsic_coef=args.min_intrinsic_coef,
+                max_intrinsic_coef=args.max_intrinsic_coef,
                 start_episode=start_episode,
             )
         return _make_env_fn
@@ -166,14 +172,39 @@ def train_brain(args):
                 
                 target_actions = np.zeros((args.brain_num_envs, 5), dtype=np.float32)
                 for i in range(args.brain_num_envs):
-                    if success_rates[i] < 0.5:
-                        # Explore: map towards higher values (actions > 0)
-                        # LR ~max, Ent ~high, Intr ~high, Horizon ~max, ReplayRatio ~0
-                        target_actions[i] = [0.8, 0.8, 0.8, 0.8, -0.9]
+                    if args.pretrain_mode == "recovery":
+                        # Recovery pretrain: multi-tier, surprise-reactive heuristic
+                        # success_rate is statically normalized: raw sr * 2.0 - 1.0
+                        # so raw_sr = (normed + 1) / 2
+                        raw_sr = (success_rates[i] + 1.0) / 2.0
+                        # steps_since_surprise_spike at index 14 (running normalized)
+                        # Negative = recent spike (below average)
+                        spike_signal = obs[i, 14]
+
+                        if spike_signal < -0.5:
+                            # Just saw a surprise spike = likely regime switch
+                            # Slam into explore mode regardless of success rate
+                            target_actions[i] = [0.7, 0.7, 0.7, 0.7, -0.3]
+                        elif raw_sr < 0.3:
+                            # Deep recovery: strong explore
+                            target_actions[i] = [0.5, 0.6, 0.6, 0.5, -0.2]
+                        elif raw_sr < 0.6:
+                            # Mid recovery: moderate explore
+                            target_actions[i] = [0.3, 0.3, 0.4, 0.3, 0.0]
+                        elif raw_sr < 0.8:
+                            # Almost recovered: start tapering
+                            target_actions[i] = [0.0, 0.0, 0.1, 0.1, 0.2]
+                        else:
+                            # Recovered: moderate exploit (not extreme)
+                            target_actions[i] = [-0.2, -0.3, -0.1, -0.1, 0.3]
                     else:
-                        # Exploit: map towards lower values (actions < 0)
-                        # LR ~min, Ent ~min, Intr ~min, Horizon ~min, ReplayRatio ~0.5 (action=1)
-                        target_actions[i] = [-0.8, -0.8, -0.8, -0.8, 0.8]
+                        # Basic pretrain: original binary heuristic
+                        if success_rates[i] < 0.5:
+                            # Explore: map towards higher values (actions > 0)
+                            target_actions[i] = [0.8, 0.8, 0.8, 0.8, -0.9]
+                        else:
+                            # Exploit: map towards lower values (actions < 0)
+                            target_actions[i] = [-0.8, -0.8, -0.8, -0.8, 0.8]
 
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
                 target_a_t = torch.tensor(target_actions, dtype=torch.float32, device=device)
@@ -400,11 +431,18 @@ def main():
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
     p.add_argument("--inner_imagined_horizon", type=int, default=10)
     p.add_argument("--inner_wm_lr", type=float, default=1e-4)
-    p.add_argument("--max_inner_lr", type=float, default=0.01, help="Maximum absolute bound for the inner agent's learning rate")
+    p.add_argument("--max_inner_lr", type=float, default=0.003, help="Maximum absolute bound for the inner agent's learning rate")
+    p.add_argument("--min_inner_lr", type=float, default=1e-4, help="Minimum absolute bound for the inner agent's learning rate")
+    p.add_argument("--min_ent_coef", type=float, default=0.001, help="Minimum bound for inner entropy coefficient")
+    p.add_argument("--max_ent_coef", type=float, default=0.2, help="Maximum bound for inner entropy coefficient")
+    p.add_argument("--min_intrinsic_coef", type=float, default=0.001, help="Minimum bound for inner intrinsic curiosity coefficient")
+    p.add_argument("--max_intrinsic_coef", type=float, default=1.0, help="Maximum bound for inner intrinsic curiosity coefficient")
 
     # Brain meta-agent settings
     p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")
     p.add_argument("--pretrain_episodes", type=int, default=5, help="Number of Imitation Learning pretrain episodes")
+    p.add_argument("--pretrain_mode", type=str, default="basic", choices=["basic", "recovery"],
+                   help="Pretrain heuristic: 'basic' (binary explore/exploit) or 'recovery' (multi-tier, surprise-reactive)")
     p.add_argument("--brain_episodes", type=int, default=50)
     p.add_argument("--brain_lr", type=float, default=1e-4)
     p.add_argument("--brain_ent_coef", type=float, default=0.0,
@@ -415,6 +453,8 @@ def main():
     # Reward shaping
     p.add_argument("--reward_alpha", type=float, default=0.1)
     p.add_argument("--reward_beta", type=float, default=0.5)
+    p.add_argument("--reward_mode", type=str, default="auc", choices=["auc", "recovery"],
+                   help="Brain reward mode: 'auc' (original) or 'recovery' (hybrid delta + urgency)")
 
     # Episodic Memory
     p.add_argument("--episodic_memory_capacity", type=int, default=50000,

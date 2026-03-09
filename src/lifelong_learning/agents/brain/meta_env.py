@@ -49,6 +49,7 @@ class MetaEnv(gym.Env):
         num_regimes: int = 2,
         reward_alpha: float = 0.1,
         reward_beta: float = 0.5,
+        reward_mode: str = "auc",
         inner_run_name: str | None = None,
         save_checkpoints: bool = False,
         anneal_lr: bool = False,
@@ -59,7 +60,12 @@ class MetaEnv(gym.Env):
         inner_log_dir: str | None = None,
         env_index: int = 0,
         episodic_memory_capacity: int = 50000,
-        max_inner_lr: float = 0.01,
+        max_inner_lr: float = 0.003,
+        min_inner_lr: float = 1e-4,
+        min_ent_coef: float = 0.001,
+        max_ent_coef: float = 0.2,
+        min_intrinsic_coef: float = 0.001,
+        max_intrinsic_coef: float = 1.0,
         start_episode: int = 1,
     ):
         super().__init__()
@@ -75,6 +81,7 @@ class MetaEnv(gym.Env):
         self.num_regimes = num_regimes
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
+        self.reward_mode = reward_mode
         self.inner_run_name = inner_run_name
         self.save_checkpoints = save_checkpoints
         self.anneal_lr = anneal_lr
@@ -85,6 +92,11 @@ class MetaEnv(gym.Env):
         self.inner_log_dir = inner_log_dir
         self.episodic_memory_capacity = episodic_memory_capacity
         self.max_inner_lr = max_inner_lr
+        self.min_inner_lr = min_inner_lr
+        self.min_ent_coef = min_ent_coef
+        self.max_ent_coef = max_ent_coef
+        self.min_intrinsic_coef = min_intrinsic_coef
+        self.max_intrinsic_coef = max_intrinsic_coef
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -95,9 +107,9 @@ class MetaEnv(gym.Env):
         )
 
         # HP bounds (absolute min/max)
-        self.lr_bounds = (1e-5, self.max_inner_lr)
-        self.ent_coef_bounds = (0.001, 0.1)
-        self.intrinsic_coef_bounds = (0.001, 0.5)
+        self.lr_bounds = (self.min_inner_lr, self.max_inner_lr)
+        self.ent_coef_bounds = (self.min_ent_coef, self.max_ent_coef)
+        self.intrinsic_coef_bounds = (self.min_intrinsic_coef, self.max_intrinsic_coef)
         self.imagined_horizon_bounds = (1, 30)
         self.replay_ratio_bounds = (0.0, 0.5)
 
@@ -144,7 +156,14 @@ class MetaEnv(gym.Env):
             
         self._state = init_inner_training(**init_kwargs)
 
-        self._signal_extractor = SignalExtractor(max_inner_lr=self.max_inner_lr)
+        self._signal_extractor = SignalExtractor(
+            max_inner_lr=self.max_inner_lr,
+            min_inner_lr=self.min_inner_lr,
+            min_ent_coef=self.min_ent_coef,
+            max_ent_coef=self.max_ent_coef,
+            min_intrinsic_coef=self.min_intrinsic_coef,
+            max_intrinsic_coef=self.max_intrinsic_coef,
+        )
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
@@ -173,8 +192,18 @@ class MetaEnv(gym.Env):
         mean_return = stats.get("mean_episodic_return", 0.0)
         failure_rate = stats.get("failure_rate", 0.0)
 
-        # Compute absolute reward (AUC proxy over the episode)
-        reward = success_rate + self.reward_alpha * mean_return - self.reward_beta * failure_rate
+        if self.reward_mode == "recovery":
+            # Hybrid recovery reward: incentivizes fast recovery after regime switches
+            delta_sr = success_rate - self._prev_success_rate
+            recovery = max(0.0, delta_sr) * 5.0
+            maintenance = success_rate * 0.3
+            shortfall = max(0.0, 0.8 - success_rate)
+            urgency_penalty = -shortfall * 3.0
+            failure_penalty = -failure_rate * 0.5
+            reward = recovery + maintenance + urgency_penalty + failure_penalty
+        else:
+            # Original AUC reward
+            reward = success_rate + self.reward_alpha * mean_return - self.reward_beta * failure_rate
 
         self._prev_success_rate = success_rate
         self._prev_mean_return = mean_return

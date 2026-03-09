@@ -42,7 +42,7 @@ class MixtureOfWorldModels(nn.Module):
         # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
         self.rescue_ratio = 0.3               # Relative rescue: veteran wins if loss < active * ratio
-        self.rescue_absolute_ceiling = 0.5    # Max loss for a veteran to qualify for relative rescue
+        self.rescue_absolute_ceiling = 1.0    # Max masked loss for a veteran to qualify for relative rescue
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -288,6 +288,8 @@ class MixtureOfWorldModels(nn.Module):
                   f"Active Model {self.active_regime_id} loss={active_loss:.4f}")
             print(f"[MoWM]   Absolute: {best_loss:.4f} < {self.absolute_spawn_threshold} ? {'PASS' if abs_ok else 'FAIL'}")
             print(f"[MoWM]   Relative: {ratio:.4f} < {self.rescue_ratio} AND {best_loss:.4f} < {self.rescue_absolute_ceiling} ? {'PASS' if rel_ok else 'FAIL'}")
+
+
 
 
             if abs_ok or rel_ok:

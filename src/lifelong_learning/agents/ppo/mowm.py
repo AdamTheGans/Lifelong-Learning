@@ -41,8 +41,8 @@ class MixtureOfWorldModels(nn.Module):
         
         # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
-        self.rescue_ratio = 0.3               # Relative rescue: veteran wins if loss < active * ratio
-        self.rescue_absolute_ceiling = 0.5    # Max loss for a veteran to qualify for relative rescue
+        self.rescue_ratio = 0.5               # Relative rescue: veteran wins if loss < active * ratio
+        self.rescue_absolute_ceiling = 1.5    # Max loss for a veteran to qualify for relative rescue
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -264,9 +264,18 @@ class MixtureOfWorldModels(nn.Module):
         # Hard Cap Bypass: if we can't spawn, we MUST switch to the lesser evil
         if at_hard_cap:
             if best_candidate != self.active_regime_id:
-                print(f"[MoWM] Hard Cap forced switch to Model {best_candidate} "
-                      f"(eval loss: {eval_losses[best_candidate]:.4f} vs active: {eval_losses[self.active_regime_id]:.4f}).")
-                return ("switch", best_candidate)
+                best_eval = eval_losses[best_candidate]
+                active_eval = eval_losses[self.active_regime_id]
+                
+                # Check if the best candidate is significantly better, even if losing absolute tests.
+                # Since we can't spawn, be slightly more forgiving for forced switches
+                if best_eval < active_eval * 0.8 and best_eval < 5.0:
+                    print(f"[MoWM] Hard Cap forced switch to Model {best_candidate} "
+                          f"(eval loss: {best_eval:.4f} vs active: {active_eval:.4f}).")
+                    return ("switch", best_candidate)
+                else:
+                    print(f"[MoWM] Hard Cap Reached. Best alternative (Model {best_candidate}, loss {best_eval:.4f}) is not viable enough compared to active ({active_eval:.4f}). Staying to collect more data.")
+                    return ("stay", self.active_regime_id)
             else:
                 print(f"[MoWM] Hard Cap Reached and active model is still lowest loss. Staying.")
                 return ("stay", self.active_regime_id)

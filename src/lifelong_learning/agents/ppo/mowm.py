@@ -41,10 +41,10 @@ class MixtureOfWorldModels(nn.Module):
         
         # MoWM Routing
         self.absolute_spawn_threshold = 0.3  # Absolute upper ceiling for rescue model viability
-        self.rescue_ratio = 0.3               # Relative rescue: veteran wins if loss < active * ratio
-        self.rescue_absolute_ceiling = 0.4    # Max loss for a veteran to qualify for relative rescue
+        self.absolute_spawn_threshold = 0.4  # Absolute upper ceiling for rescue model viability
         self.surprise_patience = 2           # Epochs to wait before spawning to clear off-policy shock
         self.current_surprise_epochs = 0
+        self.is_frozen = False               # Flag to tell train.py to skip PPO updates
         self.global_grace_period = 20000     # No spawns before this step
         self.newborn_grace_period = 10000    # Force active regime after spawn
         self.mastery_loss_threshold = 0.20   # Mastery Prerequisite: Loss threshold to accrue mastery steps
@@ -238,6 +238,7 @@ class MixtureOfWorldModels(nn.Module):
         dynamic_threshold = max(self.ema_losses[self.active_regime_id], self.anomaly_floor) * self.anomaly_multiplier
         if epoch_avg_loss <= dynamic_threshold:
             self.current_surprise_epochs = 0
+            self.is_frozen = False
             return ("stay", self.active_regime_id)
 
         print(f"\n[MoWM] Surprise detected! Model {self.active_regime_id} epoch loss ({epoch_avg_loss:.4f}) > threshold ({dynamic_threshold:.4f}).")
@@ -261,47 +262,77 @@ class MixtureOfWorldModels(nn.Module):
                     print(f"| Model {i:<1} | {masked_loss:<18.4f} | {full_loss:<16.4f} |")
 
         # Active model is surprised. Find the best alternative.
-        best_candidate = min(range(len(self.models)), key=lambda i: eval_losses[i])
+        # Active model is surprised. Evaluate alternatives.
         at_hard_cap = len(self.models) >= self.max_regimes
 
-        if best_candidate != self.active_regime_id:
-            best_loss = eval_losses[best_candidate]
-            active_loss = eval_losses[self.active_regime_id]
-            ratio = best_loss / active_loss if active_loss > 0 else float('inf')
-            abs_ok = best_loss < self.absolute_spawn_threshold
-            rel_ok = active_loss > 0 and ratio < self.rescue_ratio and best_loss < self.rescue_absolute_ceiling
-
-            # Always print the routing math so the decision is transparent
-            print(f"[MoWM] Routing Test: Model {best_candidate} loss={best_loss:.4f}, "
-                  f"Active Model {self.active_regime_id} loss={active_loss:.4f}")
-            print(f"[MoWM]   Absolute: {best_loss:.4f} < {self.absolute_spawn_threshold} ? {'PASS' if abs_ok else 'FAIL'}")
-            print(f"[MoWM]   Relative: {ratio:.4f} < {self.rescue_ratio} AND {best_loss:.4f} < {self.rescue_absolute_ceiling} ? {'PASS' if rel_ok else 'FAIL'}")
-
-            if abs_ok or rel_ok:
-                reason = "absolute confidence" if abs_ok else f"relative dominance (ratio={ratio:.3f})"
-                print(f"[MoWM] → Veteran rescue ({reason}): switching to Model {best_candidate}.")
-                self.current_surprise_epochs = 0
-                return ("switch", best_candidate)
-            else:
-                print(f"[MoWM] → No veteran immediately viable.")
-
-        if self.current_surprise_epochs < self.surprise_patience:
-            self.current_surprise_epochs += 1
-            print(f"[MoWM] → Surprise patience {self.current_surprise_epochs}/{self.surprise_patience}. Staying to collect more data and clear off-policy shock.")
-            return ("stay", self.active_regime_id)
-
-        # Patience exceeded
-        self.current_surprise_epochs = 0
-        if at_hard_cap:
-            if best_candidate != self.active_regime_id:
-                print(f"[MoWM] → Hard Cap Reached. Forcing switch to best alternative Model {best_candidate}.")
-                return ("switch", best_candidate)
-            else:
-                print(f"[MoWM] → Hard Cap Reached, but active is still best. Staying.")
-                return ("stay", self.active_regime_id)
-        else:
-            print("[MoWM] → Target patience exceeded. Spawning new model.")
+        # If we are the only model, there's no veteran to wait for. Spawn immediately!
+        if len(self.models) == 1:
+            print("[MoWM] → Only 1 model exists. No veterans to wait for. Spawning immediately.")
+            self.current_surprise_epochs = 0
+            self.is_frozen = False
             return ("spawn", -1)
+
+        # Count how many alternative models are "not surprised" by this anomalous data
+        viable_candidates = []
+        best_candidate = -1
+        best_loss = float('inf')
+        
+        for i in range(len(self.models)):
+            if i == self.active_regime_id:
+                continue
+            loss = eval_losses[i]
+            if loss < self.absolute_spawn_threshold:
+                viable_candidates.append(i)
+            if loss < best_loss:
+                best_loss = loss
+                best_candidate = i
+                
+        # Always print the routing math so the decision is transparent
+        print(f"[MoWM] Routing Evaluation: {len(viable_candidates)} alternative model(s) passed the viability threshold (< {self.absolute_spawn_threshold}).")
+        if viable_candidates:
+            print(f"[MoWM]   Viable Candidates: {viable_candidates}")
+        else:
+            print(f"[MoWM]   Best alternative (Model {best_candidate}) had loss {best_loss:.4f} (FAIL).")
+
+        # Structural Patience Logic
+        if len(viable_candidates) == 0:
+            # Nobody understands this data. Spawn.
+            if self.current_surprise_epochs < self.surprise_patience:
+                self.current_surprise_epochs += 1
+                self.is_frozen = True # Freeze PPO weights while we wait!
+                print(f"[MoWM] → All veterans surprised. Patience {self.current_surprise_epochs}/{self.surprise_patience}. Freezing PPO to clear bufffer.")
+                return ("stay", self.active_regime_id)
+                
+            self.current_surprise_epochs = 0
+            self.is_frozen = False
+            if at_hard_cap:
+                print(f"[MoWM] → Hard Cap Reached. Forcing switch to least-bad alternative Model {best_candidate}.")
+                return ("switch", best_candidate)
+            else:
+                print("[MoWM] → Target patience exceeded. No veteran viable. Spawning new model.")
+                return ("spawn", -1)
+                
+        elif len(viable_candidates) == 1:
+            # Clean rescue
+            chosen = viable_candidates[0]
+            print(f"[MoWM] → Definitive veteran rescue. Switching to Model {chosen}.")
+            self.current_surprise_epochs = 0
+            self.is_frozen = False
+            return ("switch", chosen)
+            
+        else:
+            # Ambiguous rescue: multiple models claim they understand this
+            if self.current_surprise_epochs < self.surprise_patience:
+                self.current_surprise_epochs += 1
+                self.is_frozen = True # Freeze PPO weights while we wait!
+                print(f"[MoWM] → Ambiguous rescue ({len(viable_candidates)} viable). Patience {self.current_surprise_epochs}/{self.surprise_patience}. Freezing PPO to clarify subset.")
+                return ("stay", self.active_regime_id)
+                
+            # Patience exceeded, just pick the absolute best one
+            self.current_surprise_epochs = 0
+            self.is_frozen = False
+            print(f"[MoWM] → Patience exceeded on ambiguity. Choosing absolute best Model {best_candidate}.")
+            return ("switch", best_candidate)
 
     def spawn_new_model(self, global_step: int, seed_ema: float) -> int:
         """

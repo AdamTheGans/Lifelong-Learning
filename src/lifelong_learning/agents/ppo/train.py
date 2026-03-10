@@ -57,7 +57,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.9.5")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.6")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -905,16 +905,28 @@ def train_ppo(
         # Phase D: Update policy on mixed real + imagined data
         buffers_to_train = [buffer] + dream_buffers
         update_stats = update_policy(buffers_to_train, cfg.update_epochs)
+        # Only update the policy if MoWM hasn't frozen learning due to routing patience
+        if not hasattr(world_model, 'is_frozen') or not world_model.is_frozen:
+            buffers_to_train = [buffer] + dream_buffers
+            update_stats = update_policy(buffers_to_train, cfg.update_epochs)
+            # Aggregate stats across all epochs/batches/buffers
+            avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]} if update_stats else {}
+            for k, v in avg_stats.items():
+                logger.scalar(f"ppo/{k}", v, global_step)
+        else:
+            # Log zero losses if PPO update is skipped
+            logger.scalar(f"ppo/value_loss", 0.0, global_step)
+            logger.scalar(f"ppo/policy_loss", 0.0, global_step)
+            print(f"[MoWM] PPO update SKIPPED (Frozen during patience).")
+
 
         # -----------------------------------------------------------------
         # Logging
         # -----------------------------------------------------------------
 
-        avg_stats = {k: np.mean([s[k] for s in update_stats]) for k in update_stats[0]} if update_stats else {}
+        # The avg_stats for PPO are now logged inside the conditional block above.
+        # We still need to log wm_stats regardless.
         avg_wm_stats = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]} if wm_stats else {}
-
-        for k, v in avg_stats.items():
-            logger.scalar(k, v, global_step)
 
         for k, v in avg_wm_stats.items():
             logger.scalar(k, v, global_step)

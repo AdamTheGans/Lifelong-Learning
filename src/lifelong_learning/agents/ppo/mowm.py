@@ -294,7 +294,7 @@ class MixtureOfWorldModels(nn.Module):
             else:
                 tie_break_loss = loss
                 
-            if loss < dynamic_viability_threshold:
+            if loss < dynamic_viability_threshold and tie_break_loss < dynamic_viability_threshold:
                 viable_candidates.append(i)
                 
             if tie_break_loss < best_loss:

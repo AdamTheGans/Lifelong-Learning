@@ -57,7 +57,7 @@ def train_ppo(
         C) Generate imagined trajectories and update policy on dreams
     """
 
-    print("MoWM Dyna-PPO Trainer Version: 0.9.6")
+    print("MoWM Dyna-PPO Trainer Version: 0.9.7")
     if oracle_routing:
         print("[ORACLE ROUTING] Ground-truth regime routing ENABLED.")
     seed_everything(cfg.seed)
@@ -825,10 +825,17 @@ def train_ppo(
 
                 # ---- Routing Decision (pre-training weights, fair fight) ----
                 # Oracle Routing: bypass masking logic and use ground truth
-                if oracle_routing and last_true_regime is not None and len(world_model.models) > 1:
+                if oracle_routing and last_true_regime is not None:
                     true_id = last_true_regime
                     if true_id != world_model.active_regime_id:
                         old_id = world_model.active_regime_id
+                        
+                        # Catch up by spawning any missing models up to the true_id
+                        while true_id >= len(world_model.models):
+                            new_id = world_model.spawn_new_model(global_step, epoch_avg_loss)
+                            wm_optimizers.append(torch.optim.Adam(world_model.models[-1].parameters(), lr=wm_lr))
+                            spawn_occurred = True
+                            
                         world_model.rollback_safe_state(
                             old_id, world_model.models[old_id], wm_optimizers[old_id], global_step=global_step
                         )

@@ -277,22 +277,36 @@ class MixtureOfWorldModels(nn.Module):
         best_candidate = -1
         best_loss = float('inf')
         
+        # Calculate dynamic viability threshold
+        active_masked_loss = eval_losses[self.active_regime_id]
+        staleness_ceiling = 3.0
+        dynamic_viability_threshold = max(self.absolute_spawn_threshold, min(active_masked_loss * 0.5, staleness_ceiling))
+        
         for i in range(len(self.models)):
             if i == self.active_regime_id:
                 continue
+                
             loss = eval_losses[i]
-            if loss < self.absolute_spawn_threshold:
+            
+            # Use full_buffer tie-breaker if available
+            if full_buffer_losses is not None:
+                tie_break_loss = full_buffer_losses[i]
+            else:
+                tie_break_loss = loss
+                
+            if loss < dynamic_viability_threshold:
                 viable_candidates.append(i)
-            if loss < best_loss:
-                best_loss = loss
+                
+            if tie_break_loss < best_loss:
+                best_loss = tie_break_loss
                 best_candidate = i
                 
         # Always print the routing math so the decision is transparent
-        print(f"[MoWM] Routing Evaluation: {len(viable_candidates)} alternative model(s) passed the viability threshold (< {self.absolute_spawn_threshold}).")
+        print(f"[MoWM] Routing Evaluation: {len(viable_candidates)} alternative model(s) passed the viability threshold (< {dynamic_viability_threshold:.4f}).")
         if viable_candidates:
             print(f"[MoWM]   Viable Candidates: {viable_candidates}")
         else:
-            print(f"[MoWM]   Best alternative (Model {best_candidate}) had loss {best_loss:.4f} (FAIL).")
+            print(f"[MoWM]   Best alternative (Model {best_candidate}) had tie-break loss {best_loss:.4f} (FAIL).")
 
         # Structural Patience Logic
         if len(viable_candidates) == 0:

@@ -124,3 +124,24 @@ python scripts/train_ppo.py --mode dyna --max_regimes 1 --no_save_buffer --total
 # MoWM 4 regimes
 python scripts/train_ppo.py --mode dyna --total_timesteps 2250000 --steps_per_regime 18500 --total_env_regimes 4 --run_name mowm_4_regimes
 ```
+
+# Part 4: Solution 5 (Context-Aware Meta-RL)
+
+We are actively developing a new recurrent architecture where a Long-Term sequence buffer trains a Recurrent World Model, injecting a Context Badge directly into a Context-Aware PPO agent. The components and their isolated verification scripts are currently available:
+
+```bash
+# Verify the Long-Term Sequence Memory Buffer (Chunking & Eviction Rules)
+python src/lifelong_learning/agents/ppo/sequence_memory_buffer.py
+
+# Verify the Recurrent World Model (GRU Unrolling & Stop-Gradient Masking)
+python src/lifelong_learning/agents/ppo/recurrent_world_model.py
+
+# Verify the Context-Aware PPO Network (The "Bulletproof Vest" Detach check)
+python src/lifelong_learning/agents/ppo/context_aware_network.py
+
+# Verify the Meta-RL Master Orchestration Loop (4-Phase Integration)
+python src/lifelong_learning/agents/ppo/meta_rl_trainer.py
+
+# Train the full system
+python scripts/train_meta_rl.py --total_timesteps 2250000 --steps_per_regime 18500 --total_env_regimes 4
+```

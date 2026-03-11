@@ -73,3 +73,40 @@ Training occurs in three phases per update:
 - **Recovery usage**: Steps to reach optimal performance after a regime switch.
 - **Retained performance**: Zero-shot performance when returning to a known regime.
 - **Routing accuracy**: How quickly the system identifies the active regime.
+
+---
+
+## Technical Architecture: Solution 5 (Context-Aware Meta-RL)
+
+We recently implemented the foundational components for a new approach that tightly integrates a recurrent world model directly into the PPO agent's decision-making process.
+
+### 1. The SequenceMemoryBuffer (`sequence_memory_buffer.py`)
+A Long-Term Memory Buffer to prevent catastrophic forgetting in the World Model.
+- **Unit**: Chunks of 30 consecutive transitions `(S, A, R, Done)`.
+- **Capacity**: 2000 chunks (60,000 steps).
+- **Eviction**: Uniform Random (acts as reservoir sampling).
+- **Save Triggers**:
+  - Max 1 save per 1,000 steps.
+  - Min 1 save per 5,000 steps.
+  - EMA Surprise Tracker: Saves chunks if prediction error spikes between 1k-5k steps (alpha=0.05).
+
+### 2. The RecurrentWorldModel (`recurrent_world_model.py`)
+A recurrent predictor for system identification and context tracking.
+- **CNN Extractor**: `[C=21, H=8, W=8] -> Conv(32) -> Conv(64) -> Conv(64) -> Flatten(4096)`.
+- **Action Embedding**: `nn.Embedding(n_actions, 32)`.
+- **GRU Core**: `input_size=4129, hidden_size=256`.
+- **Heads**: `Next State (-> CrossEntropy)`, `Next Reward (-> MSE)`.
+- **Masking**: Terminal steps (`done=True`) are masked out of the loss calculation to prevent penalizing random episode resets.
+
+### 3. The ContextAwarePPONetwork (`context_aware_network.py`)
+The decision-maker that uses the World Model's internal state as an explicit context badge.
+- **Input**: Visual State + Recurrent Hidden State `h_t` (256-D).
+- **The "Bulletproof Vest"**: The `h_t` vector is rigorously `.detach()`'ed before entering the Actor/Critic heads. This strictly prevents PPO reward gradients from corrupting the World Model's representation learning.
+- **Architecture**: Separate 2-layer MLPs for Actor Config and Critic Config.
+
+### 4. The MetaRLTrainer Master Loop (`meta_rl_trainer.py`)
+The orchestrator connecting all systems via 4 phases:
+- **Phase 1 (Live Rollout)**: Agent uses `ContextAwarePPONetwork` conditioned on live `h_t` from the `RecurrentWorldModel`.
+- **Phase 2 (Memory)**: Surprise thresholding is applied to live chunks to selectively insert into `SequenceMemoryBuffer`.
+- **Phase 3 (Anti-Forgetting WM Update)**: World Model trains on a strict 50/50 batch (50% uniform samples from LT Memory + 50% recent live chunks).
+- **Phase 4 (PPO Update)**: Agent trains using the exact `h_t` contexts cached during Phase 1.

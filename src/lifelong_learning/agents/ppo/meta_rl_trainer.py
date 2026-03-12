@@ -102,6 +102,8 @@ class MetaRLTrainer:
                 # Total Loss
                 loss = pg_loss - self.cfg['ent_coef'] * ent_loss + self.cfg['vf_coef'] * v_loss
                 
+                self.ppo_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
                 self.ppo_optimizer.step()
                 
                 # We can just return the last minibatch/epoch stats or mean them. 
@@ -190,6 +192,8 @@ class MetaRLTrainer:
         
         # We chunk the live buffer into 30-step sequences
         num_chunks = S // seq_len
+        chunk_surprise_scores = []
+        saves_this_rollout = 0
         
         for c in range(num_chunks):
             start_idx = c * seq_len
@@ -221,8 +225,11 @@ class MetaRLTrainer:
                 ce_loss = nn.functional.cross_entropy(preds_flat, targets_flat, reduction='none')
                 surprise_score = ce_loss.mean().item()
                 
+            chunk_surprise_scores.append(surprise_score)
+            
             # Interrogate the buffer decision matrix
             if self.memory_buffer.should_save_chunk(self.global_step, surprise_score):
+                saves_this_rollout += B  # B chunks pushed (one per env)
                 # PUSH CHUNKS INDIVIDUALLY (Batch dim B gets split)
                 for i in range(B):
                     chunk = {
@@ -314,6 +321,29 @@ class MetaRLTrainer:
             mixed_next = torch.stack(live_batch_next_obs)
             mixed_don  = torch.stack(live_batch_don).float()
             
+        # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in 50/50 mode
+        loss_live_val = loss_memory_val = None
+        if self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
+            with torch.no_grad():
+                _, loss_live_s, loss_live_r = self.world_model.compute_loss_detailed(
+                    states=torch.stack(live_batch_obs[:half_batch]),
+                    actions=torch.stack(live_batch_act[:half_batch]),
+                    rewards=torch.stack(live_batch_rew[:half_batch]),
+                    next_states=torch.stack(live_batch_next_obs[:half_batch]),
+                    next_rewards=torch.stack(live_batch_rew[:half_batch]),
+                    dones=torch.stack(live_batch_don[:half_batch]).float(),
+                )
+                loss_live_val = (loss_live_s + loss_live_r).item()
+                _, loss_mem_s, loss_mem_r = self.world_model.compute_loss_detailed(
+                    states=ltm_batch['state'].to(device),
+                    actions=ltm_batch['action'].to(device),
+                    rewards=ltm_batch['reward'].to(device),
+                    next_states=ltm_batch['next_state'].to(device),
+                    next_rewards=ltm_batch['reward'].to(device),
+                    dones=ltm_batch['done'].to(device).float(),
+                )
+                loss_memory_val = (loss_mem_s + loss_mem_r).item()
+        
         # 4. Standard Supervised Training Step
         wm_stats = []
         for _ in range(self.cfg['wm_epochs']):
@@ -368,17 +398,45 @@ class MetaRLTrainer:
         # Aggregate stats
         results = {
             "global_step": self.global_step,
-            "charts/reward_step_mean": rew_buf.mean().item()
+            "charts/reward_step_mean": rew_buf.mean().item(),
+            "charts/reward_step_max": rew_buf.max().item(),
+            "charts/reward_step_min": rew_buf.min().item()
         }
         
-        # PPO stats (Average live and dream if available)
-        if ppo_stats_dream:
-            for k in ppo_stats_live:
-                results[k] = (ppo_stats_live[k] + ppo_stats_dream[k]) / 2.0
+        # Memory buffer & surprise metrics
+        results["memory/surprise_ema"] = self.memory_buffer.surprise_ema_threshold
+        results["memory/buffer_size"] = len(self.memory_buffer.buffer)
+        results["memory/saves_per_rollout"] = saves_this_rollout
+        if chunk_surprise_scores:
+            results["memory/chunk_surprise_score"] = np.mean(chunk_surprise_scores)
         else:
-            results.update(ppo_stats_live)
+            results["memory/chunk_surprise_score"] = 0.0
             
-        # WM Stats
+        # World model split (diagnostic for catastrophic forgetting)
+        if loss_live_val is not None:
+            results["world_model/loss_live"] = loss_live_val
+        if loss_memory_val is not None:
+            results["world_model/loss_memory"] = loss_memory_val
+        
+        # PPO stats: report live and dream separately for dream health diagnosis
+        results["ppo/policy_loss_live"] = ppo_stats_live["ppo/policy_loss"]
+        results["ppo/value_loss_live"] = ppo_stats_live["ppo/value_loss"]
+        results["ppo/entropy"] = ppo_stats_live["ppo/entropy"]
+        
+        # Diagnostic prints for context_ht
+        results["ppo/context_ht_norm"] = ctx_buf.norm(dim=-1).mean().item()
+        results["ppo/context_ht_std"] = ctx_buf.std(dim=(0,1)).mean().item()
+        
+        if ppo_stats_dream:
+            results["ppo/policy_loss_dream"] = ppo_stats_dream["ppo/policy_loss"]
+            results["ppo/value_loss_dream"] = ppo_stats_dream["ppo/value_loss"]
+        else:
+            results["ppo/policy_loss_dream"] = 0.0
+            results["ppo/value_loss_dream"] = 0.0
+        results["dream/used"] = 1.0 if has_dreams else 0.0
+        results["wm/warmup_active"] = 1.0 if self.global_step < wm_warmup_steps else 0.0
+            
+        # WM Stats (loss_total, loss_state, loss_reward from training)
         if wm_stats:
             avg_wm = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]}
             results.update(avg_wm)

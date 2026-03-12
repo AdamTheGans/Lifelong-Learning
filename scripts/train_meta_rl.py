@@ -125,15 +125,18 @@ def main():
     # Actually, MetaRLTrainer logic assumes env.reset() returns a tensor or expects DummyEnv behavior.
     # Let's adjust env wrapper directly. SyncVectorEnv yields ndarrays.
     class EnvTensorWrapper:
-        def __init__(self, envs, device, logger):
+        def __init__(self, envs, device, logger, total_regimes=4):
             self.envs = envs
             self.device = device
             self.logger = logger
+            self.total_regimes = total_regimes
             
             # Tracking
             self.running_returns = np.zeros(envs.num_envs)
             self.running_lengths = np.zeros(envs.num_envs, dtype=int)
             self.outcome_window = deque(maxlen=100)
+            # Per-regime outcome windows for continual learning diagnostics
+            self.outcome_windows = {r: deque(maxlen=100) for r in range(total_regimes)}
             self.global_step = 0
             
             # Auto-reset state tracker
@@ -165,14 +168,25 @@ def main():
                     elif infos.get("reached_bad_goal", [False]*self.envs.num_envs)[i]: outcome = -1
                     self.outcome_window.append(outcome)
                     
+                    # Per-regime outcome window for continual learning diagnostics
+                    regime_id = infos.get("regime_id", np.zeros(self.envs.num_envs, dtype=int))[i]
+                    if regime_id < self.total_regimes:
+                        self.outcome_windows[regime_id].append(outcome)
+                    
                     if len(self.outcome_window) > 0:
                         self.logger.scalar("charts/success_rate", sum(1 for x in self.outcome_window if x == 1)/len(self.outcome_window), self.global_step)
                         self.logger.scalar("charts/failure_rate", sum(1 for x in self.outcome_window if x == -1)/len(self.outcome_window), self.global_step)
                         self.logger.scalar("charts/timeout_rate", sum(1 for x in self.outcome_window if x == 0)/len(self.outcome_window), self.global_step)
 
-                    # Regimes
+                    # Regime-specific return and success rate (proves retention across regimes)
                     if "regime_id" in infos:
-                        self.logger.scalar(f"charts/r_regime_{infos['regime_id'][i]}", self.running_returns[i], self.global_step)
+                        rid = infos["regime_id"][i]
+                        self.logger.scalar(f"charts/return_regime_{rid}", self.running_returns[i], self.global_step)
+                        self.logger.scalar(f"charts/r_regime_{rid}", self.running_returns[i], self.global_step)
+                    for r in range(self.total_regimes):
+                        w = self.outcome_windows[r]
+                        if len(w) > 0:
+                            self.logger.scalar(f"charts/success_rate_regime_{r}", sum(1 for x in w if x == 1) / len(w), self.global_step)
                         
                     self.running_returns[i] = 0
                     self.running_lengths[i] = 0
@@ -187,7 +201,7 @@ def main():
             self._obs = next_obs_t
             return next_obs_t, reward_t, done_t
 
-    wrapped_envs = EnvTensorWrapper(envs, device, logger)
+    wrapped_envs = EnvTensorWrapper(envs, device, logger, total_regimes=args.total_env_regimes)
 
     for update in range(1, num_updates + 1):
         # 1. Execute 1 full iteration (Phase 1 -> Phase 4)
@@ -205,7 +219,12 @@ def main():
                 logger.scalar(k, v, global_step)
         
         if update % 10 == 0:
-            print(f"Update {update}/{num_updates} | step={global_step} | SPS={sps}")
+            ctx_norm = stats.get("ppo/context_ht_norm", 0.0)
+            ent = stats.get("ppo/entropy", 0.0)
+            rew_max = stats.get("charts/reward_step_max", 0.0)
+            v_loss = stats.get("ppo/value_loss_live", 0.0)
+            p_loss = stats.get("ppo/policy_loss_live", 0.0)
+            print(f"Update {update}/{num_updates} | step={global_step} | SPS={sps} | Entropy={ent:.3f} | CtxNorm={ctx_norm:.3f} | R_max={rew_max:.2f} | V_loss={v_loss:.3f} | P_loss={p_loss:.3f}")
             
         # 3. Checkpointing
         if update % 50 == 0 or update == num_updates:

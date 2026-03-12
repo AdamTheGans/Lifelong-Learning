@@ -89,7 +89,11 @@ class RecurrentWorldModel(nn.Module):
         cnn_features = cnn_features.view(B, S, -1)        # [B, S, 4096]
         
         act_emb = self.action_emb(actions)                # [B, S, 32]
-        rew_emb = rewards.unsqueeze(-1)                   # [B, S, 1]
+        
+        # CRITICAL FIX: The model must not see r_t when predicting r_t.
+        # We shift the rewards to be r_{t-1}, padding the first step with 0.
+        prev_rewards = torch.cat([torch.zeros(B, 1, device=rewards.device), rewards[:, :-1]], dim=1)
+        rew_emb = prev_rewards.unsqueeze(-1)              # [B, S, 1]
         
         # Concatenate features 
         rnn_input = torch.cat([cnn_features, act_emb, rew_emb], dim=-1) # [B, S, 4129]
@@ -109,14 +113,14 @@ class RecurrentWorldModel(nn.Module):
         
         return next_state_preds, next_reward_preds
 
-    def step(self, state: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, hidden_state: torch.Tensor):
+    def step(self, state: torch.Tensor, action: torch.Tensor, prev_reward: torch.Tensor, hidden_state: torch.Tensor):
         """
         Live PPO Inference stepping.
         
         Args:
             state:        [B, C, H, W]
             action:       [B]
-            reward:       [B]
+            prev_reward:  [B] (The reward from the previous step)
             hidden_state: [1, B, 256] GRU recurrent state
             
         Returns:
@@ -127,7 +131,7 @@ class RecurrentWorldModel(nn.Module):
         # Process inputs
         cnn_feat = self.cnn(state)                           # [B, 4096]
         act_emb = self.action_emb(action)                    # [B, 32]
-        rew_emb = reward.unsqueeze(-1)                       # [B, 1]
+        rew_emb = prev_reward.unsqueeze(-1)                  # [B, 1]
         
         # Add sequence dimension of size 1
         rnn_input = torch.cat([cnn_feat, act_emb, rew_emb], dim=-1).unsqueeze(1) # [B, 1, 4129]
@@ -160,24 +164,18 @@ class RecurrentWorldModel(nn.Module):
         curr_state = start_states
         curr_h_t = start_h_t
         
+        # In a dream, we start with a dummy previous reward of 0
+        curr_prev_reward = torch.zeros(start_states.shape[0], dtype=torch.float32, device=start_states.device)
+        
         for _ in range(horizon):
             with torch.no_grad():
                 # 1. PPO decides action based on current state & WM context badge
                 action, logprob, entropy, value = policy_net.get_action_and_value(curr_state, curr_h_t.squeeze(0))
                 
-                # 2. Get environment reward estimate to feed into the next WM step
-                # Note: The reward here must come from the live environment evaluation since the true step
-                # requires (state, action, reward, h_t). However, in a pure dream without tracking canonical rewards,
-                # we can approximate using the critic value or just zero it if reward isn't critical to dynamics.
-                # A more accurate WM would predict reward first, then state. Since ours predicts both simultaneously,
-                # we feed a dummy zero-reward into the step just to keep the RNN unrolling, and use the predicted
-                # reward as the actual experienced reward for the dream trajectory.
-                dummy_reward_input = torch.zeros_like(action, dtype=torch.float32)
+                # 2. WM predicts next frame and next reward
+                next_state_logits, next_reward_pred, next_h_t = self.step(curr_state, action, curr_prev_reward, curr_h_t)
                 
-                # 3. WM predicts next frame and next reward
-                next_state_logits, next_reward_pred, next_h_t = self.step(curr_state, action, dummy_reward_input, curr_h_t)
-                
-                # 4. Strict Discretization (Guardrail against compounding blurriness)
+                # 3. Strict Discretization (Guardrail against compounding blurriness)
                 # Argument max over channel dim C, then re-encode into One-Hot float tensor
                 max_indices = torch.argmax(next_state_logits, dim=1)           # [B, H, W]
                 one_hot = torch.nn.functional.one_hot(max_indices, num_classes=self.c)  # [B, H, W, C]
@@ -200,6 +198,7 @@ class RecurrentWorldModel(nn.Module):
                 
                 curr_state = next_state_discrete
                 curr_h_t = next_h_t
+                curr_prev_reward = next_reward_pred # The predicted reward becomes the prev_reward for the next step
                 
         return trajectories
 
@@ -288,8 +287,9 @@ if __name__ == "__main__":
     print("Evaluating PPO live step integration processing...")
     # Initialize zero hidden batch
     h0 = torch.zeros(1, B, 256)
+    prev_r = torch.zeros(B)
     
-    s_pred_live, r_pred_live, h1 = model.step(states[:, 0], actions[:, 0], rewards[:, 0], h0)
+    s_pred_live, r_pred_live, h1 = model.step(states[:, 0], actions[:, 0], prev_r, h0)
     assert list(s_pred_live.shape) == [B, C, H, W]
     assert list(r_pred_live.shape) == [B]
     assert list(h1.shape) == [1, B, 256]

@@ -141,9 +141,11 @@ class MetaRLTrainer:
         if not hasattr(self, 'current_obs') or self.current_obs is None:
             self.current_obs = env.reset()
             self.current_h_t = torch.zeros(1, B, self.world_model.gru.hidden_size, device=device)
+            self.current_prev_rew = torch.zeros(B, device=device)
             
         obs = self.current_obs
         h_t = self.current_h_t
+        prev_rew = self.current_prev_rew
         
         for t in range(S):
             self.global_step += B
@@ -157,7 +159,7 @@ class MetaRLTrainer:
             
             # 4. World Model Step (Live)
             with torch.no_grad():
-                next_obs_pred, rew_pred, new_h_t = self.world_model.step(obs, action, reward, h_t)
+                next_obs_pred, rew_pred, new_h_t = self.world_model.step(obs, action, prev_rew, h_t)
                 
             # 5. Store practically everything
             obs_buf[:, t] = obs
@@ -170,9 +172,11 @@ class MetaRLTrainer:
             
             # 6. Episode Resets (Boundary Masking on Memory)
             # If done == True, zero out the GRU state for that specific environment
+            prev_rew = reward.clone() # update for next step
             for i in range(B):
                 if done[i]:
                     new_h_t[:, i, :] = 0.0
+                    prev_rew[i] = 0.0 # next step is a new episode, so prev_reward is 0
                     
             h_t = new_h_t
             obs = next_obs
@@ -180,6 +184,7 @@ class MetaRLTrainer:
         # 7. Persist for the next iteration
         self.current_obs = obs
         self.current_h_t = h_t
+        self.current_prev_rew = prev_rew
             
         # Bootstrap value for GAE
         with torch.no_grad():
@@ -213,7 +218,7 @@ class MetaRLTrainer:
                 else:
                     chunk_next_obs = torch.cat([obs_buf[:, start_idx+1:end_idx], obs.unsqueeze(1)], dim=1)
                 
-                next_state_preds, _ = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew)
+                next_state_preds, next_reward_preds = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew)
                 
                 # Simplified surprise: MSE of the state logits (or CrossEntropy proxy depending on shape)
                 # target class indices
@@ -221,9 +226,16 @@ class MetaRLTrainer:
                 preds_flat = next_state_preds.view(B * seq_len, *self.ppo_net.obs_shape)
                 targets_flat = target_state_idx.view(B * seq_len, self.ppo_net.h, self.ppo_net.w)
                 
-                # Mean surprise
+                # Mean state surprise
                 ce_loss = nn.functional.cross_entropy(preds_flat, targets_flat, reduction='none')
-                surprise_score = ce_loss.mean().item()
+                state_surprise = ce_loss.mean().item()
+                
+                # Mean reward surprise
+                rew_loss = nn.functional.mse_loss(next_reward_preds, chunk_rew, reduction='none')
+                reward_surprise = rew_loss.mean().item()
+                
+                # Total surprise combines both visual and reward prediction errors
+                surprise_score = state_surprise + reward_surprise
                 
             chunk_surprise_scores.append(surprise_score)
             

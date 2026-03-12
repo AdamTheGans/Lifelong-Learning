@@ -533,4 +533,4 @@ if __name__ == "__main__":
     assert isinstance(trainer.ppo_optimizer, torch.optim.Optimizer)
     assert isinstance(trainer.wm_optimizer, torch.optim.Optimizer)
     
-    print(f"✅ Verification Successful: 1 Full Training pass completed without shape errors (Global Steps: {final_step}). Optimizers correctly separated.")
+    print(f"Verification Successful: 1 Full Training pass completed without shape errors (Global Steps: {final_step}). Optimizers correctly separated.")

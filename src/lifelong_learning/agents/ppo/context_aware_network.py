@@ -151,5 +151,5 @@ if __name__ == "__main__":
     # If we made it here, the system correctly blocked gradients
     assert model.encoder[0].weight.grad is not None, "Network itself did not receive valid PPO gradients"
     
-    print("\n✅ Verification Successful: Context inputs strictly block gradient flow into the World Model.")
+    print("\nVerification Successful: Context inputs strictly block gradient flow into the World Model.")
     print(f"   -> Forward pass returned {action.shape} shape actions and {value.shape} value.")

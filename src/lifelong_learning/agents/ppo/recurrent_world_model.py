@@ -307,4 +307,4 @@ if __name__ == "__main__":
     assert model.cnn[0].weight.grad is not None, "CNN extractor layer 0 did not receive gradients."
     assert model.next_state_head[0].weight.grad is not None, "MLP Output head did not receive gradients."
     
-    print("\n✅ Verification Successful: Gradients successfully backpropagated through sequential GRU back into the CNN Extractor!")
+    print("\nVerification Successful: Gradients successfully backpropagated through sequential GRU back into the CNN Extractor!")

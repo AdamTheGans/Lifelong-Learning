@@ -397,6 +397,21 @@ def train_brain(args):
             # Live plotting for brain
             plot_dir = os.path.join(logger.full_dir, "brain_trends")
             logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
+
+            # Generate high-scale plots for each inner env's data from this episode
+            ep_prefix = "episode" if episode > 0 else "pretrain"
+            ep_data_dir = os.path.join(logger.full_dir, f"{ep_prefix}_{episode}")
+            if os.path.isdir(ep_data_dir):
+                import subprocess, sys, glob as glob_mod
+                for env_folder in sorted(glob_mod.glob(os.path.join(ep_data_dir, "ep*_env*"))):
+                    if os.path.isdir(env_folder):
+                        try:
+                            subprocess.Popen(
+                                [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                        except Exception as e:
+                            print(f"  [plot] Failed to launch high-scale plot for {env_folder}: {e}")
               
     # Generate final overall Brain trend charts
     plot_dir = os.path.join(logger.full_dir, "brain_trends")

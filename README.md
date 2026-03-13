@@ -213,6 +213,7 @@ Understanding the key CLI flags for `train_brain.py` and `eval_brain.py`:
 * `--brain_episodes` : Number of complete inner agent training runs.
 * `--brain_num_envs` : Number of parallel meta-environments. Higher values (e.g., 4 or 8) give the Brain smoother gradients and more stable learning, but use more RAM/VRAM. Start with 2 or 4.
 * `--pretrain_episodes` : Number of initial episodes where the Brain uses Imitation Learning (behavioral cloning) on a hardcoded "explore vs exploit" heuristic before switching to PPO. Highly recommended to keep at 1–3 to seed the Brain with a good starting policy.
+* `--pretrain_mode` : Pretrain heuristic style. `basic` (default) uses a binary explore/exploit split at 50% success rate. `recovery` uses a multi-tier, surprise-reactive heuristic with 5 graduated tiers and immediate explore response to regime-switch surprise spikes.
 * `--brain_lr` : Learning rate for the Brain's PPO optimizer.
 * `--brain_ent_coef` : Entropy coefficient for the Brain's PPO optimizer.
 * `--reward_mode` : Brain reward function. `auc` (default) rewards absolute success rate. `recovery` uses a hybrid reward that heavily incentivizes fast recovery after regime switches (Δ success bonus + urgency penalty below 80%).

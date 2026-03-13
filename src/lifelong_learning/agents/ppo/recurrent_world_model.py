@@ -247,9 +247,15 @@ class RecurrentWorldModel(nn.Module):
         # Mask out steps strictly landing on reset frames (1.0 = valid, 0.0 = done)
         mask = 1.0 - dones.float()
         
-        masked_total = (total_loss_per_step * mask).mean()
-        masked_state = (state_loss_per_step * mask).mean()
-        masked_reward = (reward_loss_per_step * mask).mean()
+        # We only mask the state loss because the next state is a random reset.
+        # We DO NOT mask the reward loss, because the agent needs to learn the terminal +5/-1 reward!
+        # Upweight terminal rewards so the model doesn't just learn to predict the constant step penalty (-0.01)
+        reward_weights = 1.0 + (dones.float() * 49.0)
+        masked_reward = (reward_loss_per_step * reward_weights).mean()
+        
+        # Use .sum() / mask.sum() to compute the mean over valid elements only
+        masked_state = (state_loss_per_step * mask).sum() / mask.sum().clamp(min=1.0)
+        masked_total = masked_state + masked_reward
         
         return masked_total, masked_state, masked_reward
 

@@ -259,7 +259,8 @@ class MetaRLTrainer:
         dream_batch_size = self.cfg.get('dream_batch_size', B) # Default to rolling out B dreams
         
         has_dreams = False
-        if len(self.memory_buffer.buffer) >= dream_batch_size:
+        # QUICK DISABLE: Turning off generative replay completely for now (100% real PPO training)
+        if False and len(self.memory_buffer.buffer) >= dream_batch_size:
             has_dreams = True
             
             # Sample seeds (extract final state & h_t of the chunk)

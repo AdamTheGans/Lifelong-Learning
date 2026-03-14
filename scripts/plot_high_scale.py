@@ -101,13 +101,31 @@ def plot_metric(data_list, metric_name, save_path, regime_data, step_interval=50
                         color='green', fontsize=12, fontweight='bold', ha='center', va='center',
                         bbox=dict(facecolor='white', alpha=0.9, edgecolor='green', boxstyle='round,pad=0.3'))
             else:
-                # Did not reach 95%
-                mid_step = start_step + (end_step - start_step) / 2
-                y_pos = 0.5
+                # Did not reach 95% — check for 80%
+                reached_80_step = None
+                for s, v in zip(steps, values):
+                    if s >= start_step and s <= end_step:
+                        if v >= 0.80 and s >= (start_step + 10000):
+                            reached_80_step = s
+                            break
                 
-                ax.text(mid_step, y_pos, f"Regime {i}:\nfailed\nto reach\n95%", 
-                        color='red', fontsize=12, fontweight='bold', ha='center', va='center',
-                        bbox=dict(facecolor='white', alpha=0.9, edgecolor='red', boxstyle='round,pad=0.3'))
+                if reached_80_step is not None:
+                    steps_to_80 = reached_80_step - start_step
+                    mid_step = reached_80_step
+                    y_pos = 0.5
+                    
+                    ax.axvline(x=reached_80_step, color='orange', linestyle='--', alpha=0.7, zorder=1)
+                    ax.text(mid_step, y_pos, f"Regime {i}\nreached\n80% in\n{int(steps_to_80)}\nsteps", 
+                            color='orange', fontsize=12, fontweight='bold', ha='center', va='center',
+                            bbox=dict(facecolor='white', alpha=0.9, edgecolor='orange', boxstyle='round,pad=0.3'))
+                else:
+                    # Did not reach even 80%
+                    mid_step = start_step + (end_step - start_step) / 2
+                    y_pos = 0.5
+                    
+                    ax.text(mid_step, y_pos, f"Regime {i}:\nfailed\nto reach\n80%", 
+                            color='red', fontsize=12, fontweight='bold', ha='center', va='center',
+                            bbox=dict(facecolor='white', alpha=0.9, edgecolor='red', boxstyle='round,pad=0.3'))
     
     ax.xaxis.set_major_locator(ticker.MultipleLocator(step_interval))
     ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)

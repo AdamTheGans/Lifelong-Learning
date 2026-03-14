@@ -175,7 +175,8 @@ class MetaRLTrainer:
             prev_rew = reward.clone() # update for next step
             for i in range(B):
                 if done[i]:
-                    new_h_t[:, i, :] = 0.0
+                    # TEMPORARILY DISABLED: Do not reset hidden context vector
+                    # new_h_t[:, i, :] = 0.0
                     prev_rew[i] = 0.0 # next step is a new episode, so prev_reward is 0
                     
             h_t = new_h_t
@@ -318,7 +319,8 @@ class MetaRLTrainer:
             live_batch_don.append(don_buf[env_idx, start_idx:end_idx])
                 
         # 2. Mix only if past Warmup AND buffer has enough chunks
-        if self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
+        # QUICK DISABLE: Turning off World Model learning from buffer sequences (100% live data)
+        if False and self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
             ltm_batch = self.memory_buffer.sample(half_batch)
             
             mixed_obs  = torch.cat([ltm_batch['state'].to(device),  torch.stack(live_batch_obs[:half_batch])], dim=0)
@@ -336,14 +338,14 @@ class MetaRLTrainer:
             
         # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in 50/50 mode
         loss_live_val = loss_memory_val = None
-        if self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
+        if False and self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
             with torch.no_grad():
                 _, loss_live_s, loss_live_r = self.world_model.compute_loss_detailed(
                     states=torch.stack(live_batch_obs[:half_batch]),
                     actions=torch.stack(live_batch_act[:half_batch]),
                     rewards=torch.stack(live_batch_rew[:half_batch]),
                     next_states=torch.stack(live_batch_next_obs[:half_batch]),
-                    next_rewards=torch.stack(live_batch_rew[:half_batch]),
+                    target_rewards=torch.stack(live_batch_rew[:half_batch]),
                     dones=torch.stack(live_batch_don[:half_batch]).float(),
                 )
                 loss_live_val = (loss_live_s + loss_live_r).item()
@@ -352,7 +354,7 @@ class MetaRLTrainer:
                     actions=ltm_batch['action'].to(device),
                     rewards=ltm_batch['reward'].to(device),
                     next_states=ltm_batch['next_state'].to(device),
-                    next_rewards=ltm_batch['reward'].to(device),
+                    target_rewards=ltm_batch['reward'].to(device),
                     dones=ltm_batch['done'].to(device).float(),
                 )
                 loss_memory_val = (loss_mem_s + loss_mem_r).item()
@@ -366,7 +368,7 @@ class MetaRLTrainer:
                 actions=mixed_act,
                 rewards=mixed_rew,
                 next_states=mixed_next,
-                next_rewards=mixed_rew, # Simplified test: assume current step reward approx correlates target
+                target_rewards=mixed_rew, # target is r_t, forward_sequence shifts 'rewards' to r_{t-1} internally
                 dones=mixed_don
             )
             
@@ -398,15 +400,18 @@ class MetaRLTrainer:
         
         # 2. Update on Dream Generative Replay Rollout (if valid)
         if has_dreams:
-            ppo_stats_dream = self.ppo_update(
-                obs=d_obs,
-                actions=d_act,
-                old_logprobs=d_logp,
-                context_ht=d_ctx,
-                advantages=d_advantages,
-                returns=d_returns,
-                old_values=d_val
-            )
+            # TEMPORARILY DISABLED: The PPO is currently training on hallucinated trajectories 
+            # from a World Model that has not yet converged, causing it to confidently learn a broken environment.
+            pass
+            # ppo_stats_dream = self.ppo_update(
+            #     obs=d_obs,
+            #     actions=d_act,
+            #     old_logprobs=d_logp,
+            #     context_ht=d_ctx,
+            #     advantages=d_advantages,
+            #     returns=d_returns,
+            #     old_values=d_val
+            # )
             
         # Aggregate stats
         results = {

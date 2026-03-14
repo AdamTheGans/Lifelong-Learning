@@ -98,6 +98,12 @@ class RecurrentWorldModel(nn.Module):
         # Concatenate features 
         rnn_input = torch.cat([cnn_features, act_emb, rew_emb], dim=-1) # [B, S, 4129]
         
+        # --- DIAGNOSTIC 1: GRU INITIALIZATION ---
+        if np.random.rand() < 0.005:  # Print ~0.5% of the time to avoid massive spam
+            print(f"\n[DIAGNOSTIC 1] GRU forward_sequence called. rnn_input shape: {rnn_input.shape}")
+            print("[DIAGNOSTIC 1] Origin of h_0: NOT PROVIDED (Defaults to ZEROS by PyTorch).")
+            print("[DIAGNOSTIC 1] It is NOT loaded from the buffer, nor carried over from previous batches.")
+        
         # Unroll GRU
         gru_out, _ = self.gru(rnn_input)                  # [B, S, 256]
         
@@ -202,28 +208,55 @@ class RecurrentWorldModel(nn.Module):
                 
         return trajectories
 
-    def compute_loss(self, states, actions, rewards, next_states, next_rewards, dones):
+    def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones):
         """Standard loss wrapper"""
-        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, next_rewards, dones)
+        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, target_rewards, dones)
         return loss
 
-    def compute_loss_detailed(self, states, actions, rewards, next_states, next_rewards, dones):
+    def compute_loss_detailed(self, states, actions, rewards, next_states, target_rewards, dones):
         """
         Calculates loss handling randomized episode bounds masking, returning detailed components.
         
         Args:
-            states:       [B, S, C, H, W]
-            actions:      [B, S]
-            rewards:      [B, S]
-            next_states:  [B, S, C, H, W] real next states 
-            next_rewards: [B, S] real next rewards
-            dones:        [B, S] 0 or 1 done flags
+            states:         [B, S, C, H, W]
+            actions:        [B, S]
+            rewards:        [B, S] (shifted to r_{t-1} internally)
+            next_states:    [B, S, C, H, W] real next states 
+            target_rewards: [B, S] real target rewards (r_t)
+            dones:          [B, S] 0 or 1 done flags
             
         Returns:
             Mean total loss, Mean state loss, Mean reward loss
         """
         # 1. Forward pass
         next_state_preds, next_reward_preds = self.forward_sequence(states, actions, rewards)
+        
+        # --- DIAGNOSTIC 2: SEQUENCE ALIGNMENT ---
+        if np.random.rand() < 0.005:
+            print(f"\n[DIAGNOSTIC 2] Alignment Check:")
+            print(f"  states shape: {states.shape}, actions shape: {actions.shape}")
+            print(f"  next_reward_preds shape: {next_reward_preds.shape}, target_rewards shape: {target_rewards.shape}")
+            print(f"  Temporal flow: next_reward_preds[:, t] is predicted from state[:, t], action[:, t], and reward[:, t-1].")
+            print(f"  It is evaluated against target_rewards[:, t].")
+
+        # --- DIAGNOSTIC 3: OUTPUT VS TARGET VALUES ---
+        # Find terminal steps
+        terminal_mask = target_rewards > 4.0
+        if terminal_mask.any():
+            if np.random.rand() < 0.05: # Print occasionally when terminal is found
+                print(f"\n[DIAGNOSTIC 3] Terminal State Found! (Target > 4.0)")
+                term_preds = next_reward_preds[terminal_mask][:5]
+                term_targs = target_rewards[terminal_mask][:5]
+                print(f"  Terminal Preds:   {term_preds.detach().cpu().numpy()}")
+                print(f"  Terminal Targets: {term_targs.detach().cpu().numpy()}")
+                
+                # Also print some non-terminal for comparison
+                non_term_mask = target_rewards < 1.0
+                if non_term_mask.any():
+                    non_term_preds = next_reward_preds[non_term_mask][:5]
+                    non_term_targs = target_rewards[non_term_mask][:5]
+                    print(f"  Non-Term Preds:   {non_term_preds.detach().cpu().numpy()}")
+                    print(f"  Non-Term Targets: {non_term_targs.detach().cpu().numpy()}")
         
         B, S, C, H, W = states.shape
         
@@ -238,7 +271,7 @@ class RecurrentWorldModel(nn.Module):
         state_loss_per_step = ce_loss.mean(dim=(1, 2)).view(B, S) # [B, S]
         
         # 3. Reward loss (Mean Squared Error)
-        reward_loss_per_step = F.mse_loss(next_reward_preds, next_rewards, reduction='none') # [B, S]
+        reward_loss_per_step = F.mse_loss(next_reward_preds, target_rewards, reduction='none') # [B, S]
         
         # total per-step loss
         total_loss_per_step = state_loss_per_step + reward_loss_per_step
@@ -279,7 +312,7 @@ if __name__ == "__main__":
     # The 'next' targets from environment
     next_states = torch.zeros((B, S, C, H, W))
     next_states[:, :, 1, :, :] = 1.0
-    next_rewards = torch.randn((B, S))
+    target_rewards = torch.randn((B, S))
     dones = torch.randint(0, 2, (B, S)).float()
     
     # 2. Verify sequence shapes 
@@ -303,7 +336,7 @@ if __name__ == "__main__":
     
     # 4. Calculate Loss & Masking Validation
     print("Computing Loss and running backpropagation...")
-    loss = model.compute_loss(states, actions, rewards, next_states, next_rewards, dones)
+    loss = model.compute_loss(states, actions, rewards, next_states, target_rewards, dones)
     
     loss.backward()
     

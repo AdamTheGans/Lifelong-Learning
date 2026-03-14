@@ -215,7 +215,7 @@ def eval_brain(args):
                 state.cfg.anchoring_weight = new_aw
 
             # Action[7:15]: neuromodulation context code
-            if len(action) > 7:
+            if len(action) > 7 and not args.disable_neuromodulation:
                 context_code = torch.tensor(action[7:15], dtype=torch.float32, device=device)
                 state.model.set_context_code(context_code)
 
@@ -291,6 +291,8 @@ def main():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--save_every_updates", type=int, default=9999)
+    p.add_argument("--disable_neuromodulation", action="store_true",
+                   help="Disable neuromodulation gating (context code ignored, mask stays all-ones)")
 
     args = p.parse_args()
     eval_brain(args)

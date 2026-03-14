@@ -152,6 +152,7 @@ def train_brain(args):
                 min_intrinsic_coef=args.min_intrinsic_coef,
                 max_intrinsic_coef=args.max_intrinsic_coef,
                 start_episode=start_episode,
+                disable_neuromodulation=args.disable_neuromodulation,
             )
         return _make_env_fn
 
@@ -530,6 +531,8 @@ def main():
     p.add_argument("--reward_beta", type=float, default=0.5)
     p.add_argument("--reward_mode", type=str, default="auc", choices=["auc", "recovery", "curriculum"],
                    help="Brain reward mode: 'auc' (original), 'recovery' (hybrid delta + urgency), or 'curriculum' (exponential multiplier for returning regimes)")
+    p.add_argument("--disable_neuromodulation", action="store_true",
+                   help="Disable neuromodulation gating (Brain still outputs 15 dims but context code is ignored)")
 
     # Episodic Memory
     p.add_argument("--episodic_memory_capacity", type=int, default=50000,

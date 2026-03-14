@@ -70,6 +70,7 @@ class MetaEnv(gym.Env):
         min_intrinsic_coef: float = 0.001,
         max_intrinsic_coef: float = 0.5,
         start_episode: int = 1,
+        disable_neuromodulation: bool = False,
     ):
         super().__init__()
 
@@ -100,6 +101,7 @@ class MetaEnv(gym.Env):
         self.max_ent_coef = max_ent_coef
         self.min_intrinsic_coef = min_intrinsic_coef
         self.max_intrinsic_coef = max_intrinsic_coef
+        self.disable_neuromodulation = disable_neuromodulation
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -278,9 +280,10 @@ class MetaEnv(gym.Env):
         s.cfg.anchoring_weight = map_to_range(action[6], self.anchoring_weight_bounds)
 
         # Action[7:15]: neuromodulation context code
-        import torch
-        context_code = torch.tensor(action[7:15], dtype=torch.float32, device=s.device)
-        s.model.set_context_code(context_code)
+        if not self.disable_neuromodulation:
+            import torch
+            context_code = torch.tensor(action[7:15], dtype=torch.float32, device=s.device)
+            s.model.set_context_code(context_code)
 
     def close(self):
         if self._state is not None:

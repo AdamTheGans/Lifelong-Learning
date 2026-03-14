@@ -41,7 +41,29 @@ def eval_brain(args):
     ckpt = torch.load(args.brain_checkpoint, map_location=device)
     
     brain_model = MLPActorCritic().to(device)
-    brain_model.load_state_dict(ckpt["model_state_dict"])
+    
+    # Handle backward compatibility: older checkpoints have 5 action output dims, we have 7
+    state_dict = ckpt["model_state_dict"]
+    
+    if "actor_mean.weight" in state_dict and state_dict["actor_mean.weight"].shape[0] == 5:
+        print("DETECTED LEGACY 5-DIM ACTION SPACE MODEL. PADDING TO 7-DIM...")
+        old_weight = state_dict["actor_mean.weight"]
+        old_bias = state_dict["actor_mean.bias"]
+        old_logstd = state_dict["actor_logstd"]
+        
+        new_weight = torch.zeros(7, old_weight.shape[1], device=old_weight.device)
+        new_weight[:5, :] = old_weight
+        state_dict["actor_mean.weight"] = new_weight
+        
+        new_bias = torch.zeros(7, device=old_bias.device)
+        new_bias[:5] = old_bias
+        state_dict["actor_mean.bias"] = new_bias
+        
+        new_logstd = torch.zeros(1, 7, device=old_logstd.device)
+        new_logstd[0, :5] = old_logstd
+        state_dict["actor_logstd"] = new_logstd
+
+    brain_model.load_state_dict(state_dict)
     brain_model.eval()  # Inference mode — no dropout, batchnorm etc.
 
     train_args = ckpt.get("args", {})
@@ -114,6 +136,8 @@ def eval_brain(args):
     intrinsic_coef_bounds = (args.min_intrinsic_coef, args.max_intrinsic_coef)
     imagined_horizon_bounds = (1, 30)
     replay_ratio_bounds = (0.0, 0.5)
+    replay_prioritization_bounds = (0.0, 1.0)
+    anchoring_weight_bounds = (0.0, 0.5)
 
     print(f"\nRunning Brain-controlled evaluation:")
     print(f"  Environment: {args.env_id}")
@@ -173,6 +197,21 @@ def eval_brain(args):
             new_rr = map_to_range(float(action[4]), replay_ratio_bounds)
             state.replay_ratio = new_rr
 
+            # Backward compatibility for models trained before levers 5 and 6 were added
+            if len(action) > 5:
+                # Action[5]: replay prioritization
+                new_rp = map_to_range(float(action[5]), replay_prioritization_bounds)
+                state.replay_prioritization = new_rp
+
+                # Action[6]: anchoring weight
+                new_aw = map_to_range(float(action[6]), anchoring_weight_bounds)
+                state.cfg.anchoring_weight = new_aw
+            else:
+                new_rp = 0.0
+                new_aw = 0.0
+                state.replay_prioritization = new_rp
+                state.cfg.anchoring_weight = new_aw
+
             # Log Brain decisions
             success_rate = stats.get("success_rate", 0.0)
             state.logger.scalar("brain/lr", new_lr, state.global_step)
@@ -180,6 +219,8 @@ def eval_brain(args):
             state.logger.scalar("brain/intrinsic_coef", new_ic, state.global_step)
             state.logger.scalar("brain/imagined_horizon", new_ih, state.global_step)
             state.logger.scalar("brain/replay_ratio", new_rr, state.global_step)
+            state.logger.scalar("brain/replay_prioritization", new_rp, state.global_step)
+            state.logger.scalar("brain/anchoring_weight", new_aw, state.global_step)
             state.logger.scalar("brain/value_estimate", value.item(), state.global_step)
 
     elapsed = time.time() - start_time
@@ -216,8 +257,8 @@ def main():
 
     # Environment
     p.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-5x5-v0")
-    p.add_argument("--total_timesteps", type=int, default=1_150_000)
-    p.add_argument("--steps_per_regime", type=int, default=18500)
+    p.add_argument("--total_timesteps", type=int, default=1150000)
+    p.add_argument("--steps_per_regime", type=int, default=296000)
     p.add_argument("--num_regimes", type=int, default=2)
     p.add_argument("--num_envs", type=int, default=8)
     p.add_argument("--num_steps", type=int, default=128)
@@ -231,9 +272,9 @@ def main():
     p.add_argument("--max_inner_lr", type=float, default=0.003, help="Maximum absolute bound for the inner agent's learning rate")
     p.add_argument("--min_inner_lr", type=float, default=1e-4, help="Minimum absolute bound for the inner agent's learning rate")
     p.add_argument("--min_ent_coef", type=float, default=0.001, help="Minimum bound for inner entropy coefficient")
-    p.add_argument("--max_ent_coef", type=float, default=0.2, help="Maximum bound for inner entropy coefficient")
+    p.add_argument("--max_ent_coef", type=float, default=0.1, help="Maximum bound for inner entropy coefficient")
     p.add_argument("--min_intrinsic_coef", type=float, default=0.001, help="Minimum bound for inner intrinsic curiosity coefficient")
-    p.add_argument("--max_intrinsic_coef", type=float, default=1.0, help="Maximum bound for inner intrinsic curiosity coefficient")
+    p.add_argument("--max_intrinsic_coef", type=float, default=0.5, help="Maximum bound for inner intrinsic curiosity coefficient")
 
     # Brain settings
     p.add_argument("--decision_interval", type=int, default=10)

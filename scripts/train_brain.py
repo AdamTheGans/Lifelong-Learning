@@ -34,29 +34,44 @@ def train_brain(args):
     # -----------------------------------------------------------------
     start_episode = 1
     checkpoint = None
+    resume_dir = None
     if args.resume_path:
+        if not getattr(args, "new_run_dir", False):
+            abs_path = os.path.abspath(args.resume_path)
+            parent_dir = os.path.dirname(abs_path)
+            parent_dir_name = os.path.basename(parent_dir)
+            if parent_dir_name.startswith("episode_") or parent_dir_name.startswith("pretrain_"):
+                resume_dir = os.path.dirname(parent_dir)
+            else:
+                resume_dir = parent_dir
+            print(f"Resuming in existing folder: {resume_dir}")
+
         print(f"Loading checkpoint configs from: {args.resume_path}")
         checkpoint = torch.load(args.resume_path, map_location=device, weights_only=False)
         
-        if isinstance(checkpoint, dict) and "args" in checkpoint:
-            saved_args = checkpoint["args"]
-            
-            # Find arguments explicitly passed in the command line
-            import sys
-            explicit_args = set()
-            for arg_str in sys.argv[1:]:
-                if arg_str.startswith("--"):
-                    key = arg_str[2:].split("=")[0]
-                    # Handle if the user passes dashes instead of underscores
-                    explicit_args.add(key.replace("-", "_"))
-            
-            # Restore saved arguments ONLY IF they were not explicitly passed
-            for k, v in saved_args.items():
-                if k not in explicit_args:
-                    setattr(args, k, v)
-                    
-            print(f"Successfully restored environment and inner agent config from checkpoint.")
-            print(f"Kept explicit CLI arguments: {list(explicit_args.intersection(saved_args.keys()))}")
+        if isinstance(checkpoint, dict):
+            if "episodes_trained" in checkpoint:
+                start_episode = checkpoint.get("episode", checkpoint["episodes_trained"]) + 1
+                
+            if "args" in checkpoint:
+                saved_args = checkpoint["args"]
+                
+                # Find arguments explicitly passed in the command line
+                import sys
+                explicit_args = set()
+                for arg_str in sys.argv[1:]:
+                    if arg_str.startswith("--"):
+                        key = arg_str[2:].split("=")[0]
+                        # Handle if the user passes dashes instead of underscores
+                        explicit_args.add(key.replace("-", "_"))
+                
+                # Restore saved arguments ONLY IF they were not explicitly passed
+                for k, v in saved_args.items():
+                    if k not in explicit_args:
+                        setattr(args, k, v)
+                        
+                print(f"Successfully restored environment and inner agent config from checkpoint.")
+                print(f"Kept explicit CLI arguments: {list(explicit_args.intersection(saved_args.keys()))}")
 
     # -----------------------------------------------------------------
     # Inner agent config (passed to MetaEnv)
@@ -76,7 +91,31 @@ def train_brain(args):
     # -----------------------------------------------------------------
     # Meta-environment Vectorization
     # -----------------------------------------------------------------
-    logger = DataLogger(run_name=args.run_name or "brain_training")
+    logger = DataLogger(run_name=args.run_name or "brain_training", full_dir=resume_dir)
+
+    if args.resume_path and not getattr(args, "new_run_dir", False) and resume_dir:
+        import glob
+        import json
+        trends_dir = os.path.join(resume_dir, "brain_trends")
+        json_path = os.path.join(trends_dir, f"{logger.run_name}_data.json")
+        if not os.path.exists(json_path):
+            json_files = glob.glob(os.path.join(trends_dir, "*_data.json"))
+            if json_files:
+                json_path = json_files[0]
+                logger.run_name = os.path.basename(json_path).replace("_data.json", "")
+        
+        if os.path.exists(json_path):
+            print(f"Loading previous logger data: {json_path}")
+            try:
+                with open(json_path, "r") as f:
+                    old_data = json.load(f)
+                    from collections import defaultdict
+                    new_data = defaultdict(list)
+                    for k, v in old_data.items():
+                        new_data[k] = [tuple(item) for item in v]
+                    logger.data = new_data
+            except Exception as e:
+                print(f"Warning: failed to load previous logger data: {e}")
     
     # Save all configuration arguments to a txt file in the run directory
     config_path = os.path.join(logger.full_dir, "config.txt")
@@ -138,9 +177,7 @@ def train_brain(args):
             brain_model.load_state_dict(checkpoint["model_state_dict"])
             if "optimizer_state_dict" in checkpoint:
                 brain_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if "episodes_trained" in checkpoint:
-                start_episode = checkpoint.get("episode", checkpoint["episodes_trained"]) + 1
-                print(f"Resuming at episode {start_episode}")
+            print(f"Resuming at episode {start_episode}")
         else:
             brain_model.load_state_dict(checkpoint)
 
@@ -170,7 +207,7 @@ def train_brain(args):
                 # Index 1 is success_rate (from signals.py)
                 success_rates = obs[:, 1]
                 
-                target_actions = np.zeros((args.brain_num_envs, 5), dtype=np.float32)
+                target_actions = np.zeros((args.brain_num_envs, 7), dtype=np.float32)
                 for i in range(args.brain_num_envs):
                     if args.pretrain_mode == "recovery":
                         # Recovery pretrain: multi-tier, surprise-reactive heuristic
@@ -184,27 +221,27 @@ def train_brain(args):
                         if spike_signal < -0.5:
                             # Just saw a surprise spike = likely regime switch
                             # Slam into explore mode regardless of success rate
-                            target_actions[i] = [0.7, 0.7, 0.7, 0.7, -0.3]
+                            target_actions[i] = [0.7, 0.7, 0.7, 0.7, -0.3, 0.8, -0.8]
                         elif raw_sr < 0.3:
                             # Deep recovery: strong explore
-                            target_actions[i] = [0.5, 0.6, 0.6, 0.5, -0.2]
+                            target_actions[i] = [0.5, 0.6, 0.6, 0.5, -0.2, 0.6, -0.6]
                         elif raw_sr < 0.6:
                             # Mid recovery: moderate explore
-                            target_actions[i] = [0.3, 0.3, 0.4, 0.3, 0.0]
+                            target_actions[i] = [0.3, 0.3, 0.4, 0.3, 0.0, 0.3, -0.2]
                         elif raw_sr < 0.8:
                             # Almost recovered: start tapering
-                            target_actions[i] = [0.0, 0.0, 0.1, 0.1, 0.2]
+                            target_actions[i] = [0.0, 0.0, 0.1, 0.1, 0.2, 0.0, 0.2]
                         else:
                             # Recovered: moderate exploit (not extreme)
-                            target_actions[i] = [-0.2, -0.3, -0.1, -0.1, 0.3]
+                            target_actions[i] = [-0.2, -0.3, -0.1, -0.1, 0.3, -0.5, 0.5]
                     else:
                         # Basic pretrain: original binary heuristic
                         if success_rates[i] < 0.5:
                             # Explore: map towards higher values (actions > 0)
-                            target_actions[i] = [0.8, 0.8, 0.8, 0.8, -0.9]
+                            target_actions[i] = [0.8, 0.8, 0.8, 0.8, -0.9, 0.8, -0.8]
                         else:
                             # Exploit: map towards lower values (actions < 0)
-                            target_actions[i] = [-0.8, -0.8, -0.8, -0.8, 0.8]
+                            target_actions[i] = [-0.8, -0.8, -0.8, -0.8, 0.8, -0.8, 0.8]
 
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
                 target_a_t = torch.tensor(target_actions, dtype=torch.float32, device=device)
@@ -227,6 +264,21 @@ def train_brain(args):
             ep_time = time.time() - ep_start
             print(f"Pretrain Episode {pre_ep}/{args.pretrain_episodes} | steps={steps} | time={ep_time:.1f}s | last_loss={loss.item():.4f}")
 
+            # Generate high-scale plots for pretrain episode
+            ep_data_dir = os.path.join(logger.full_dir, f"pretrain_{pre_ep}")
+            if os.path.isdir(ep_data_dir):
+                import subprocess, sys, glob as glob_mod
+                for env_folder in sorted(glob_mod.glob(os.path.join(ep_data_dir, "ep*_env*"))):
+                    if os.path.isdir(env_folder):
+                        try:
+                            print(f"  [plot] Generating charts for {os.path.basename(env_folder)}...")
+                            subprocess.Popen(
+                                [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                        except Exception as e:
+                            print(f"  [plot] Failed to launch high-scale plot for {env_folder}: {e}")
+
     # -----------------------------------------------------------------
     # Training loop: RL
     # -----------------------------------------------------------------
@@ -239,9 +291,15 @@ def train_brain(args):
 
     print(f"\n--- Starting Meta-RL PPO Training (Target: {target_episodes}) ---")
     all_episode_rewards = []
+    if "brain/episode_reward" in logger.data:
+        all_episode_rewards = [val for step, val in logger.data["brain/episode_reward"]]
     
     # Restore the prefix and starting episode counter count since pretraining modified it
+    # AND ensure that when resuming from a checkpoint, the environment uses the correct episode number.
     if args.pretrain_episodes > 0 and start_episode == 1:
+        meta_env.set_attr("_episode_prefix", "episode")
+        meta_env.set_attr("_episode_counter", start_episode - 1)
+    elif start_episode > 1:
         meta_env.set_attr("_episode_prefix", "episode")
         meta_env.set_attr("_episode_counter", start_episode - 1)
 
@@ -399,13 +457,15 @@ def train_brain(args):
             logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
 
             # Generate high-scale plots for each inner env's data from this episode
-            ep_prefix = "episode" if episode > 0 else "pretrain"
+            ep_prefix = "pretrain" if episode == 0 else "episode"
             ep_data_dir = os.path.join(logger.full_dir, f"{ep_prefix}_{episode}")
+            
             if os.path.isdir(ep_data_dir):
                 import subprocess, sys, glob as glob_mod
                 for env_folder in sorted(glob_mod.glob(os.path.join(ep_data_dir, "ep*_env*"))):
                     if os.path.isdir(env_folder):
                         try:
+                            print(f"  [plot] Generating charts for {os.path.basename(env_folder)}...")
                             subprocess.Popen(
                                 [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -437,11 +497,11 @@ def main():
 
     # Inner agent settings
     p.add_argument("--env_id", type=str, default="MiniGrid-MultiGoal-5x5-v0")
-    p.add_argument("--inner_total_timesteps", type=int, default=150_000)
+    p.add_argument("--inner_total_timesteps", type=int, default=1150000)
     p.add_argument("--inner_num_envs", type=int, default=8)
     p.add_argument("--inner_num_steps", type=int, default=128)
     p.add_argument("--num_regimes", type=int, default=2)
-    p.add_argument("--inner_steps_per_regime", type=int, default=None)
+    p.add_argument("--inner_steps_per_regime", type=int, default=296000)
     p.add_argument("--inner_mode", type=str, default="dyna", choices=["dyna", "passive"])
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
     p.add_argument("--inner_imagined_horizon", type=int, default=10)
@@ -449,9 +509,9 @@ def main():
     p.add_argument("--max_inner_lr", type=float, default=0.003, help="Maximum absolute bound for the inner agent's learning rate")
     p.add_argument("--min_inner_lr", type=float, default=1e-4, help="Minimum absolute bound for the inner agent's learning rate")
     p.add_argument("--min_ent_coef", type=float, default=0.001, help="Minimum bound for inner entropy coefficient")
-    p.add_argument("--max_ent_coef", type=float, default=0.2, help="Maximum bound for inner entropy coefficient")
+    p.add_argument("--max_ent_coef", type=float, default=0.1, help="Maximum bound for inner entropy coefficient")
     p.add_argument("--min_intrinsic_coef", type=float, default=0.001, help="Minimum bound for inner intrinsic curiosity coefficient")
-    p.add_argument("--max_intrinsic_coef", type=float, default=1.0, help="Maximum bound for inner intrinsic curiosity coefficient")
+    p.add_argument("--max_intrinsic_coef", type=float, default=0.5, help="Maximum bound for inner intrinsic curiosity coefficient")
 
     # Brain meta-agent settings
     p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")
@@ -468,8 +528,8 @@ def main():
     # Reward shaping
     p.add_argument("--reward_alpha", type=float, default=0.1)
     p.add_argument("--reward_beta", type=float, default=0.5)
-    p.add_argument("--reward_mode", type=str, default="auc", choices=["auc", "recovery"],
-                   help="Brain reward mode: 'auc' (original) or 'recovery' (hybrid delta + urgency)")
+    p.add_argument("--reward_mode", type=str, default="auc", choices=["auc", "recovery", "curriculum"],
+                   help="Brain reward mode: 'auc' (original), 'recovery' (hybrid delta + urgency), or 'curriculum' (exponential multiplier for returning regimes)")
 
     # Episodic Memory
     p.add_argument("--episodic_memory_capacity", type=int, default=50000,
@@ -480,6 +540,7 @@ def main():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--resume_path", type=str, default=None, help="Path to brain checkpoint.pt to resume from")
+    p.add_argument("--new_run_dir", action="store_true", help="If resuming, create a new run folder instead of continuing in the same folder")
 
     args = p.parse_args()
     train_brain(args)

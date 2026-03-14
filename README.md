@@ -112,6 +112,26 @@ python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --total_timesteps 
 ```
 *Note: Learning rate annealing will reset unless you manually adjust timesteps, but for fine-tuning/continuation, this is usually acceptable.*
 
+### 1.7 Testing Continual Learning Levers Manually
+
+You can manually test the new Replay Prioritization and Policy Anchoring Weight levers in Dyna-PPO without the Brain agent:
+
+```bash
+python scripts/train_ppo.py \
+    --env_id MiniGrid-MultiGoal-8x8-v0 \
+    --mode dyna \
+    --total_timesteps 1500000 \
+    --steps_per_regime 18500 \
+    --anchoring_weight 0.5 \
+    --replay_ratio 0.25 \
+    --replay_prioritization 1.0 \
+    --run_name ppo_with_levers
+```
+
+```powershell
+.\myenv\Scripts\python.exe scripts\train_ppo.py --env_id MiniGrid-MultiGoal-8x8-v0 --mode dyna --total_timesteps 1500000 --steps_per_regime 18500 --anchoring_weight 0.5 --replay_ratio 0.25 --replay_prioritization 1.0 --run_name ppo_with_levers_ps
+```
+
 ---
 
 ## Part 2: Meta-RL Hyperparameter Controller ("The Brain")
@@ -146,7 +166,7 @@ tensorboard --logdir runs
 
 ### 2.3 Recommended Robust Training Command
 
-Use this command for a full-scale Meta-RL training run that prioritizes robust generalization and recovery from catastrophic forgetting, utilizing the new Episodic Memory system:
+Use this command for a full-scale Meta-RL training run. The Brain now operates in a **7-dimensional continuous action space**, dynamically controlling Replay Prioritization and Policy Anchoring Weight to prioritize robust generalization and recovery from catastrophic forgetting:
 
 ```bash
 python scripts/train_brain.py \

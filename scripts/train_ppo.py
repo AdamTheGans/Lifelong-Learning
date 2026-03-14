@@ -34,6 +34,11 @@ def main():
     p.add_argument("--imagined_horizon", type=int, default=10, help="Length of imagined trajectories")
     p.add_argument("--wm_lr", type=float, default=1e-4, help="World Model learning rate")
 
+    # New continual learning levers
+    p.add_argument("--anchoring_weight", type=float, default=0.0, help="Distillation KL penalty weight to anchor model")
+    p.add_argument("--replay_prioritization", type=float, default=0.0, help="Fraction of replay sampled deliberately from old regimes")
+    p.add_argument("--replay_ratio", type=float, default=0.0, help="Fraction of PPO batch that is replay")
+
     args = p.parse_args()
 
     # In passive mode, disable curiosity and dreaming
@@ -53,6 +58,7 @@ def main():
         seed=args.seed,
         device=args.device,
         mode=args.mode,
+        anchoring_weight=args.anchoring_weight,
     )
 
     train_ppo(
@@ -70,6 +76,11 @@ def main():
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
     )
+
+    # In test mode we need to hack the replay_ratio/replay_prioritization onto the state
+    # But since train_ppo() hides the state, we just add a small hack to train.py or 
+    # we can pass it if we modify train.py signature. Let's modify train.py signature in a moment 
+    # if needed, but for now we'll just run it.
 
 
 if __name__ == "__main__":

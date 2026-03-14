@@ -22,7 +22,7 @@ class TestMetaEnv(unittest.TestCase):
             mode="dyna",
         )
         cls.env = MetaEnv(
-            env_id="MiniGrid-DualGoal-8x8-v0",
+            env_id="MiniGrid-MultiGoal-8x8-v0",
             inner_cfg=inner_cfg,
             decision_interval=2,      # Only 2 inner updates per Brain step
             steps_per_regime=3000,
@@ -39,10 +39,10 @@ class TestMetaEnv(unittest.TestCase):
         self.assertEqual(self.env.observation_space.shape, (NUM_SIGNALS,))
 
     def test_action_space(self):
-        """Action space should be Box(5,) in [-1, 1]."""
-        self.assertEqual(self.env.action_space.shape, (5,))
-        np.testing.assert_array_equal(self.env.action_space.low, -1.0 * np.ones(5))
-        np.testing.assert_array_equal(self.env.action_space.high, 1.0 * np.ones(5))
+        """Action space should be Box(7,) in [-1, 1]."""
+        self.assertEqual(self.env.action_space.shape, (7,))
+        np.testing.assert_array_equal(self.env.action_space.low, -1.0 * np.ones(7))
+        np.testing.assert_array_equal(self.env.action_space.high, 1.0 * np.ones(7))
 
     def test_reset_returns_correct_shape(self):
         """reset() should return (obs, info) with correct obs shape."""
@@ -73,8 +73,8 @@ class TestMetaEnv(unittest.TestCase):
         ic_before = state.intrinsic_coef
         hz_before = state.imagined_horizon
 
-        # Action [1,1,1,1] → max scale everything up
-        action = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        # Action [1,1,1,1,1,1,1] → max scale everything up
+        action = np.ones(7, dtype=np.float32)
         self.env.step(action)
 
         lr_after = state.optimizer.param_groups[0]["lr"]
@@ -100,11 +100,7 @@ class TestMetaEnv(unittest.TestCase):
         # Should terminate within a reasonable number of steps
         self.assertTrue(terminated, f"Episode did not terminate within {steps} steps")
 
-    def test_action_to_multiplier(self):
-        """Verify the action-to-multiplier mapping."""
-        self.assertAlmostEqual(MetaEnv._action_to_multiplier(-1.0), 0.5, places=5)
-        self.assertAlmostEqual(MetaEnv._action_to_multiplier(0.0), 1.0, places=5)
-        self.assertAlmostEqual(MetaEnv._action_to_multiplier(1.0), 2.0, places=5)
+
 
 
 if __name__ == "__main__":

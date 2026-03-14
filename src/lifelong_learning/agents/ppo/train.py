@@ -41,6 +41,7 @@ class InnerTrainState:
     """
     # --- Models & optimizers ---
     model: CNNActorCritic = field(repr=False)
+    anchor_model: CNNActorCritic | None = field(repr=False)
     optimizer: torch.optim.Adam = field(repr=False)
     world_model: SimpleWorldModel = field(repr=False)
     wm_optimizer: torch.optim.Adam = field(repr=False)
@@ -58,6 +59,7 @@ class InnerTrainState:
     intrinsic_reward_clip: float = 0.1
     imagined_horizon: int = 5
     replay_ratio: float = 0.0
+    replay_prioritization: float = 0.0
 
     # --- Episodic Memory ---
     episodic_memory: EpisodicMemory = field(default=None, repr=False)
@@ -91,6 +93,7 @@ class InnerTrainState:
 
     # --- Regime switching ---
     regime_step_counter: list = field(default_factory=lambda: [0])
+    current_mode_regime: int = 0
 
 
 def init_inner_training(
@@ -156,6 +159,10 @@ def init_inner_training(
     model = CNNActorCritic(obs_shape, n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
+    anchor_model = CNNActorCritic(obs_shape, n_actions).to(device)
+    anchor_model.load_state_dict(model.state_dict())
+    anchor_model.eval()
+
     world_model = SimpleWorldModel(obs_shape, n_actions).to(device)
     wm_optimizer = torch.optim.Adam(world_model.parameters(), lr=wm_lr)
     buffer = RolloutBuffer(cfg.num_steps, num_envs, obs_shape, device)
@@ -215,6 +222,7 @@ def init_inner_training(
 
     return InnerTrainState(
         model=model,
+        anchor_model=anchor_model,
         optimizer=optimizer,
         world_model=world_model,
         wm_optimizer=wm_optimizer,
@@ -244,6 +252,7 @@ def init_inner_training(
         episodic_memory=ep_memory,
         episodic_memory_capacity=episodic_memory_capacity,
         regime_step_counter=regime_step_counter,
+        current_mode_regime=start_regime,
     )
 
 
@@ -303,14 +312,26 @@ def run_inner_update(state: InnerTrainState) -> dict:
         next_obs, reward, terminated, truncated, infos = s.envs.step(action.cpu().numpy())
         done = np.logical_or(terminated, truncated)
 
-        # Increment shared regime step counter once per envs.step() call
+        # Increment shared regime step counter by the number of parallel env steps taken
         if hasattr(s, 'regime_step_counter'):
-            s.regime_step_counter[0] += 1
+            s.regime_step_counter[0] += s.num_envs
 
         # Log regime_id for regime switch visualization
+        current_env_regime = s.current_mode_regime
         if "regime_id" in infos:
             regime_ids = infos["regime_id"]
-            s.logger.scalar("charts/regime_id", float(np.mean(regime_ids)), s.global_step)
+            # Filter out None values that might appear due to env resets
+            valid_regimes = [r for r in regime_ids if r is not None]
+            if valid_regimes:
+                current_env_regime = int(np.bincount(np.array(valid_regimes, dtype=int)).argmax())  # majority vote
+                s.logger.scalar("charts/regime_id", float(np.mean(valid_regimes)), s.global_step)
+
+        # Handle regime switch
+        if current_env_regime != s.current_mode_regime:
+            print(f"[{s.global_step}] Regime switch detected! {s.current_mode_regime} -> {current_env_regime}. Snapshotting anchor model.")
+            s.current_mode_regime = current_env_regime
+            if s.anchor_model is not None:
+                s.anchor_model.load_state_dict(s.model.state_dict())
 
         # Handle autoreset: use final_observation for surprise calc on done envs
         real_next_obs = next_obs.copy()
@@ -420,7 +441,14 @@ def run_inner_update(state: InnerTrainState) -> dict:
         minibatches = s.buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
         for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
             ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-            stats = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+            
+            anchor_logprobs_list = None
+            if s.cfg.anchoring_weight > 0.0 and s.anchor_model is not None:
+                with torch.no_grad():
+                    anchor_logprobs, _, _ = s.anchor_model.evaluate_actions(obs, actions)
+                anchor_logprobs_list = [anchor_logprobs]
+
+            stats = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg, anchor_logprobs_list)
             update_stats.append(stats)
 
     # Phase B2: Replay from episodic memory (Brain-controlled)
@@ -429,7 +457,7 @@ def run_inner_update(state: InnerTrainState) -> dict:
         n_replay = max(1, int(s.cfg.minibatch_size * s.replay_ratio))
         n_fresh = s.cfg.minibatch_size - n_replay
 
-        replay_sample = s.episodic_memory.sample(n_replay)
+        replay_sample = s.episodic_memory.sample(n_replay, prioritization=s.replay_prioritization, current_regime=s.current_mode_regime)
         if replay_sample is not None:
             # Get fresh samples from current buffer
             fresh_idxs = np.random.randint(0, s.cfg.num_steps * s.num_envs, size=n_fresh)
@@ -463,7 +491,14 @@ def run_inner_update(state: InnerTrainState) -> dict:
             new_logprobs, _, _ = s.model.evaluate_actions(mixed_obs, mixed_actions)
 
             ppo_batch = [mixed_obs, mixed_actions, new_logprobs, mixed_advantages, mixed_returns, mixed_values]
-            rs = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+            
+            anchor_logprobs_list = None
+            if s.cfg.anchoring_weight > 0.0 and s.anchor_model is not None:
+                with torch.no_grad():
+                    anchor_logprobs, _, _ = s.anchor_model.evaluate_actions(mixed_obs, mixed_actions)
+                anchor_logprobs_list = [anchor_logprobs]
+
+            rs = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg, anchor_logprobs_list)
             replay_stats.append(rs)
 
     # =====================================================================
@@ -527,13 +562,20 @@ def run_inner_update(state: InnerTrainState) -> dict:
 
         # Archive current rollout to episodic memory BEFORE dreaming
         if s.episodic_memory is not None:
-            s.episodic_memory.store_from_rollout(s.buffer)
+            s.episodic_memory.store_from_rollout(s.buffer, regime_ids=s.current_mode_regime)
 
         for epoch in range(1):
             minibatches = dream_buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
             for obs, actions, logprobs, advantages, returns, values, _, _ in minibatches:
                 ppo_batch = [obs, actions, logprobs, advantages, returns, values]
-                ds = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg)
+                
+                anchor_logprobs_list = None
+                if s.cfg.anchoring_weight > 0.0 and s.anchor_model is not None:
+                    with torch.no_grad():
+                        anchor_logprobs, _, _ = s.anchor_model.evaluate_actions(obs, actions)
+                    anchor_logprobs_list = [anchor_logprobs]
+
+                ds = ppo_update(s.model, s.optimizer, [ppo_batch], s.cfg, anchor_logprobs_list)
                 dream_stats.append(ds)
 
     # =====================================================================
@@ -575,10 +617,12 @@ def run_inner_update(state: InnerTrainState) -> dict:
     s.logger.scalar("brain/ent_coef", s.cfg.ent_coef, s.global_step)
     s.logger.scalar("brain/intrinsic_coef", s.intrinsic_coef, s.global_step)
     s.logger.scalar("brain/imagined_horizon", float(s.imagined_horizon), s.global_step)
+    s.logger.scalar("brain/anchoring_weight", float(s.cfg.anchoring_weight), s.global_step)
 
     sps = int(s.global_step / max(1e-9, (time.time() - s.start_time)))
     s.logger.scalar("charts/SPS", sps, s.global_step)
     s.logger.scalar("charts/replay_ratio", s.replay_ratio, s.global_step)
+    s.logger.scalar("charts/replay_prioritization", s.replay_prioritization, s.global_step)
     s.logger.scalar("charts/episodic_memory_fullness", s.episodic_memory.fullness if s.episodic_memory else 0.0, s.global_step)
 
     if update % s.save_every_updates == 0 or update == s.num_updates:
@@ -649,9 +693,12 @@ def run_inner_update(state: InnerTrainState) -> dict:
         "current_ent_coef": s.cfg.ent_coef,
         "current_intrinsic_coef": s.intrinsic_coef,
         "current_replay_ratio": s.replay_ratio,
+        "current_replay_prioritization": s.replay_prioritization,
+        "current_anchoring_weight": s.cfg.anchoring_weight,
         "episodic_memory_size": s.episodic_memory.size if s.episodic_memory else 0,
         "episodic_memory_fullness": s.episodic_memory.fullness if s.episodic_memory else 0.0,
         "current_imagined_horizon": s.imagined_horizon,
+        "current_mode_regime": s.current_mode_regime,
     }
 
 

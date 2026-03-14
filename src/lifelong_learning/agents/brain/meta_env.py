@@ -32,6 +32,8 @@ class MetaEnv(gym.Env):
         [2] intrinsic_coef  ∈ [-1, 1] → mapped linearly to [intr_min, intr_max]
         [3] imagined_horizon ∈ [-1, 1] → mapped linearly to [1, 30]
         [4] replay_ratio    ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
+        [5] replay_prioritization ∈ [-1, 1] → mapped linearly to [0.0, 1.0]
+        [6] anchoring_weight ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
       - Reward: recovery-based metric (Δ success_rate + α·Δ return - β·failure_rate)
       - Episode: one full inner training run
     """
@@ -63,9 +65,9 @@ class MetaEnv(gym.Env):
         max_inner_lr: float = 0.003,
         min_inner_lr: float = 1e-4,
         min_ent_coef: float = 0.001,
-        max_ent_coef: float = 0.2,
+        max_ent_coef: float = 0.1,
         min_intrinsic_coef: float = 0.001,
-        max_intrinsic_coef: float = 1.0,
+        max_intrinsic_coef: float = 0.5,
         start_episode: int = 1,
     ):
         super().__init__()
@@ -103,7 +105,7 @@ class MetaEnv(gym.Env):
             low=-10.0, high=10.0, shape=(NUM_SIGNALS,), dtype=np.float32
         )
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(7,), dtype=np.float32
         )
 
         # HP bounds (absolute min/max)
@@ -112,6 +114,8 @@ class MetaEnv(gym.Env):
         self.intrinsic_coef_bounds = (self.min_intrinsic_coef, self.max_intrinsic_coef)
         self.imagined_horizon_bounds = (1, 30)
         self.replay_ratio_bounds = (0.0, 0.5)
+        self.replay_prioritization_bounds = (0.0, 1.0)
+        self.anchoring_weight_bounds = (0.0, 0.5)
 
         # Will be initialized on reset()
         self._state: InnerTrainState | None = None
@@ -121,6 +125,8 @@ class MetaEnv(gym.Env):
         self._prev_failure_rate = 0.0
         self._episode_counter = self.start_episode - 1
         self._episode_prefix = "episode"
+        self._regime_exposures = {}
+        self._current_regime = None
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -167,6 +173,8 @@ class MetaEnv(gym.Env):
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
+        self._regime_exposures = {}
+        self._current_regime = None
 
         # Run initial updates to get a meaningful first observation
         stats = self._run_n_updates(self.decision_interval)
@@ -201,6 +209,19 @@ class MetaEnv(gym.Env):
             urgency_penalty = -shortfall * 3.0
             failure_penalty = -failure_rate * 0.5
             reward = recovery + maintenance + urgency_penalty + failure_penalty
+        elif self.reward_mode == "curriculum":
+            # Tracks exposure to regimes. Re-visiting an old regime grants a massive multiplier.
+            current_regime = stats.get("current_mode_regime", 0)
+            if self._current_regime != current_regime:
+                self._regime_exposures[current_regime] = self._regime_exposures.get(current_regime, 0) + 1
+                self._current_regime = current_regime
+            
+            exposures = self._regime_exposures.get(current_regime, 1)
+            # Give a 10x multiplier if this is the 2nd+ time we've seen this regime
+            multiplier = 10.0 if exposures > 1 else 1.0
+            
+            base_reward = success_rate + self.reward_alpha * mean_return - self.reward_beta * failure_rate
+            reward = base_reward * multiplier
         else:
             # Original AUC reward
             reward = success_rate + self.reward_alpha * mean_return - self.reward_beta * failure_rate
@@ -248,6 +269,12 @@ class MetaEnv(gym.Env):
 
         # Action[4]: replay_ratio
         s.replay_ratio = map_to_range(action[4], self.replay_ratio_bounds)
+
+        # Action[5]: replay_prioritization
+        s.replay_prioritization = map_to_range(action[5], self.replay_prioritization_bounds)
+
+        # Action[6]: anchoring_weight
+        s.cfg.anchoring_weight = map_to_range(action[6], self.anchoring_weight_bounds)
 
     def close(self):
         if self._state is not None:

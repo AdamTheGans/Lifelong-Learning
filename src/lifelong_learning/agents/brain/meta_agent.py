@@ -35,10 +35,10 @@ class MLPActorCritic(nn.Module):
     Input: NUM_SIGNALS-dim observation (training signals)
     Output: (action_mean, action_log_std, value)
 
-    Uses a continuous Gaussian policy since the action space is Box(4,).
+    Uses a continuous Gaussian policy since the action space is Box(7,).
     """
 
-    def __init__(self, obs_dim: int = NUM_SIGNALS, act_dim: int = 5, hidden_dim: int = 128):
+    def __init__(self, obs_dim: int = NUM_SIGNALS, act_dim: int = 7, hidden_dim: int = 128):
         super().__init__()
 
         self.shared = nn.Sequential(
@@ -158,7 +158,7 @@ class BrainRolloutBuffer:
     def get_batches(self, device: torch.device):
         """Return all data as flattened tensors for PPO update."""
         obs = np.array(self.obs, dtype=np.float32).reshape(-1, NUM_SIGNALS)
-        actions = np.array(self.actions, dtype=np.float32).reshape(-1, 5)
+        actions = np.array(self.actions, dtype=np.float32).reshape(-1, 7)
         log_probs = np.array(self.log_probs, dtype=np.float32).reshape(-1)
         advantages = self._advantages.reshape(-1)
         returns = self._returns.reshape(-1)

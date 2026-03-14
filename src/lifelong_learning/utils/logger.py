@@ -7,16 +7,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Optional
 
 @dataclass
 class DataLogger:
     run_name: str
     log_dir: str = "runs"
     data: dict = field(default_factory=lambda: defaultdict(list))
+    full_dir: Optional[str] = None
 
     def __post_init__(self):
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        self.full_dir = os.path.join(self.log_dir, f"{self.run_name}_{ts}")
+        if self.full_dir is None:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            self.full_dir = os.path.join(self.log_dir, f"{self.run_name}_{ts}")
         os.makedirs(self.full_dir, exist_ok=True)
 
     def scalar(self, tag: str, value: float, step: int) -> None:

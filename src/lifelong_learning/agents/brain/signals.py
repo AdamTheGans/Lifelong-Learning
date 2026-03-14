@@ -28,6 +28,8 @@ SIGNAL_NAMES = [
     "current_imagined_horizon",
     "steps_since_surprise_spike",
     "current_replay_ratio",
+    "current_replay_prioritization",
+    "current_anchoring_weight",
     "episodic_memory_fullness",
 ]
 
@@ -68,7 +70,7 @@ class SignalExtractor:
     delta computation.
     """
 
-    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50, max_inner_lr: float = 0.003, min_inner_lr: float = 1e-4, min_ent_coef: float = 0.001, max_ent_coef: float = 0.2, min_intrinsic_coef: float = 0.001, max_intrinsic_coef: float = 1.0):
+    def __init__(self, surprise_spike_threshold: float = 2.0, history_len: int = 50, max_inner_lr: float = 0.003, min_inner_lr: float = 1e-4, min_ent_coef: float = 0.001, max_ent_coef: float = 0.1, min_intrinsic_coef: float = 0.001, max_intrinsic_coef: float = 0.5):
         self.normalizer = RunningNormalizer(NUM_SIGNALS)
         self.surprise_history = deque(maxlen=history_len)
         self.spike_threshold = surprise_spike_threshold
@@ -120,6 +122,8 @@ class SignalExtractor:
             stats.get("current_imagined_horizon", 0.0),
             float(self.steps_since_spike),
             stats.get("current_replay_ratio", 0.0),
+            stats.get("current_replay_prioritization", 0.0),
+            stats.get("current_anchoring_weight", 0.0),
             stats.get("episodic_memory_fullness", 0.0),
         ], dtype=np.float32)
 
@@ -163,6 +167,16 @@ class SignalExtractor:
         full = stats.get("episodic_memory_fullness", 0.0)
         normed[16] = full * 2.0 - 1.0
         normed[16] = np.clip(normed[16], -1.0, 1.0)
+        
+        # 17: current_replay_prioritization -> [0, 1] mapped to [-1, 1]
+        rp = stats.get("current_replay_prioritization", 0.0)
+        normed[17] = rp * 2.0 - 1.0
+        normed[17] = np.clip(normed[17], -1.0, 1.0)
+        
+        # 18: current_anchoring_weight -> linear [0, 0.5] mapped to [-1, 1] (Assuming 0.5 max logic in env)
+        aw = stats.get("current_anchoring_weight", 0.0)
+        normed[18] = (aw - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
+        normed[18] = np.clip(normed[18], -1.0, 1.0)
 
         return normed
 

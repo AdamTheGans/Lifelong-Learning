@@ -3,6 +3,10 @@ Episodic Memory: a persistent ring buffer that stores transitions across
 regime switches for experience replay.
 
 The Brain meta-agent controls when and how much to replay from this buffer.
+
+NOTE: All storage tensors are kept on CPU to avoid VRAM exhaustion at large
+capacities (e.g. 200k+). Sampled batches are moved to the target device
+on-demand in sample().
 """
 from __future__ import annotations
 
@@ -16,19 +20,21 @@ class EpisodicMemory:
     transitions across the lifetime of the inner agent.
 
     Oldest transitions are overwritten when capacity is reached.
+    Storage is on CPU; sampled batches are transferred to the target device.
     """
 
     def __init__(self, capacity: int, obs_shape: tuple, device: torch.device):
         self.capacity = capacity
         self.obs_shape = obs_shape
-        self.device = device
+        self.device = device  # target device for sampled batches
 
-        self.obs = torch.zeros((capacity,) + obs_shape, device=device)
-        self.actions = torch.zeros(capacity, device=device, dtype=torch.long)
-        self.rewards = torch.zeros(capacity, device=device)
-        self.next_obs = torch.zeros((capacity,) + obs_shape, device=device)
-        self.dones = torch.zeros(capacity, device=device)
-        self.regimes = torch.zeros(capacity, device=device, dtype=torch.long)
+        # Store on CPU to avoid VRAM pressure
+        self.obs = torch.zeros((capacity,) + obs_shape, device="cpu")
+        self.actions = torch.zeros(capacity, device="cpu", dtype=torch.long)
+        self.rewards = torch.zeros(capacity, device="cpu")
+        self.next_obs = torch.zeros((capacity,) + obs_shape, device="cpu")
+        self.dones = torch.zeros(capacity, device="cpu")
+        self.regimes = torch.zeros(capacity, device="cpu", dtype=torch.long)
 
         self._size = 0          # Number of valid entries
         self._write_idx = 0     # Next write position
@@ -55,24 +61,26 @@ class EpisodicMemory:
 
         # Flatten (T, N) → (T*N)
         n_transitions = T * N
-        flat_obs = rollout_buffer.obs[:T].reshape((n_transitions,) + self.obs_shape)
-        flat_actions = rollout_buffer.actions[:T].reshape(n_transitions)
-        flat_rewards = rollout_buffer.rewards[:T].reshape(n_transitions)
-        flat_next_obs = rollout_buffer.next_obs[:T].reshape((n_transitions,) + self.obs_shape)
-        flat_dones = rollout_buffer.dones[:T].reshape(n_transitions)
+        flat_obs = rollout_buffer.obs[:T].reshape((n_transitions,) + self.obs_shape).cpu()
+        flat_actions = rollout_buffer.actions[:T].reshape(n_transitions).cpu()
+        flat_rewards = rollout_buffer.rewards[:T].reshape(n_transitions).cpu()
+        flat_next_obs = rollout_buffer.next_obs[:T].reshape((n_transitions,) + self.obs_shape).cpu()
+        flat_dones = rollout_buffer.dones[:T].reshape(n_transitions).cpu()
 
         if regime_ids is not None:
             if isinstance(regime_ids, int):
-                flat_regimes = torch.full((n_transitions,), regime_ids, device=self.device, dtype=torch.long)
+                flat_regimes = torch.full((n_transitions,), regime_ids, device="cpu", dtype=torch.long)
             else:
                 if isinstance(regime_ids, np.ndarray):
-                    regime_ids = torch.tensor(regime_ids, device=self.device, dtype=torch.long)
+                    regime_ids = torch.tensor(regime_ids, device="cpu", dtype=torch.long)
+                else:
+                    regime_ids = regime_ids.cpu()
                 # Expand (N,) to (T, N) then flatten
                 if regime_ids.dim() == 1:
                     regime_ids = regime_ids.unsqueeze(0).expand(T, -1)
                 flat_regimes = regime_ids.reshape(n_transitions)
         else:
-            flat_regimes = torch.zeros(n_transitions, device=self.device, dtype=torch.long)
+            flat_regimes = torch.zeros(n_transitions, device="cpu", dtype=torch.long)
 
         # Write in chunks (handle wrap-around)
         for i in range(n_transitions):
@@ -99,7 +107,7 @@ class EpisodicMemory:
 
         Returns:
             dict with keys: obs, actions, rewards, next_obs, dones
-            All tensors on self.device.
+            All tensors on self.device (transferred from CPU).
         """
         if self._size < n:
             return None
@@ -122,7 +130,7 @@ class EpisodicMemory:
                     # Sample with replacement if we don't have enough old experiences
                     replace = len(old_regime_idxs) < n_priority
                     sampled_old_idxs = np.random.choice(
-                        old_regime_idxs.cpu().numpy(), size=n_priority, replace=replace
+                        old_regime_idxs.numpy(), size=n_priority, replace=replace
                     )
                     priority_idxs = sampled_old_idxs
                 else:
@@ -138,10 +146,12 @@ class EpisodicMemory:
         else:
             idxs = uniform_idxs
 
+        # Transfer sampled batch to target device
         return {
-            "obs": self.obs[idxs],
-            "actions": self.actions[idxs],
-            "rewards": self.rewards[idxs],
-            "next_obs": self.next_obs[idxs],
-            "dones": self.dones[idxs],
+            "obs": self.obs[idxs].to(self.device),
+            "actions": self.actions[idxs].to(self.device),
+            "rewards": self.rewards[idxs].to(self.device),
+            "next_obs": self.next_obs[idxs].to(self.device),
+            "dones": self.dones[idxs].to(self.device),
         }
+

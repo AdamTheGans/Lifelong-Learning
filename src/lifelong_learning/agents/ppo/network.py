@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+# Dimensionality of the context code the Brain sends for neuromodulation
+CONTEXT_CODE_DIM = 8
+
 
 class CNNActorCritic(nn.Module):
     """
@@ -11,6 +14,7 @@ class CNNActorCritic(nn.Module):
 
     Architecture:
         - Shared 3-layer CNN encoder (input channels → 32 → 64 → 64)
+        - Neuromodulation gating via ContextDecoder (8-dim code → sigmoid mask)
         - Decoupled Actor head (policy logits) and Critic head (state value)
 
     Input:  (B, C, H, W) one-hot tensor from OneHotPartialObsWrapper
@@ -35,6 +39,18 @@ class CNNActorCritic(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, self.c, self.h, self.w)
             flat_size = self.encoder(dummy).shape[1]
+        self.flat_size = flat_size
+
+        # ContextDecoder: maps Brain's 8-dim context code → sigmoid gating mask
+        self.context_decoder = nn.Sequential(
+            nn.Linear(CONTEXT_CODE_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, flat_size),
+            nn.Sigmoid(),
+        )
+
+        # Current neuromodulation mask (default: all 1s = no gating)
+        self.register_buffer("neuro_mask", torch.ones(1, flat_size))
 
         # Actor head (policy)
         self.actor_head = nn.Sequential(
@@ -76,8 +92,26 @@ class CNNActorCritic(nn.Module):
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
 
+    def set_context_code(self, code: torch.Tensor):
+        """
+        Decode an 8-dim context code into a gating mask and store it.
+        
+        Args:
+            code: Tensor of shape (CONTEXT_CODE_DIM,) with values in [-1, 1]
+        """
+        with torch.no_grad():
+            if code.dim() == 1:
+                code = code.unsqueeze(0)
+            self.neuro_mask = self.context_decoder(code)
+
+    def clear_context(self):
+        """Reset the neuro mask to all-ones (no gating)."""
+        self.neuro_mask = torch.ones(1, self.flat_size, device=self.neuro_mask.device)
+
     def forward(self, obs: torch.Tensor):
         features = self.encoder(obs)
+        # Apply neuromodulation gating mask
+        features = features * self.neuro_mask
         return self.actor_head(features), self.critic_head(features).squeeze(-1)
 
     def act(self, obs: torch.Tensor):

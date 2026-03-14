@@ -42,25 +42,27 @@ def eval_brain(args):
     
     brain_model = MLPActorCritic().to(device)
     
-    # Handle backward compatibility: older checkpoints have 5 action output dims, we have 7
+    # Handle backward compatibility: older checkpoints may have 5 or 7 action dims, we need 15
     state_dict = ckpt["model_state_dict"]
     
-    if "actor_mean.weight" in state_dict and state_dict["actor_mean.weight"].shape[0] == 5:
-        print("DETECTED LEGACY 5-DIM ACTION SPACE MODEL. PADDING TO 7-DIM...")
+    old_act_dim = state_dict["actor_mean.weight"].shape[0] if "actor_mean.weight" in state_dict else 15
+    if old_act_dim < 15:
+        print(f"DETECTED LEGACY {old_act_dim}-DIM ACTION SPACE MODEL. PADDING TO 15-DIM...")
         old_weight = state_dict["actor_mean.weight"]
         old_bias = state_dict["actor_mean.bias"]
         old_logstd = state_dict["actor_logstd"]
         
-        new_weight = torch.zeros(7, old_weight.shape[1], device=old_weight.device)
-        new_weight[:5, :] = old_weight
+        new_weight = torch.zeros(15, old_weight.shape[1], device=old_weight.device)
+        new_weight[:old_act_dim, :] = old_weight
         state_dict["actor_mean.weight"] = new_weight
         
-        new_bias = torch.zeros(7, device=old_bias.device)
-        new_bias[:5] = old_bias
+        new_bias = torch.zeros(15, device=old_bias.device)
+        new_bias[:old_act_dim] = old_bias
         state_dict["actor_mean.bias"] = new_bias
         
-        new_logstd = torch.zeros(1, 7, device=old_logstd.device)
-        new_logstd[0, :5] = old_logstd
+        logstd_dim = old_logstd.shape[-1] if old_logstd.dim() > 1 else old_logstd.shape[0]
+        new_logstd = torch.zeros(1, 15, device=old_logstd.device) - 0.5
+        new_logstd[0, :logstd_dim] = old_logstd.view(-1)[:logstd_dim]
         state_dict["actor_logstd"] = new_logstd
 
     brain_model.load_state_dict(state_dict)
@@ -211,6 +213,11 @@ def eval_brain(args):
                 new_aw = 0.0
                 state.replay_prioritization = new_rp
                 state.cfg.anchoring_weight = new_aw
+
+            # Action[7:15]: neuromodulation context code
+            if len(action) > 7:
+                context_code = torch.tensor(action[7:15], dtype=torch.float32, device=device)
+                state.model.set_context_code(context_code)
 
             # Log Brain decisions
             success_rate = stats.get("success_rate", 0.0)

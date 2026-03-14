@@ -25,15 +25,16 @@ from lifelong_learning.agents.brain.signals import SignalExtractor, NUM_SIGNALS
 class MetaEnv(gym.Env):
     """
     Gymnasium environment where:
-      - Observation: 15-dim vector of normalized training signals
-      - Action: 4-dim continuous vector controlling hyperparameter adjustments
-        [0] lr scale        ∈ [-1, 1] → mapped linearly to [lr_min, lr_max]
-        [1] ent_coef scale  ∈ [-1, 1] → mapped linearly to [ent_min, ent_max]
-        [2] intrinsic_coef  ∈ [-1, 1] → mapped linearly to [intr_min, intr_max]
-        [3] imagined_horizon ∈ [-1, 1] → mapped linearly to [1, 30]
-        [4] replay_ratio    ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
-        [5] replay_prioritization ∈ [-1, 1] → mapped linearly to [0.0, 1.0]
-        [6] anchoring_weight ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
+      - Observation: 19-dim vector of normalized training signals
+      - Action: 15-dim continuous vector controlling hyperparameter adjustments
+        [0]  lr scale             ∈ [-1, 1] → mapped linearly to [lr_min, lr_max]
+        [1]  ent_coef scale       ∈ [-1, 1] → mapped linearly to [ent_min, ent_max]
+        [2]  intrinsic_coef       ∈ [-1, 1] → mapped linearly to [intr_min, intr_max]
+        [3]  imagined_horizon     ∈ [-1, 1] → mapped linearly to [1, 30]
+        [4]  replay_ratio         ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
+        [5]  replay_prioritization ∈ [-1, 1] → mapped linearly to [0.0, 1.0]
+        [6]  anchoring_weight     ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
+        [7:15] context_code       ∈ [-1, 1]^8 → neuromodulation mask via ContextDecoder
       - Reward: recovery-based metric (Δ success_rate + α·Δ return - β·failure_rate)
       - Episode: one full inner training run
     """
@@ -105,7 +106,7 @@ class MetaEnv(gym.Env):
             low=-10.0, high=10.0, shape=(NUM_SIGNALS,), dtype=np.float32
         )
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(7,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(15,), dtype=np.float32
         )
 
         # HP bounds (absolute min/max)
@@ -246,7 +247,7 @@ class MetaEnv(gym.Env):
         return stats
 
     def _apply_action(self, action: np.ndarray):
-        """Map Brain action [-1, 1]^5 to absolute HP values and apply to inner state."""
+        """Map Brain action [-1, 1]^15 to absolute HP values and apply to inner state."""
         s = self._state
 
         # Helper to map [-1, 1] to [min_val, max_val]
@@ -275,6 +276,11 @@ class MetaEnv(gym.Env):
 
         # Action[6]: anchoring_weight
         s.cfg.anchoring_weight = map_to_range(action[6], self.anchoring_weight_bounds)
+
+        # Action[7:15]: neuromodulation context code
+        import torch
+        context_code = torch.tensor(action[7:15], dtype=torch.float32, device=s.device)
+        s.model.set_context_code(context_code)
 
     def close(self):
         if self._state is not None:

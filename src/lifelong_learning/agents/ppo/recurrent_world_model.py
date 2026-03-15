@@ -36,11 +36,14 @@ class RecurrentWorldModel(nn.Module):
             dummy = torch.zeros(1, self.c, self.h, self.w)
             self.cnn_out_dim = self.cnn(dummy).shape[1]
             
-        # Action embedding
-        self.action_emb = nn.Embedding(n_actions, 32)
+        # Project CNN features to a compact latent space
+        self.cnn_proj = nn.Sequential(
+            nn.Linear(self.cnn_out_dim, 256),
+            nn.ReLU()
+        )
         
-        # Input size to GRU: CNN Output (4096) + Action (32) + Reward (1) = 4129
-        self.gru_input_dim = self.cnn_out_dim + 32 + 1
+        # Input size to GRU: CNN Proj (256) + Action One-Hot (n_actions) + Reward (1)
+        self.gru_input_dim = 256 + n_actions + 1
         
         # GRU Core
         self.gru = nn.GRU(input_size=self.gru_input_dim, hidden_size=hidden_dim, batch_first=True)
@@ -68,7 +71,7 @@ class RecurrentWorldModel(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.1)
 
-    def forward_sequence(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor):
+    def forward_sequence(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, h_0: torch.Tensor = None):
         """
         Unrolls the GRU over an entire sequence of transitions for training.
         
@@ -76,6 +79,7 @@ class RecurrentWorldModel(nn.Module):
             states:  [B, S, C, H, W] tensor of observations
             actions: [B, S] tensor of actions
             rewards: [B, S] tensor of rewards
+            h_0:     [1, B, 256] optional initial hidden state
             
         Returns:
             next_state_preds:  [B, S, C, H, W] predicted logits
@@ -86,9 +90,11 @@ class RecurrentWorldModel(nn.Module):
         # Flatten time and batch dim to pass gracefully through CNN
         states_flat = states.contiguous().view(B * S, C, H, W)
         cnn_features = self.cnn(states_flat)              # [B*S, 4096]
-        cnn_features = cnn_features.view(B, S, -1)        # [B, S, 4096]
+        cnn_features = self.cnn_proj(cnn_features)        # [B*S, 256]
+        cnn_features = cnn_features.view(B, S, -1)        # [B, S, 256]
         
-        act_emb = self.action_emb(actions)                # [B, S, 32]
+        # Use one-hot encoded actions instead of embeddings
+        act_one_hot = F.one_hot(actions, num_classes=self.n_actions).float() # [B, S, n_actions]
         
         # CRITICAL FIX: The model must not see r_t when predicting r_t.
         # We shift the rewards to be r_{t-1}, padding the first step with 0.
@@ -96,16 +102,18 @@ class RecurrentWorldModel(nn.Module):
         rew_emb = prev_rewards.unsqueeze(-1)              # [B, S, 1]
         
         # Concatenate features 
-        rnn_input = torch.cat([cnn_features, act_emb, rew_emb], dim=-1) # [B, S, 4129]
+        rnn_input = torch.cat([cnn_features, act_one_hot, rew_emb], dim=-1) # [B, S, 256 + n_actions + 1]
         
         # --- DIAGNOSTIC 1: GRU INITIALIZATION ---
         if np.random.rand() < 0.005:  # Print ~0.5% of the time to avoid massive spam
             print(f"\n[DIAGNOSTIC 1] GRU forward_sequence called. rnn_input shape: {rnn_input.shape}")
-            print("[DIAGNOSTIC 1] Origin of h_0: NOT PROVIDED (Defaults to ZEROS by PyTorch).")
-            print("[DIAGNOSTIC 1] It is NOT loaded from the buffer, nor carried over from previous batches.")
+            if h_0 is None:
+                print("[DIAGNOSTIC 1] Origin of h_0: NOT PROVIDED (Defaults to ZEROS by PyTorch).")
+            else:
+                print(f"[DIAGNOSTIC 1] Origin of h_0: PROVIDED. Shape: {h_0.shape}")
         
         # Unroll GRU
-        gru_out, _ = self.gru(rnn_input)                  # [B, S, 256]
+        gru_out, _ = self.gru(rnn_input, h_0)                  # [B, S, 256]
         
         # Flatten again for independent step-wise predictions
         gru_out_flat = gru_out.contiguous().view(B * S, -1)
@@ -136,11 +144,12 @@ class RecurrentWorldModel(nn.Module):
         """
         # Process inputs
         cnn_feat = self.cnn(state)                           # [B, 4096]
-        act_emb = self.action_emb(action)                    # [B, 32]
+        cnn_feat = self.cnn_proj(cnn_feat)                   # [B, 256]
+        act_one_hot = F.one_hot(action, num_classes=self.n_actions).float() # [B, n_actions]
         rew_emb = prev_reward.unsqueeze(-1)                  # [B, 1]
         
         # Add sequence dimension of size 1
-        rnn_input = torch.cat([cnn_feat, act_emb, rew_emb], dim=-1).unsqueeze(1) # [B, 1, 4129]
+        rnn_input = torch.cat([cnn_feat, act_one_hot, rew_emb], dim=-1).unsqueeze(1) # [B, 1, 256 + n_actions + 1]
         
         gru_out, new_hidden_state = self.gru(rnn_input, hidden_state) # gru_out: [B, 1, 256]
         
@@ -208,12 +217,12 @@ class RecurrentWorldModel(nn.Module):
                 
         return trajectories
 
-    def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones):
+    def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones, h_0=None):
         """Standard loss wrapper"""
-        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, target_rewards, dones)
+        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, target_rewards, dones, h_0)
         return loss
 
-    def compute_loss_detailed(self, states, actions, rewards, next_states, target_rewards, dones):
+    def compute_loss_detailed(self, states, actions, rewards, next_states, target_rewards, dones, h_0=None):
         """
         Calculates loss handling randomized episode bounds masking, returning detailed components.
         
@@ -224,12 +233,13 @@ class RecurrentWorldModel(nn.Module):
             next_states:    [B, S, C, H, W] real next states 
             target_rewards: [B, S] real target rewards (r_t)
             dones:          [B, S] 0 or 1 done flags
+            h_0:            [1, B, 256] optional initial hidden state
             
         Returns:
             Mean total loss, Mean state loss, Mean reward loss
         """
         # 1. Forward pass
-        next_state_preds, next_reward_preds = self.forward_sequence(states, actions, rewards)
+        next_state_preds, next_reward_preds = self.forward_sequence(states, actions, rewards, h_0)
         
         # --- DIAGNOSTIC 2: SEQUENCE ALIGNMENT ---
         if np.random.rand() < 0.005:
@@ -241,22 +251,24 @@ class RecurrentWorldModel(nn.Module):
 
         # --- DIAGNOSTIC 3: OUTPUT VS TARGET VALUES ---
         # Find terminal steps
-        terminal_mask = target_rewards > 4.0
-        if terminal_mask.any():
+        success_mask = target_rewards > 4.0
+        failure_mask = target_rewards < -0.5
+        
+        if success_mask.any() or failure_mask.any():
             if np.random.rand() < 0.05: # Print occasionally when terminal is found
-                print(f"\n[DIAGNOSTIC 3] Terminal State Found! (Target > 4.0)")
-                term_preds = next_reward_preds[terminal_mask][:5]
-                term_targs = target_rewards[terminal_mask][:5]
-                print(f"  Terminal Preds:   {term_preds.detach().cpu().numpy()}")
-                print(f"  Terminal Targets: {term_targs.detach().cpu().numpy()}")
+                print(f"\n[DIAGNOSTIC 3] Terminal State Found!")
+                if success_mask.any():
+                    print(f"  Success Preds:    {next_reward_preds[success_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Success Targets:  {target_rewards[success_mask][:5].detach().cpu().numpy()}")
+                if failure_mask.any():
+                    print(f"  Failure Preds:    {next_reward_preds[failure_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Failure Targets:  {target_rewards[failure_mask][:5].detach().cpu().numpy()}")
                 
-                # Also print some non-terminal for comparison
-                non_term_mask = target_rewards < 1.0
+                # Also print some non-terminal for comparison (around -0.01)
+                non_term_mask = (target_rewards > -0.5) & (target_rewards < 1.0)
                 if non_term_mask.any():
-                    non_term_preds = next_reward_preds[non_term_mask][:5]
-                    non_term_targs = target_rewards[non_term_mask][:5]
-                    print(f"  Non-Term Preds:   {non_term_preds.detach().cpu().numpy()}")
-                    print(f"  Non-Term Targets: {non_term_targs.detach().cpu().numpy()}")
+                    print(f"  Non-Term Preds:   {next_reward_preds[non_term_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Non-Term Targets: {target_rewards[non_term_mask][:5].detach().cpu().numpy()}")
         
         B, S, C, H, W = states.shape
         
@@ -282,8 +294,13 @@ class RecurrentWorldModel(nn.Module):
         
         # We only mask the state loss because the next state is a random reset.
         # We DO NOT mask the reward loss, because the agent needs to learn the terminal +5/-1 reward!
-        # Upweight terminal rewards so the model doesn't just learn to predict the constant step penalty (-0.01)
-        reward_weights = 1.0 + (dones.float() * 49.0)
+        
+        # Dynamic Loss Balancing for Rewards
+        num_non_terminal = (dones == 0.0).sum()
+        num_terminal = (dones == 1.0).sum().clamp(min=1.0)
+        dynamic_weight = num_non_terminal / num_terminal
+        
+        reward_weights = torch.where(dones == 1.0, dynamic_weight, torch.ones_like(dones))
         masked_reward = (reward_loss_per_step * reward_weights).mean()
         
         # Use .sum() / mask.sum() to compute the mean over valid elements only

@@ -168,7 +168,7 @@ class MetaRLTrainer:
             rew_buf[:, t] = reward
             don_buf[:, t] = done
             val_buf[:, t] = value
-            ctx_buf[:, t] = h_t.squeeze(0) # Store the exact h_t used to make the decision
+            ctx_buf[:, t] = h_t.squeeze(0).detach() # Store the exact h_t used to make the decision (detached for safe buffer storage)
             
             # 6. Episode Resets (Boundary Masking on Memory)
             # If done == True, zero out the GRU state for that specific environment
@@ -219,7 +219,10 @@ class MetaRLTrainer:
                 else:
                     chunk_next_obs = torch.cat([obs_buf[:, start_idx+1:end_idx], obs.unsqueeze(1)], dim=1)
                 
-                next_state_preds, next_reward_preds = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew)
+                # Extract h_0 for this chunk (shape: [1, B, 256])
+                chunk_h0 = chunk_ctx[:, 0, :].unsqueeze(0).contiguous()
+                
+                next_state_preds, next_reward_preds = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew, h_0=chunk_h0)
                 
                 # Simplified surprise: MSE of the state logits (or CrossEntropy proxy depending on shape)
                 # target class indices
@@ -306,6 +309,7 @@ class MetaRLTrainer:
         # 1. Always gather enough Current Live Buffer Chunks for a full batch
         live_batch_obs, live_batch_act, live_batch_rew = [], [], []
         live_batch_next_obs, live_batch_don = [], []
+        live_batch_h0 = []
         
         for _ in range(self.cfg['wm_batch_size']):
             env_idx = np.random.randint(0, B)
@@ -317,6 +321,7 @@ class MetaRLTrainer:
             live_batch_rew.append(rew_buf[env_idx, start_idx:end_idx])
             live_batch_next_obs.append(obs_buf[env_idx, start_idx+1:end_idx+1])
             live_batch_don.append(don_buf[env_idx, start_idx:end_idx])
+            live_batch_h0.append(ctx_buf[env_idx, start_idx].detach())
                 
         # 2. Mix only if past Warmup AND buffer has enough chunks
         # QUICK DISABLE: Turning off World Model learning from buffer sequences (100% live data)
@@ -328,6 +333,10 @@ class MetaRLTrainer:
             mixed_rew  = torch.cat([ltm_batch['reward'].to(device), torch.stack(live_batch_rew[:half_batch])], dim=0)
             mixed_next = torch.cat([ltm_batch['next_state'].to(device), torch.stack(live_batch_next_obs[:half_batch])], dim=0)
             mixed_don  = torch.cat([ltm_batch['done'].to(device).float(),   torch.stack(live_batch_don[:half_batch]).float()], dim=0)
+            
+            # Extract h_0 from ltm_batch (which has h_t of shape [half_batch, seq_len, 256])
+            ltm_h0 = ltm_batch['h_t'][:, 0, :].to(device) # [half_batch, 256]
+            mixed_h0 = torch.cat([ltm_h0, torch.stack(live_batch_h0[:half_batch])], dim=0).unsqueeze(0).contiguous() # [1, batch_size, 256]
         else:
             # 100% Live batch during warmup
             mixed_obs  = torch.stack(live_batch_obs)
@@ -335,6 +344,7 @@ class MetaRLTrainer:
             mixed_rew  = torch.stack(live_batch_rew)
             mixed_next = torch.stack(live_batch_next_obs)
             mixed_don  = torch.stack(live_batch_don).float()
+            mixed_h0   = torch.stack(live_batch_h0).unsqueeze(0).contiguous() # [1, batch_size, 256]
             
         # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in 50/50 mode
         loss_live_val = loss_memory_val = None
@@ -347,6 +357,7 @@ class MetaRLTrainer:
                     next_states=torch.stack(live_batch_next_obs[:half_batch]),
                     target_rewards=torch.stack(live_batch_rew[:half_batch]),
                     dones=torch.stack(live_batch_don[:half_batch]).float(),
+                    h_0=torch.stack(live_batch_h0[:half_batch]).unsqueeze(0).contiguous()
                 )
                 loss_live_val = (loss_live_s + loss_live_r).item()
                 _, loss_mem_s, loss_mem_r = self.world_model.compute_loss_detailed(
@@ -356,6 +367,7 @@ class MetaRLTrainer:
                     next_states=ltm_batch['next_state'].to(device),
                     target_rewards=ltm_batch['reward'].to(device),
                     dones=ltm_batch['done'].to(device).float(),
+                    h_0=ltm_batch['h_t'][:, 0, :].to(device).unsqueeze(0).contiguous()
                 )
                 loss_memory_val = (loss_mem_s + loss_mem_r).item()
         
@@ -369,7 +381,8 @@ class MetaRLTrainer:
                 rewards=mixed_rew,
                 next_states=mixed_next,
                 target_rewards=mixed_rew, # target is r_t, forward_sequence shifts 'rewards' to r_{t-1} internally
-                dones=mixed_don
+                dones=mixed_don,
+                h_0=mixed_h0
             )
             
             self.wm_optimizer.zero_grad(set_to_none=True)

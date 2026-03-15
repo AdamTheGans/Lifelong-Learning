@@ -55,10 +55,16 @@ class RecurrentWorldModel(nn.Module):
             nn.Linear(hidden_dim, self.flat_obs_dim)
         )
         
+        # Categorical Reward Head
+        self.num_reward_bins = 256
+        self.reward_min = -2.0
+        self.reward_max = 5.0
+        self.register_buffer("reward_bins", torch.linspace(self.reward_min, self.reward_max, self.num_reward_bins))
+        
         self.next_reward_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, self.num_reward_bins)
         )
         
         self.apply(self._init_weights)
@@ -122,8 +128,8 @@ class RecurrentWorldModel(nn.Module):
         next_states_flat = self.next_state_head(gru_out_flat) # [B*S, C*H*W]
         next_state_preds = next_states_flat.view(B, S, C, H, W)
         
-        next_rewards_flat = self.next_reward_head(gru_out_flat) # [B*S, 1]
-        next_reward_preds = next_rewards_flat.view(B, S)
+        next_rewards_flat = self.next_reward_head(gru_out_flat) # [B*S, num_bins]
+        next_reward_preds = next_rewards_flat.view(B, S, self.num_reward_bins) # Return logits
         
         return next_state_preds, next_reward_preds
 
@@ -158,7 +164,11 @@ class RecurrentWorldModel(nn.Module):
         
         # Forward through heads
         next_state_pred = self.next_state_head(gru_out_squeeze).view(-1, self.c, self.h, self.w)
-        next_reward_pred = self.next_reward_head(gru_out_squeeze).squeeze(-1)
+        
+        # Categorical inference: Expected value
+        next_reward_logits = self.next_reward_head(gru_out_squeeze) # [B, num_bins]
+        next_reward_probs = F.softmax(next_reward_logits, dim=-1) # [B, num_bins]
+        next_reward_pred = (next_reward_probs * self.reward_bins).sum(dim=-1) # [B]
         
         return next_state_pred, next_reward_pred, new_hidden_state
 
@@ -249,6 +259,10 @@ class RecurrentWorldModel(nn.Module):
             print(f"  Temporal flow: next_reward_preds[:, t] is predicted from state[:, t], action[:, t], and reward[:, t-1].")
             print(f"  It is evaluated against target_rewards[:, t].")
 
+        # Convert reward logits to expected scalar values for diagnostic
+        next_reward_probs = F.softmax(next_reward_preds, dim=-1)
+        next_reward_scalar_preds = (next_reward_probs * self.reward_bins).sum(dim=-1)
+
         # --- DIAGNOSTIC 3: OUTPUT VS TARGET VALUES ---
         # Find terminal steps
         success_mask = target_rewards > 4.0
@@ -258,16 +272,16 @@ class RecurrentWorldModel(nn.Module):
             if np.random.rand() < 0.05: # Print occasionally when terminal is found
                 print(f"\n[DIAGNOSTIC 3] Terminal State Found!")
                 if success_mask.any():
-                    print(f"  Success Preds:    {next_reward_preds[success_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Success Preds:    {next_reward_scalar_preds[success_mask][:5].detach().cpu().numpy()}")
                     print(f"  Success Targets:  {target_rewards[success_mask][:5].detach().cpu().numpy()}")
                 if failure_mask.any():
-                    print(f"  Failure Preds:    {next_reward_preds[failure_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Failure Preds:    {next_reward_scalar_preds[failure_mask][:5].detach().cpu().numpy()}")
                     print(f"  Failure Targets:  {target_rewards[failure_mask][:5].detach().cpu().numpy()}")
                 
                 # Also print some non-terminal for comparison (around -0.01)
                 non_term_mask = (target_rewards > -0.5) & (target_rewards < 1.0)
                 if non_term_mask.any():
-                    print(f"  Non-Term Preds:   {next_reward_preds[non_term_mask][:5].detach().cpu().numpy()}")
+                    print(f"  Non-Term Preds:   {next_reward_scalar_preds[non_term_mask][:5].detach().cpu().numpy()}")
                     print(f"  Non-Term Targets: {target_rewards[non_term_mask][:5].detach().cpu().numpy()}")
         
         B, S, C, H, W = states.shape
@@ -282,18 +296,28 @@ class RecurrentWorldModel(nn.Module):
         ce_loss = F.cross_entropy(preds_flat, targets_flat, reduction='none') 
         state_loss_per_step = ce_loss.mean(dim=(1, 2)).view(B, S) # [B, S]
         
-        # 3. Reward loss (Mean Squared Error)
-        reward_loss_per_step = F.mse_loss(next_reward_preds, target_rewards, reduction='none') # [B, S]
+        # 3. Reward loss (Categorical Cross-Entropy)
+        # Convert continuous target_rewards to nearest bin indices
+        clamped_targets = torch.clamp(target_rewards, self.reward_min, self.reward_max)
+        bin_width = (self.reward_max - self.reward_min) / (self.num_reward_bins - 1)
+        target_indices = torch.round((clamped_targets - self.reward_min) / bin_width).long() # [B, S]
         
-        # total per-step loss
-        total_loss_per_step = state_loss_per_step + reward_loss_per_step
+        preds_flat_rew = next_reward_preds.view(B * S, self.num_reward_bins)
+        targets_flat_rew = target_indices.view(B * S)
+        
+        ce_loss_rew = F.cross_entropy(preds_flat_rew, targets_flat_rew, reduction='none')
+        reward_loss_per_step = ce_loss_rew.view(B, S) # [B, S]
         
         # 4. Boundary Masking
-        # Mask out steps strictly landing on reset frames (1.0 = valid, 0.0 = done)
-        mask = 1.0 - dones.float()
+        # Mask out invalid transitions that bridge the end of one episode and the start of a new one.
+        # If dones[:, t-1] is true, the sequence crossed an episode boundary, so step t is invalid.
+        valid_mask = torch.cat([torch.ones(B, 1, device=dones.device), 1.0 - dones[:, :-1].float()], dim=1) # [B, S]
         
-        # We only mask the state loss because the next state is a random reset.
-        # We DO NOT mask the reward loss, because the agent needs to learn the terminal +5/-1 reward!
+        # We also mask the state loss for the step where dones[:, t] is true, because next_state is a random reset.
+        state_mask = valid_mask * (1.0 - dones.float())
+        
+        # Reward loss is masked by valid_mask, but NOT by dones[:, t], because we need to learn terminal rewards!
+        reward_mask = valid_mask
         
         # Dynamic Loss Balancing for Rewards
         num_non_terminal = (dones == 0.0).sum()
@@ -301,10 +325,11 @@ class RecurrentWorldModel(nn.Module):
         dynamic_weight = num_non_terminal / num_terminal
         
         reward_weights = torch.where(dones == 1.0, dynamic_weight, torch.ones_like(dones))
-        masked_reward = (reward_loss_per_step * reward_weights).mean()
         
-        # Use .sum() / mask.sum() to compute the mean over valid elements only
-        masked_state = (state_loss_per_step * mask).sum() / mask.sum().clamp(min=1.0)
+        # Apply masks and weights
+        masked_state = (state_loss_per_step * state_mask).sum() / state_mask.sum().clamp(min=1.0)
+        masked_reward = (reward_loss_per_step * reward_weights * reward_mask).sum() / reward_mask.sum().clamp(min=1.0)
+        
         masked_total = masked_state + masked_reward
         
         return masked_total, masked_state, masked_reward
@@ -336,7 +361,7 @@ if __name__ == "__main__":
     print("Evaluating forward_sequence processing...")
     s_preds, r_preds = model.forward_sequence(states, actions, rewards)
     assert list(s_preds.shape) == [B, S, C, H, W]
-    assert list(r_preds.shape) == [B, S]
+    assert list(r_preds.shape) == [B, S, model.num_reward_bins]
     print("  -> forward_sequence shapes match specifications.")
 
     # 3. Verify singular stepwise inference shapes

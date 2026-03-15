@@ -235,7 +235,10 @@ class MetaRLTrainer:
                 state_surprise = ce_loss.mean().item()
                 
                 # Mean reward surprise
-                rew_loss = nn.functional.mse_loss(next_reward_preds, chunk_rew, reduction='none')
+                # Convert logits to expected scalar values for MSE comparison
+                next_reward_probs = torch.nn.functional.softmax(next_reward_preds, dim=-1)
+                next_reward_scalar_preds = (next_reward_probs * self.world_model.reward_bins).sum(dim=-1)
+                rew_loss = nn.functional.mse_loss(next_reward_scalar_preds, chunk_rew, reduction='none')
                 reward_surprise = rew_loss.mean().item()
                 
                 # Total surprise combines both visual and reward prediction errors

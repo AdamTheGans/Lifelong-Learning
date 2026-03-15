@@ -92,7 +92,7 @@ def main():
         'ppo_epochs': 4,
         'minibatch_size': 256,
         'clip_coef': 0.2,
-        'ent_coef': 0.01,
+        'ent_coef': 0.05, # Increased from 0.01 to prevent entropy collapse
         'vf_coef': 0.5,
         'max_grad_norm': 0.5,
         'wm_batch_size': 16, # Controls the 50/50 split chunking

@@ -267,7 +267,7 @@ class MetaRLTrainer:
         
         has_dreams = False
         # QUICK DISABLE: Turning off generative replay completely for now (100% real PPO training)
-        if False and len(self.memory_buffer.buffer) >= dream_batch_size:
+        if False and len(self.memory_buffer) >= dream_batch_size:
             has_dreams = True
             
             # Sample seeds (extract final state & h_t of the chunk)
@@ -303,18 +303,29 @@ class MetaRLTrainer:
                     d_rew, d_val, d_don, d_next_value, self.cfg['gamma'], self.cfg['gae_lambda']
                 )
 
-        # --- PHASE 3: The World Model Update (The 50/50 Anti-Forgetting Split) ---
+        # --- PHASE 3: The World Model Update (Mixed Batch) ---
         
-        # We enforce a Warmup Period (100% Live Data) before initiating the 50/50 mix
-        half_batch = self.cfg['wm_batch_size'] // 2
+        # 50% Live Data, 50% Buffer Data
+        buffer_batch_size = int(self.cfg['wm_batch_size'] * 0.5)
+        live_batch_size = self.cfg['wm_batch_size'] - buffer_batch_size
+        
+        # We enforce a Warmup Period (100% Live Data) before initiating the mix, 
+        # and require the buffer to have at least 500 chunks to ensure diversity.
         wm_warmup_steps = self.cfg.get('wm_warmup_steps', 75000)
+        min_buffer_size = 500
         
-        # 1. Always gather enough Current Live Buffer Chunks for a full batch
+        use_buffer = (self.global_step >= wm_warmup_steps) and (len(self.memory_buffer) >= min_buffer_size)
+        
+        if not use_buffer:
+            live_batch_size = self.cfg['wm_batch_size']
+            buffer_batch_size = 0
+        
+        # 1. Gather Current Live Buffer Chunks
         live_batch_obs, live_batch_act, live_batch_rew = [], [], []
         live_batch_next_obs, live_batch_don = [], []
         live_batch_h0 = []
         
-        for _ in range(self.cfg['wm_batch_size']):
+        for _ in range(live_batch_size):
             env_idx = np.random.randint(0, B)
             start_idx = np.random.randint(0, S - seq_len)
             end_idx = start_idx + seq_len
@@ -326,22 +337,21 @@ class MetaRLTrainer:
             live_batch_don.append(don_buf[env_idx, start_idx:end_idx])
             live_batch_h0.append(ctx_buf[env_idx, start_idx].detach())
                 
-        # 2. Mix only if past Warmup AND buffer has enough chunks
-        # QUICK DISABLE: Turning off World Model learning from buffer sequences (100% live data)
-        if False and self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
-            ltm_batch = self.memory_buffer.sample(half_batch)
+        # 2. Mix with Stratified Buffer Chunks
+        if use_buffer:
+            ltm_batch = self.memory_buffer.sample(buffer_batch_size)
             
-            mixed_obs  = torch.cat([ltm_batch['state'].to(device),  torch.stack(live_batch_obs[:half_batch])], dim=0)
-            mixed_act  = torch.cat([ltm_batch['action'].to(device), torch.stack(live_batch_act[:half_batch])], dim=0)
-            mixed_rew  = torch.cat([ltm_batch['reward'].to(device), torch.stack(live_batch_rew[:half_batch])], dim=0)
-            mixed_next = torch.cat([ltm_batch['next_state'].to(device), torch.stack(live_batch_next_obs[:half_batch])], dim=0)
-            mixed_don  = torch.cat([ltm_batch['done'].to(device).float(),   torch.stack(live_batch_don[:half_batch]).float()], dim=0)
+            mixed_obs  = torch.cat([ltm_batch['state'].to(device),  torch.stack(live_batch_obs)], dim=0)
+            mixed_act  = torch.cat([ltm_batch['action'].to(device), torch.stack(live_batch_act)], dim=0)
+            mixed_rew  = torch.cat([ltm_batch['reward'].to(device), torch.stack(live_batch_rew)], dim=0)
+            mixed_next = torch.cat([ltm_batch['next_state'].to(device), torch.stack(live_batch_next_obs)], dim=0)
+            mixed_don  = torch.cat([ltm_batch['done'].to(device).float(),   torch.stack(live_batch_don).float()], dim=0)
             
-            # Extract h_0 from ltm_batch (which has h_t of shape [half_batch, seq_len, 256])
-            ltm_h0 = ltm_batch['h_t'][:, 0, :].to(device) # [half_batch, 256]
-            mixed_h0 = torch.cat([ltm_h0, torch.stack(live_batch_h0[:half_batch])], dim=0).unsqueeze(0).contiguous() # [1, batch_size, 256]
+            # Extract h_0 from ltm_batch (which has h_t of shape [buffer_batch_size, seq_len, 256])
+            ltm_h0 = ltm_batch['h_t'][:, 0, :].to(device) # [buffer_batch_size, 256]
+            mixed_h0 = torch.cat([ltm_h0, torch.stack(live_batch_h0)], dim=0).unsqueeze(0).contiguous() # [1, batch_size, 256]
         else:
-            # 100% Live batch during warmup
+            # 100% Live batch
             mixed_obs  = torch.stack(live_batch_obs)
             mixed_act  = torch.stack(live_batch_act)
             mixed_rew  = torch.stack(live_batch_rew)
@@ -349,18 +359,18 @@ class MetaRLTrainer:
             mixed_don  = torch.stack(live_batch_don).float()
             mixed_h0   = torch.stack(live_batch_h0).unsqueeze(0).contiguous() # [1, batch_size, 256]
             
-        # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in 50/50 mode
+        # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in mixed mode
         loss_live_val = loss_memory_val = None
-        if False and self.global_step >= wm_warmup_steps and len(self.memory_buffer.buffer) >= half_batch:
+        if use_buffer:
             with torch.no_grad():
                 _, loss_live_s, loss_live_r = self.world_model.compute_loss_detailed(
-                    states=torch.stack(live_batch_obs[:half_batch]),
-                    actions=torch.stack(live_batch_act[:half_batch]),
-                    rewards=torch.stack(live_batch_rew[:half_batch]),
-                    next_states=torch.stack(live_batch_next_obs[:half_batch]),
-                    target_rewards=torch.stack(live_batch_rew[:half_batch]),
-                    dones=torch.stack(live_batch_don[:half_batch]).float(),
-                    h_0=torch.stack(live_batch_h0[:half_batch]).unsqueeze(0).contiguous()
+                    states=torch.stack(live_batch_obs),
+                    actions=torch.stack(live_batch_act),
+                    rewards=torch.stack(live_batch_rew),
+                    next_states=torch.stack(live_batch_next_obs),
+                    target_rewards=torch.stack(live_batch_rew),
+                    dones=torch.stack(live_batch_don).float(),
+                    h_0=torch.stack(live_batch_h0).unsqueeze(0).contiguous()
                 )
                 loss_live_val = (loss_live_s + loss_live_r).item()
                 _, loss_mem_s, loss_mem_r = self.world_model.compute_loss_detailed(
@@ -439,7 +449,7 @@ class MetaRLTrainer:
         
         # Memory buffer & surprise metrics
         results["memory/surprise_ema"] = self.memory_buffer.surprise_ema_threshold
-        results["memory/buffer_size"] = len(self.memory_buffer.buffer)
+        results["memory/buffer_size"] = len(self.memory_buffer)
         results["memory/saves_per_rollout"] = saves_this_rollout
         if chunk_surprise_scores:
             results["memory/chunk_surprise_score"] = np.mean(chunk_surprise_scores)

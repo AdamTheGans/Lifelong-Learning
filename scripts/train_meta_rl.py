@@ -105,7 +105,7 @@ def main():
     # Use default dimensions (21, 8, 8), 256-D context, 3 actions
     ppo_net = ContextAwarePPONetwork(obs_shape=obs_shape, context_dim=256, n_actions=n_actions).to(device)
     wm = RecurrentWorldModel(obs_shape=obs_shape, hidden_dim=256, n_actions=n_actions).to(device)
-    buffer = SequenceMemoryBuffer(max_capacity=2000, seq_len=30)
+    buffer = SequenceMemoryBuffer(max_capacity=4000, seq_len=30)
     
     ppo_opt = torch.optim.Adam(ppo_net.parameters(), lr=args.ppo_lr, eps=1e-5)
     wm_opt = torch.optim.Adam(wm.parameters(), lr=args.wm_lr)

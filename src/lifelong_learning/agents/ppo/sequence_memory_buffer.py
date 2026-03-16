@@ -14,11 +14,10 @@ class SequenceMemoryBuffer:
     """
     def __init__(self, max_capacity: int = 2000, seq_len: int = 30, surprise_ema_alpha: float = 0.05):
         """
-        Initialize the SequenceMemoryBuffer.
+        Initialize the SequenceMemoryBuffer with Stratified Storage.
         
         Args:
             max_capacity (int): The maximum number of chunks the buffer can hold.
-                                E.g., 2000 chunks of length 30 = 60,000 total steps.
             seq_len (int): The number of consecutive transitions in a chunk (default: 30).
             surprise_ema_alpha (float): The decay rate for the Exponential Moving Average 
                                         tracker of the surprise score.
@@ -27,9 +26,16 @@ class SequenceMemoryBuffer:
         self.seq_len = seq_len
         self.surprise_ema_alpha = surprise_ema_alpha
         
-        # Buffer storage. Each element will be a dictionary containing 'state', 
-        # 'action', 'reward', and 'done' as sequences (e.g. PyTorch tensors).
-        self.buffer = []
+        # Stratified Buffer storage
+        self.max_success = max_capacity // 3
+        self.max_failure = max_capacity // 3
+        self.max_neutral = max_capacity - self.max_success - self.max_failure
+        
+        self.buffers = {
+            'success': [],
+            'failure': [],
+            'neutral': []
+        }
         
         # Tracking for the rate limits
         self.last_save_step = 0
@@ -37,6 +43,14 @@ class SequenceMemoryBuffer:
         # EMA Tracker for the surprise threshold
         self.surprise_ema_threshold = 0.0
         self.ema_initialized = False
+
+    def __len__(self):
+        return sum(len(b) for b in self.buffers.values())
+
+    @property
+    def buffer(self):
+        # For backward compatibility where buffer.buffer is accessed directly
+        return self.buffers['success'] + self.buffers['failure'] + self.buffers['neutral']
 
     def update_surprise_ema(self, surprise_score: float):
         """
@@ -73,12 +87,12 @@ class SequenceMemoryBuffer:
         
         steps_since_last = current_step - self.last_save_step
         
-        # Rule 1: Maximum 1 save per 1k steps (prevent flooding during high volatility)
-        if steps_since_last < 1000:
+        # Rule 1: Maximum 1 save per 500 steps (prevent flooding during high volatility)
+        if steps_since_last < 500:
             return False
             
-        # Rule 2: Minimum 1 save per 5k steps (force save even if agent is comfortable)
-        if steps_since_last >= 5000:
+        # Rule 2: Minimum 1 save per 2500 steps (force save even if agent is comfortable)
+        if steps_since_last >= 2500:
             self.last_save_step = current_step
             return True
             
@@ -92,9 +106,9 @@ class SequenceMemoryBuffer:
 
     def push(self, chunk: dict):
         """
-        Pushes a new chunk of transitions into the buffer.
+        Pushes a new chunk of transitions into the stratified buffer.
         
-        If the buffer is at max capacity, it triggers Uniform Random Eviction.
+        If the specific sub-buffer is at max capacity, it triggers Uniform Random Eviction.
         
         Args:
             chunk (dict): Dictionary with keys 'state', 'action', 'reward', 'done', 'h_t' (and optionally 'next_state').
@@ -105,17 +119,40 @@ class SequenceMemoryBuffer:
             if len(value) != self.seq_len:
                 raise ValueError(f"Chunk key '{key}' has length {len(value)}, expected {self.seq_len}")
 
-        if len(self.buffer) < self.max_capacity:
+        # Categorize the chunk based on rewards
+        rewards = chunk['reward']
+        if isinstance(rewards, torch.Tensor):
+            max_r = rewards.max().item()
+            min_r = rewards.min().item()
+        else:
+            max_r = np.max(rewards)
+            min_r = np.min(rewards)
+
+        if min_r < -0.5:
+            category = 'failure'
+            max_cap = self.max_failure
+        elif max_r > 4.0:
+            category = 'success'
+            max_cap = self.max_success
+        else:
+            category = 'neutral'
+            max_cap = self.max_neutral
+
+        target_buffer = self.buffers[category]
+
+        if len(target_buffer) < max_cap:
             # Buffer has room, append normally
-            self.buffer.append(chunk)
+            target_buffer.append(chunk)
         else:
             # Buffer is full, overwrite a uniformly selected existing chunk 
-            evict_index = random.randint(0, self.max_capacity - 1)
-            self.buffer[evict_index] = chunk
+            # This naturally acts as reservoir sampling, permanently protecting a percentage of early sequences
+            evict_index = random.randint(0, max_cap - 1)
+            target_buffer[evict_index] = chunk
 
     def sample(self, batch_size: int) -> dict:
         """
-        Samples a uniform batch of chunks and formats them as PyTorch tensors.
+        Samples a stratified batch of chunks and formats them as PyTorch tensors.
+        Ensures an equal pull from Success, Failure, and Neutral categories if available.
         
         Args:
             batch_size (int): The number of chunks to sample.
@@ -123,12 +160,44 @@ class SequenceMemoryBuffer:
         Returns:
             dict: Stacked chunks where each value is a tensor of shape [batch_size, 30, ...].
         """
-        if len(self.buffer) < batch_size:
-            raise ValueError(f"Cannot sample {batch_size} chunks, buffer only has {len(self.buffer)}.")
+        total_available = sum(len(b) for b in self.buffers.values())
+        if total_available < batch_size:
+            raise ValueError(f"Cannot sample {batch_size} chunks, buffer only has {total_available}.")
             
-        # Uniform sampling from the history
-        sampled_indices = random.sample(range(len(self.buffer)), batch_size)
-        sampled_chunks = [self.buffer[i] for i in sampled_indices]
+        sampled_chunks = []
+        
+        # Try to sample equally from all 3 categories
+        categories = ['success', 'failure', 'neutral']
+        per_category = batch_size // 3
+        remainder = batch_size % 3
+        
+        requests = {cat: per_category + (1 if i < remainder else 0) for i, cat in enumerate(categories)}
+        
+        # Adjust requests if some buffers don't have enough
+        for _ in range(2): # Two passes to distribute shortfall
+            for cat in categories:
+                avail = len(self.buffers[cat])
+                if requests[cat] > avail:
+                    shortfall = requests[cat] - avail
+                    requests[cat] = avail
+                    # Distribute shortfall to others
+                    others = [c for c in categories if c != cat and len(self.buffers[c]) > requests[c]]
+                    if others:
+                        for c in others:
+                            add = shortfall // len(others) + (1 if shortfall % len(others) > 0 else 0)
+                            can_add = min(add, len(self.buffers[c]) - requests[c])
+                            requests[c] += can_add
+                            shortfall -= can_add
+                            if shortfall <= 0: break
+
+        # Actually sample
+        for cat in categories:
+            if requests[cat] > 0:
+                sampled_indices = random.sample(range(len(self.buffers[cat])), requests[cat])
+                sampled_chunks.extend([self.buffers[cat][i] for i in sampled_indices])
+                
+        # Shuffle the combined batch so categories aren't contiguous
+        random.shuffle(sampled_chunks)
         
         # Dynamically initialize batch lists based on the keys present in the first chunk
         batch = {key: [] for key in sampled_chunks[0].keys()}
@@ -202,11 +271,14 @@ if __name__ == "__main__":
             if saved_chunks_count % 20 == 0:
                 print(f"  [Step {current_step:6d}] Chunk saved! Surprise: {surprise_score:5.2f} (EMA: {buffer.surprise_ema_threshold:5.2f}). Buffer size: {len(buffer.buffer)}")
 
-    print(f"\nSimulation complete. Total chunks saved: {len(buffer.buffer)}")
+    print(f"\nSimulation complete. Total chunks saved: {len(buffer)}")
+    print(f"  Success: {len(buffer.buffers['success'])}")
+    print(f"  Failure: {len(buffer.buffers['failure'])}")
+    print(f"  Neutral: {len(buffer.buffers['neutral'])}")
     
     # 3. Sample a batch of 64
     batch_size = 64
-    if len(buffer.buffer) >= batch_size:
+    if len(buffer) >= batch_size:
         print(f"\nSampling a batch of {batch_size} chunks...")
         sampled_batch = buffer.sample(batch_size)
         

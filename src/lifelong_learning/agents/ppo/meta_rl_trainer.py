@@ -184,7 +184,7 @@ class MetaRLTrainer:
             with torch.no_grad():
                 # padding_mask expects True for values that should be IGNORED
                 padding_mask = ~self.window_valid
-                next_obs_pred, rew_pred, h_t_seq = self.world_model.step(
+                h_t_seq = self.world_model.get_context(
                     self.window_obs, self.window_act, self.window_rew, self.window_don, padding_mask
                 )
                 h_t = h_t_seq[:, -1, :] # Extract the context for the current step [B, 256]

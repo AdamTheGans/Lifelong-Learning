@@ -65,7 +65,7 @@ class TransformerWorldModel(nn.Module):
         
         # Output Heads
         self.next_state_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, self.flat_obs_dim)
         )
@@ -77,7 +77,7 @@ class TransformerWorldModel(nn.Module):
         self.register_buffer("reward_bins", torch.linspace(self.reward_min, self.reward_max, self.num_reward_bins))
         
         self.next_reward_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, self.num_reward_bins)
         )
@@ -91,6 +91,38 @@ class TransformerWorldModel(nn.Module):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.1)
+
+    def get_context(self, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, padding_mask: torch.Tensor = None):
+        """
+        Extracts the Pre-Action Context (h_t) using a rolling window of past transitions.
+        """
+        B, S, C, H, W = states_window.shape
+        
+        states_flat = states_window.contiguous().view(B * S, C, H, W)
+        cnn_feat = self.cnn(states_flat)
+        cnn_feat = self.cnn_proj(cnn_feat).view(B, S, self.hidden_dim)
+        
+        act_feat = self.act_emb(actions_window)
+        rew_feat = self.rew_emb(rewards_window.unsqueeze(-1))
+        don_feat = self.don_emb(dones_window.long())
+        
+        tokens = cnn_feat + act_feat + rew_feat + don_feat
+        
+        positions = torch.arange(S, device=states_window.device).unsqueeze(0).expand(B, S)
+        pos_feat = self.pos_emb(positions)
+        
+        tokens = tokens + pos_feat
+        
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(S, device=states_window.device, dtype=torch.bool)
+        
+        out = self.transformer(
+            src=tokens,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask,
+            is_causal=True
+        ) # [B, S, hidden_dim]
+        
+        return out
 
     def forward_sequence(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, dones: torch.Tensor, padding_mask: torch.Tensor = None):
         """
@@ -108,122 +140,40 @@ class TransformerWorldModel(nn.Module):
             next_reward_preds: [B, S] predicted rewards
             out:               [B, S, hidden_dim] contextual embeddings
         """
-        B, S, C, H, W = states.shape
+        B, S = actions.shape
         
-        # Flatten time and batch dim to pass gracefully through CNN
-        states_flat = states.contiguous().view(B * S, C, H, W)
-        cnn_features = self.cnn(states_flat)              # [B*S, 4096]
-        cnn_features = self.cnn_proj(cnn_features)        # [B*S, 256]
-        cnn_features = cnn_features.view(B, S, self.hidden_dim) # [B, S, 256]
-        
-        # CRITICAL FIX: The model must not see a_t, r_t, d_t when predicting step t.
-        # We shift them to be a_{t-1}, r_{t-1}, d_{t-1}, padding the first step with dummies.
-        # We use n_actions as the dummy action index.
+        # 1. Shift inputs to create Pre-Action Context history
         dummy_actions = torch.full((B, 1), self.n_actions, dtype=torch.long, device=actions.device)
         prev_actions = torch.cat([dummy_actions, actions[:, :-1]], dim=1)
         
         prev_rewards = torch.cat([torch.zeros(B, 1, device=rewards.device), rewards[:, :-1]], dim=1)
         prev_dones = torch.cat([torch.zeros(B, 1, dtype=torch.long, device=dones.device), dones[:, :-1].long()], dim=1)
         
-        act_feat = self.act_emb(prev_actions)
-        rew_feat = self.rew_emb(prev_rewards.unsqueeze(-1))
-        don_feat = self.don_emb(prev_dones)
+        # 2. Get Pre-Action Context (h_t)
+        out = self.get_context(states, prev_actions, prev_rewards, prev_dones, padding_mask)
         
-        # Combine features
-        tokens = cnn_features + act_feat + rew_feat + don_feat
+        # 3. Inject Current Action to create Post-Action Context
+        curr_act_feat = self.act_emb(actions)
+        pred_input = torch.cat([out, curr_act_feat], dim=-1) # [B, S, hidden_dim * 2]
         
-        # Positional Encoding
-        positions = torch.arange(S, device=states.device).unsqueeze(0).expand(B, S)
-        pos_feat = self.pos_emb(positions)
+        pred_input_flat = pred_input.contiguous().view(B * S, -1)
         
-        tokens = tokens + pos_feat
+        # 4. Heads
+        next_states_flat = self.next_state_head(pred_input_flat)
+        next_state_preds = next_states_flat.view(B, S, self.c, self.h, self.w)
         
-        # Causal Mask
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(S, device=states.device, dtype=torch.bool)
-        
-        # Transformer
-        out = self.transformer(
-            src=tokens,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask,
-            is_causal=True
-        ) # [B, S, 256]
-        
-        # Flatten again for independent step-wise predictions
-        out_flat = out.contiguous().view(B * S, -1)
-        
-        # Heads
-        next_states_flat = self.next_state_head(out_flat) # [B*S, C*H*W]
-        next_state_preds = next_states_flat.view(B, S, C, H, W)
-        
-        next_rewards_flat = self.next_reward_head(out_flat) # [B*S, num_bins]
-        next_reward_preds = next_rewards_flat.view(B, S, self.num_reward_bins) # Return logits
+        next_rewards_flat = self.next_reward_head(pred_input_flat)
+        next_reward_preds = next_rewards_flat.view(B, S, self.num_reward_bins)
         
         return next_state_preds, next_reward_preds, out
-
-    def step(self, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, padding_mask: torch.Tensor):
-        """
-        Live PPO Inference stepping using a rolling window.
-        
-        Args:
-            states_window:  [B, S, C, H, W]
-            actions_window: [B, S] (These are PREVIOUS actions, already shifted by the rolling window)
-            rewards_window: [B, S] (PREVIOUS rewards)
-            dones_window:   [B, S] (PREVIOUS dones)
-            padding_mask:   [B, S] boolean tensor, True where padded (ignored)
-            
-        Returns:
-            next_state_pred:  [B, C, H, W]
-            next_reward_pred: [B]
-            context_seq:      [B, S, 256] full sequence of contexts
-        """
-        B, S, C, H, W = states_window.shape
-        
-        # Embeddings
-        states_flat = states_window.contiguous().view(B * S, C, H, W)
-        cnn_feat = self.cnn(states_flat)
-        cnn_feat = self.cnn_proj(cnn_feat).view(B, S, self.hidden_dim)
-        
-        act_feat = self.act_emb(actions_window)
-        rew_feat = self.rew_emb(rewards_window.unsqueeze(-1))
-        don_feat = self.don_emb(dones_window.long())
-        
-        # Combine
-        tokens = cnn_feat + act_feat + rew_feat + don_feat
-        
-        # Positional Encoding
-        positions = torch.arange(S, device=states_window.device).unsqueeze(0).expand(B, S)
-        pos_feat = self.pos_emb(positions)
-        
-        tokens = tokens + pos_feat
-        
-        # Causal Mask
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(S, device=states_window.device, dtype=torch.bool)
-        
-        out = self.transformer(
-            src=tokens,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask,
-            is_causal=True
-        ) # [B, S, hidden_dim]
-        
-        # We only need the predictions for the last step
-        last_out = out[:, -1, :] # [B, hidden_dim]
-        
-        next_state_pred = self.next_state_head(last_out).view(-1, self.c, self.h, self.w)
-        
-        next_reward_logits = self.next_reward_head(last_out)
-        next_reward_probs = F.softmax(next_reward_logits, dim=-1)
-        next_reward_pred = (next_reward_probs * self.reward_bins).sum(dim=-1)
-        
-        return next_state_pred, next_reward_pred, out
 
     def autoregressive_dream_step(self, states_window, actions_window, rewards_window, dones_window, padding_mask):
         """
         Scaffold for dreaming. In the future, this will take the window, predict the next state/reward,
         and the caller will append the prediction to the window for the next step.
         """
-        return self.step(states_window, actions_window, rewards_window, dones_window, padding_mask)
+        # Currently disabled, but this would use get_context, then inject the action, then predict.
+        raise NotImplementedError("Dreaming requires post-action context refactoring.")
 
     def generate_dream_trajectories(self, policy_net, start_states: torch.Tensor, start_h_t: torch.Tensor, horizon: int) -> list[dict]:
         """
@@ -307,32 +257,16 @@ class TransformerWorldModel(nn.Module):
         
         if padding_mask is not None:
             valid_mask = valid_mask * (~padding_mask).float()
-        
+            
         # We also mask the state loss for the step where dones[:, t] is true, because next_state is a random reset.
         state_mask = valid_mask * (1.0 - dones.float())
         
         # Reward loss is masked by valid_mask, but NOT by dones[:, t], because we need to learn terminal rewards!
         reward_mask = valid_mask
         
-        # Dynamic Loss Balancing for Rewards
-        if padding_mask is not None:
-            valid_dones = dones[~padding_mask]
-        else:
-            valid_dones = dones
-            
-        num_non_terminal = (valid_dones == 0.0).sum()
-        num_terminal = (valid_dones == 1.0).sum().clamp(min=1.0)
-        dynamic_weight = num_non_terminal / num_terminal
-        
-        # We want to value predicting terminal rewards 20x higher than other steps
-        reward_weights = torch.where(dones == 1.0, dynamic_weight * 20.0, torch.ones_like(dones))
-        
-        # Apply masks and weights
+        # Apply masks directly without dynamic weighting
         masked_state = (state_loss_per_step * state_mask).sum() / state_mask.sum().clamp(min=1.0)
-        
-        # For reward, we use a weighted mean over the valid elements
-        valid_reward_weights = reward_weights * reward_mask
-        masked_reward = (reward_loss_per_step * valid_reward_weights).sum() / valid_reward_weights.sum().clamp(min=1.0)
+        masked_reward = (reward_loss_per_step * reward_mask).sum() / reward_mask.sum().clamp(min=1.0)
         
         masked_total = masked_state + masked_reward
         
@@ -378,9 +312,7 @@ if __name__ == "__main__":
     rewards_window = torch.zeros((B, S))
     dones_window = torch.zeros((B, S), dtype=torch.long)
     
-    s_pred_live, r_pred_live, out_live = model.step(states_window, actions_window, rewards_window, dones_window, padding_mask)
-    assert list(s_pred_live.shape) == [B, C, H, W]
-    assert list(r_pred_live.shape) == [B]
+    out_live = model.get_context(states_window, actions_window, rewards_window, dones_window, padding_mask)
     assert list(out_live.shape) == [B, S, 256]
     print("  -> live step mechanism shapes match specifications.")
     

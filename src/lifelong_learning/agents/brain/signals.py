@@ -10,7 +10,7 @@ import numpy as np
 from collections import deque
 
 
-# Indices into the 15-dim observation vector
+# Indices into the 19-dim observation vector
 SIGNAL_NAMES = [
     "mean_episodic_return",
     "success_rate",
@@ -85,7 +85,7 @@ class SignalExtractor:
 
     def extract(self, stats: dict) -> np.ndarray:
         """
-        Convert a stats dict (from run_inner_update) into a 15-dim
+        Convert a stats dict (from run_inner_update) into a 19-dim
         normalized observation vector.
 
         Args:
@@ -163,19 +163,19 @@ class SignalExtractor:
         normed[15] = (rr - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
         normed[15] = np.clip(normed[15], -1.0, 1.0)
         
-        # 16: episodic_memory_fullness -> [0, 1] mapped to [-1, 1]
-        full = stats.get("episodic_memory_fullness", 0.0)
-        normed[16] = full * 2.0 - 1.0
+        # 16: current_replay_prioritization -> [0, 1] mapped to [-1, 1]
+        rp = stats.get("current_replay_prioritization", 0.0)
+        normed[16] = rp * 2.0 - 1.0
         normed[16] = np.clip(normed[16], -1.0, 1.0)
         
-        # 17: current_replay_prioritization -> [0, 1] mapped to [-1, 1]
-        rp = stats.get("current_replay_prioritization", 0.0)
-        normed[17] = rp * 2.0 - 1.0
+        # 17: current_anchoring_weight -> linear [0, 0.5] mapped to [-1, 1]
+        aw = stats.get("current_anchoring_weight", 0.0)
+        normed[17] = (aw - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
         normed[17] = np.clip(normed[17], -1.0, 1.0)
         
-        # 18: current_anchoring_weight -> linear [0, 0.5] mapped to [-1, 1] (Assuming 0.5 max logic in env)
-        aw = stats.get("current_anchoring_weight", 0.0)
-        normed[18] = (aw - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
+        # 18: episodic_memory_fullness -> [0, 1] mapped to [-1, 1]
+        full = stats.get("episodic_memory_fullness", 0.0)
+        normed[18] = full * 2.0 - 1.0
         normed[18] = np.clip(normed[18], -1.0, 1.0)
 
         return normed

@@ -140,8 +140,10 @@ class SimpleWorldModel(nn.Module):
 
             next_obs_discrete = self.discretize_state(next_obs_pred)
 
-            # Termination heuristic: reward > 0.5 implies goal reached
-            dones = (reward_pred > 0.5).float()
+            # Keep dreamed rollouts on a fixed horizon. A learned terminal
+            # predictor is badly miscalibrated early in training and can truncate
+            # useful synthetic experience.
+            dones = torch.zeros_like(reward_pred)
 
             trajectories.append({
                 "obs": curr_obs,

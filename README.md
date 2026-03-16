@@ -8,32 +8,33 @@ See [PLAN.md](PLAN.md) for our high-level roadmap.
 
 ```
 Lifelong-Learning/
-├── src/lifelong_learning/
-│   ├── agents/ppo/
-│   │   ├── train.py            # Core training loop (Dyna-PPO logic)
-│   │   ├── ppo.py              # PPO loss and update function
-│   │   ├── network.py          # Actor-Critic network architecture
-│   │   ├── world_model.py      # Simple World Model (predicts state/reward)
-│   │   └── buffers.py          # Rollout buffer with GAE
-│   ├── envs/
-│   │   ├── dual_goal.py        # Custom MiniGrid DualGoal environment
-│   │   ├── regime_wrapper.py   # Wrapper for non-stationary reward regimes
-│   │   ├── make_env.py         # Factory function with wrapper stack
-│   │   └── wrappers/
-│   │       ├── action_reduce.py # Action space from Discrete(7) -> Discrete(3)
-│   │       └── one_hot.py      # Image (H,W,3) -> OneHot (21,H,W)
-│   └── utils/
-│       ├── logger.py           # TensorBoard logging utility
-│       └── seeding.py          # Deterministic seeding helper
-├── PLAN.md                     # Research roadmap and architecture docs
-├── README.md                   # Project overview and instructions
-├── requirements.txt            # Project dependencies
-├── pyproject.toml              # Build system configuration
-├── scripts/                    # Entry points for training and analysis
-└── tests/                      # Unit tests
-    ├── test_dyna_logic.py      # Tests for World Model and intrinsic reward
-    ├── test_env_integrity.py   # Tests for env physics and rules
-    └── test_manual_stats.py    # Tests for logging logic
+|- src/lifelong_learning/
+|  |- agents/ppo/
+|  |  |- train.py             # Inner Dyna-PPO update loop
+|  |  |- ppo.py               # PPO loss + optional anchor penalty
+|  |  |- network.py           # Inner actor-critic with neuromodulation gate
+|  |  |- world_model.py       # Predicts next state and reward
+|  |  |- episodic_memory.py   # Replay buffer across regime switches
+|  |  `- buffers.py           # Rollout buffer with GAE
+|  |- agents/brain/
+|  |  |- meta_env.py          # Wraps a full inner run as a Gym env
+|  |  |- meta_agent.py        # PPO brain policy/value network
+|  |  `- signals.py           # Builds the Brain's 19-dim observation
+|  |- envs/
+|  |  |- dual_goal.py         # Legacy 2-goal MiniGrid task
+|  |  |- multi_goal.py        # N-goal MiniGrid task used by the Brain
+|  |  |- regime_wrapper.py    # Switches which goal is rewarded
+|  |  |- make_env.py          # Factory with wrapper stack
+|  |  `- wrappers/
+|  |     |- action_reduce.py  # MiniGrid Discrete(7) -> Discrete(3)
+|  |     `- one_hot.py        # (H, W, 3) -> (21, H, W) one-hot obs
+|  `- utils/
+|     |- logger.py            # JSON/PNG run logger
+|     `- seeding.py           # Deterministic seeding helper
+|- scripts/                   # Train/eval/analyze entry points
+|- runs/                      # Timestamped training outputs
+|- evals/                     # Timestamped evaluation outputs
+`- tests/                     # Regression tests
 ```
 
 ---
@@ -96,11 +97,12 @@ python scripts/train_ppo.py --env_id MiniGrid-DualGoal-8x8-v0 --mode dyna --tota
 ### 1.5 View Results
 
 ```bash
-# View results in browser
-tensorboard --logdir runs
+# Each run writes JSON scalars and PNG charts into runs/<run_name>_<timestamp>/
+python scripts/analyze_runs.py runs/<run_folder>
 
-# Create detailed analysis plots
-python scripts/analyze_runs.py
+# Directly inspect exported JSON/PNG artifacts
+#   <run_folder>/<run_name>_data.json
+#   <run_folder>/<run_name>_charts.png
 ```
 
 ### 1.6 Resume Training
@@ -136,7 +138,7 @@ python scripts/train_ppo.py \
 
 ## Part 2: Meta-RL Hyperparameter Controller ("The Brain")
 
-A second RL agent that learns to adjust the Dyna-PPO agent's hyperparameters (learning rate, entropy coefficient, intrinsic curiosity coefficient, imagined dream horizon) in real-time to maximize recovery speed after regime switches.
+A second RL agent that learns to adjust the inner Dyna-PPO agent online. In the current implementation it controls learning rate, entropy coefficient, intrinsic curiosity coefficient, imagined horizon, replay ratio, replay prioritization, anchoring weight, and an 8-D neuromodulation context code.
 
 ### 2.1 Smoke Test
 
@@ -160,19 +162,20 @@ python scripts/train_brain.py \
     --decision_interval 10 \
     --run_name brain_full_run
 
-# View Brain + inner agent tensorboard logs
-tensorboard --logdir runs
+# Brain runs write charts and JSON summaries into runs/<run_name>_<timestamp>/
+python scripts/analyze_runs.py runs/<brain_run_folder>
 ```
 
 ### 2.3 Recommended Robust Training Command
 
-Use this command for a full-scale Meta-RL training run. The Brain now operates in a **7-dimensional continuous action space**, dynamically controlling Replay Prioritization and Policy Anchoring Weight to prioritize robust generalization and recovery from catastrophic forgetting:
+Use this command for a full-scale Meta-RL training run. The current Brain policy consumes a **19-signal observation** and outputs a **15-dimensional continuous action**: 7 scalar learning levers plus an 8-D context code for neuromodulation.
 
 ```bash
 python scripts/train_brain.py \
     --brain_episodes 65 \
     --inner_total_timesteps 450000 \
     --brain_num_envs 2 \
+    --brain_vectorization async \
     --pretrain_episodes 1 \
     --inner_steps_per_regime 8000 \
     --episodic_memory_capacity 10000 \
@@ -182,7 +185,7 @@ python scripts/train_brain.py \
 Train a Brain with 4 regimes on the 8x8 environment:
 
 ```powershell
-.\myenv\Scripts\python.exe scripts\train_brain.py --env_id MiniGrid-MultiGoal-8x8-v0 --num_regimes 4 --brain_episodes 65 --inner_total_timesteps 450000 --brain_num_envs 2 --pretrain_episodes 1 --inner_steps_per_regime 18500 --episodic_memory_capacity 10000 --run_name brain_4_regimes_8x8
+.\myenv\Scripts\python.exe scripts\train_brain.py --env_id MiniGrid-MultiGoal-8x8-v0 --num_regimes 4 --brain_episodes 65 --inner_total_timesteps 450000 --brain_num_envs 2 --brain_vectorization async --pretrain_episodes 1 --inner_steps_per_regime 18500 --episodic_memory_capacity 10000 --run_name brain_4_regimes_8x8
 ```
 
 ### 2.4 Evaluation
@@ -226,12 +229,14 @@ To resume training the Brain from a checkpoint:
 Understanding the key CLI flags for `train_brain.py` and `eval_brain.py`:
 
 ### Environment Complexity
-* `--env_id MiniGrid-DualGoal-5x5-v0` : Default. A compact 5x5 grid (8x8 with walls). Good for fast prototyping.
-* `--env_id MiniGrid-DualGoal-8x8-v0` : A larger 8x8 grid (11x11 with walls). Significantly harder navigation task; usually requires higher `inner_total_timesteps` to master.
+* `--env_id MiniGrid-MultiGoal-5x5-v0` : Current Brain default. A compact multi-goal grid for faster prototyping.
+* `--env_id MiniGrid-MultiGoal-8x8-v0` : Larger and harder. Usually needs more `inner_total_timesteps` to adapt cleanly across regime switches.
+* `--env_id MiniGrid-DualGoal-5x5-v0` / `MiniGrid-DualGoal-8x8-v0` : Legacy two-goal variants that are still supported for baseline comparisons and tests.
 
 ### Meta-RL Training (The Brain)
 * `--brain_episodes` : Number of complete inner agent training runs.
 * `--brain_num_envs` : Number of parallel meta-environments. Higher values (e.g., 4 or 8) give the Brain smoother gradients and more stable learning, but use more RAM/VRAM. Start with 2 or 4.
+* `--brain_vectorization` : Outer Brain env batching mode. `async` is the current default and runs MetaEnvs in subprocesses for real parallel inner training. `sync` keeps everything in one process, which is simpler for debugging but serializes meta-env stepping.
 * `--pretrain_episodes` : Number of initial episodes where the Brain uses Imitation Learning (behavioral cloning) on a hardcoded "explore vs exploit" heuristic before switching to PPO. Highly recommended to keep at 1–3 to seed the Brain with a good starting policy.
 * `--pretrain_mode` : Pretrain heuristic style. `basic` (default) uses a binary explore/exploit split at 50% success rate. `recovery` uses a multi-tier, surprise-reactive heuristic with 5 graduated tiers and immediate explore response to regime-switch surprise spikes.
 * `--brain_lr` : Learning rate for the Brain's PPO optimizer.

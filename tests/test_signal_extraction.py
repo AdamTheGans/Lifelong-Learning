@@ -134,6 +134,39 @@ class TestSignalExtractor(unittest.TestCase):
         self.assertEqual(ext.prev_surprise, 0.0)
         self.assertEqual(len(ext.surprise_history), 0)
 
+    def test_static_override_indices_match_signal_names(self):
+        """Static normalization overrides must write to indices matching SIGNAL_NAMES."""
+        ext = SignalExtractor()
+        # Warm up normalizer so Welford stats are non-trivial
+        for _ in range(10):
+            ext.extract(self._make_stats())
+
+        # Set distinctive values for each statically-overridden signal
+        test_stats = self._make_stats(
+            success_rate=0.75,
+            failure_rate=0.15,
+            current_lr=1e-3,
+            current_ent_coef=0.05,
+            current_intrinsic_coef=0.1,
+            current_imagined_horizon=15,
+            current_replay_ratio=0.25,
+            current_replay_prioritization=0.7,
+            current_anchoring_weight=0.3,
+            episodic_memory_fullness=0.6,
+        )
+        obs = ext.extract(test_stats)
+
+        # Index 1: success_rate -> 0.75 * 2 - 1 = 0.5
+        self.assertAlmostEqual(obs[SIGNAL_NAMES.index("success_rate")], 0.5, places=3)
+        # Index 2: failure_rate -> 0.15 * 2 - 1 = -0.7
+        self.assertAlmostEqual(obs[SIGNAL_NAMES.index("failure_rate")], -0.7, places=3)
+        # Index 16: current_replay_prioritization -> 0.7 * 2 - 1 = 0.4
+        self.assertAlmostEqual(obs[SIGNAL_NAMES.index("current_replay_prioritization")], 0.4, places=3)
+        # Index 17: current_anchoring_weight -> (0.3 / 0.5) * 2 - 1 = 0.2
+        self.assertAlmostEqual(obs[SIGNAL_NAMES.index("current_anchoring_weight")], 0.2, places=3)
+        # Index 18: episodic_memory_fullness -> 0.6 * 2 - 1 = 0.2
+        self.assertAlmostEqual(obs[SIGNAL_NAMES.index("episodic_memory_fullness")], 0.2, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

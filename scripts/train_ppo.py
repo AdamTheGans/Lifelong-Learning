@@ -75,12 +75,9 @@ def main():
         imagined_horizon=imagined_horizon,
         intrinsic_reward_clip=args.intrinsic_reward_clip,
         wm_lr=args.wm_lr,
+        replay_ratio=args.replay_ratio,
+        replay_prioritization=args.replay_prioritization,
     )
-
-    # In test mode we need to hack the replay_ratio/replay_prioritization onto the state
-    # But since train_ppo() hides the state, we just add a small hack to train.py or 
-    # we can pass it if we modify train.py signature. Let's modify train.py signature in a moment 
-    # if needed, but for now we'll just run it.
 
 
 if __name__ == "__main__":

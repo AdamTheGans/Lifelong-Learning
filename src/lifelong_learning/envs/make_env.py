@@ -17,17 +17,18 @@ def make_env(env_id: str, seed: int, record_stats: bool = True, **kwargs):
         3. OneHotPartialObsWrapper — symbolic (H,W,3) → one-hot (21,H,W)
         4. RegimeGoalSwapWrapper — non-stationary reward switching
     """
-    # Extract num_regimes to pass to the env as num_goals.
-    # MiniGrid-MultiGoal environments accept a num_goals kwarg.
+    # MultiGoal environments scale the number of goals with the number of
+    # regimes. DualGoal environments are fixed at two goals.
     num_regimes = kwargs.get("num_regimes", 2)
-    
-    # We pass num_goals to gym.make config explicitly
-    env = gym.make(
-        env_id, 
-        render_mode=None, 
-        max_episode_steps=256,
-        num_goals=num_regimes
-    )
+
+    env_kwargs = {
+        "render_mode": None,
+        "max_episode_steps": 256,
+    }
+    if "MultiGoal" in env_id:
+        env_kwargs["num_goals"] = num_regimes
+
+    env = gym.make(env_id, **env_kwargs)
 
     # Full observability: PPO sees the entire 8×8 grid
     env = FullyObsWrapper(env)

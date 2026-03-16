@@ -32,10 +32,11 @@ class MLPActorCritic(nn.Module):
     """
     Simple MLP Actor-Critic for the Brain.
 
-    Input: NUM_SIGNALS-dim observation (training signals)
+    Input: NUM_SIGNALS-dim observation of normalized inner-training signals.
     Output: (action_mean, action_log_std, value)
 
-    Uses a continuous Gaussian policy since the action space is Box(7,).
+    Uses a continuous Gaussian policy over a 15-dim action space:
+    7 scalar learning levers plus an 8-dim neuromodulation context code.
     """
 
     def __init__(self, obs_dim: int = NUM_SIGNALS, act_dim: int = 15, hidden_dim: int = 128):
@@ -213,7 +214,7 @@ def brain_ppo_update(
             old_values = batch["values"][mb]
 
             # Normalize advantages
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
             new_logprobs, entropy, new_values = model.evaluate_actions(obs, actions)
 

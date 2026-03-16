@@ -49,6 +49,7 @@ class MetaEnv(gym.Env):
         steps_per_regime: int | None = 15000,
         episodes_per_regime: int | None = None,
         start_regime: int = 0,
+        randomize_start_regime: bool = False,
         num_regimes: int = 2,
         reward_alpha: float = 0.1,
         reward_beta: float = 0.5,
@@ -71,17 +72,19 @@ class MetaEnv(gym.Env):
         max_intrinsic_coef: float = 0.5,
         start_episode: int = 1,
         disable_neuromodulation: bool = False,
+        runtime_cpu_threads: int | None = None,
     ):
         super().__init__()
 
         self.start_episode = start_episode
         self.env_index = env_index
         self.env_id = env_id
-        self.inner_cfg = inner_cfg or PPOConfig()
+        self.inner_cfg = copy.deepcopy(inner_cfg or PPOConfig())
         self.decision_interval = decision_interval
         self.steps_per_regime = steps_per_regime
         self.episodes_per_regime = episodes_per_regime
         self.start_regime = start_regime
+        self.randomize_start_regime = randomize_start_regime
         self.num_regimes = num_regimes
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
@@ -102,6 +105,7 @@ class MetaEnv(gym.Env):
         self.min_intrinsic_coef = min_intrinsic_coef
         self.max_intrinsic_coef = max_intrinsic_coef
         self.disable_neuromodulation = disable_neuromodulation
+        self.runtime_cpu_threads = runtime_cpu_threads
 
         # Spaces
         self.observation_space = spaces.Box(
@@ -133,7 +137,10 @@ class MetaEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.start_regime = int(self.np_random.integers(0, self.num_regimes))
+        if self.randomize_start_regime:
+            start_regime = int(self.np_random.integers(0, self.num_regimes))
+        else:
+            start_regime = self.start_regime
 
         # Clean up any previous inner training
         if self._state is not None:
@@ -147,7 +154,7 @@ class MetaEnv(gym.Env):
             cfg=self.inner_cfg,
             steps_per_regime=self.steps_per_regime,
             episodes_per_regime=self.episodes_per_regime,
-            start_regime=self.start_regime,
+            start_regime=start_regime,
             num_regimes=self.num_regimes,
             run_name=run_name,
             save_every_updates=9999 if not self.save_checkpoints else 50,
@@ -157,6 +164,7 @@ class MetaEnv(gym.Env):
             imagined_horizon=self.imagined_horizon_init,
             wm_lr=self.wm_lr,
             episodic_memory_capacity=self.episodic_memory_capacity,
+            cpu_threads=self.runtime_cpu_threads,
         )
         if self.inner_log_dir is not None:
             ep_log_dir = os.path.join(self.inner_log_dir, f"{self._episode_prefix}_{self._episode_counter}")
@@ -165,14 +173,19 @@ class MetaEnv(gym.Env):
             
         self._state = init_inner_training(**init_kwargs)
 
-        self._signal_extractor = SignalExtractor(
-            max_inner_lr=self.max_inner_lr,
-            min_inner_lr=self.min_inner_lr,
-            min_ent_coef=self.min_ent_coef,
-            max_ent_coef=self.max_ent_coef,
-            min_intrinsic_coef=self.min_intrinsic_coef,
-            max_intrinsic_coef=self.max_intrinsic_coef,
-        )
+        # Reuse SignalExtractor across episodes to preserve normalizer stats;
+        # only create it on the very first reset.
+        if self._signal_extractor is None:
+            self._signal_extractor = SignalExtractor(
+                max_inner_lr=self.max_inner_lr,
+                min_inner_lr=self.min_inner_lr,
+                min_ent_coef=self.min_ent_coef,
+                max_ent_coef=self.max_ent_coef,
+                min_intrinsic_coef=self.min_intrinsic_coef,
+                max_intrinsic_coef=self.max_intrinsic_coef,
+            )
+        else:
+            self._signal_extractor.reset()
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
@@ -240,13 +253,58 @@ class MetaEnv(gym.Env):
         return obs, float(reward), terminated, truncated, info
 
     def _run_n_updates(self, n: int) -> dict:
-        """Run n inner PPO updates and return the last stats dict."""
-        stats = {}
+        """Run n inner PPO updates and summarize the full decision interval."""
+        interval_stats = []
         for _ in range(n):
             stats = run_inner_update(self._state)
+            interval_stats.append(stats)
             if stats.get("done", False):
                 break
-        return stats
+        return self._summarize_interval_stats(interval_stats)
+
+    def _summarize_interval_stats(self, interval_stats: list[dict]) -> dict:
+        """Collapse multiple inner updates into one Brain-facing meta-step summary."""
+        if not interval_stats:
+            return {}
+
+        last = dict(interval_stats[-1])
+        mean_keys = [
+            "mean_surprise",
+            "wm_loss_state",
+            "wm_loss_reward",
+            "policy_entropy",
+            "policy_loss",
+            "value_loss",
+        ]
+        for key in mean_keys:
+            last[key] = float(np.mean([stats.get(key, 0.0) for stats in interval_stats]))
+
+        completed_episodes = int(sum(stats.get("completed_episodes", 0) for stats in interval_stats))
+        successes = int(sum(stats.get("successful_episodes", 0) for stats in interval_stats))
+        failures = int(sum(stats.get("failed_episodes", 0) for stats in interval_stats))
+        timeouts = int(sum(stats.get("timeout_episodes", 0) for stats in interval_stats))
+        total_return = float(sum(stats.get("episodic_return_sum", 0.0) for stats in interval_stats))
+
+        last["overall_success_rate"] = float(last.get("success_rate", 0.0))
+        last["overall_failure_rate"] = float(last.get("failure_rate", 0.0))
+
+        if completed_episodes > 0:
+            last["mean_episodic_return"] = total_return / completed_episodes
+            last["success_rate"] = successes / completed_episodes
+            last["failure_rate"] = failures / completed_episodes
+            last["timeout_rate"] = timeouts / completed_episodes
+        else:
+            last["success_rate"] = float(last.get("recent_success_rate", last.get("success_rate", 0.0)))
+            last["failure_rate"] = float(last.get("recent_failure_rate", last.get("failure_rate", 0.0)))
+            last["timeout_rate"] = float(last.get("recent_timeout_rate", 1.0 - last["success_rate"] - last["failure_rate"]))
+            last["mean_episodic_return"] = float(np.mean([stats.get("mean_episodic_return", 0.0) for stats in interval_stats]))
+
+        last["interval_completed_episodes"] = completed_episodes
+        last["interval_successes"] = successes
+        last["interval_failures"] = failures
+        last["interval_timeouts"] = timeouts
+        last["interval_updates"] = len(interval_stats)
+        return last
 
     def _apply_action(self, action: np.ndarray):
         """Map Brain action [-1, 1]^15 to absolute HP values and apply to inner state."""
@@ -284,6 +342,27 @@ class MetaEnv(gym.Env):
             import torch
             context_code = torch.tensor(action[7:15], dtype=torch.float32, device=s.device)
             s.model.set_context_code(context_code)
+            self._log_neuromodulation_snapshot(context_code)
+
+    def _log_neuromodulation_snapshot(self, context_code):
+        """Record the Brain context code, decoded mask, and its effect on the current batch."""
+        s = self._state
+        if s is None or getattr(s, 'logger', None) is None or getattr(s, 'obs_t', None) is None:
+            return
+        if not hasattr(s.model, 'describe_neuromodulation'):
+            return
+
+        step = int(getattr(s, 'global_step', 0))
+        for idx, value in enumerate(context_code.detach().cpu().tolist()):
+            s.logger.scalar(f'brain_context/context_{idx}', float(value), step)
+
+        summary = s.model.describe_neuromodulation(s.obs_t)
+        for key in ('mask_mean', 'mask_std', 'mask_min', 'mask_max', 'policy_kl_vs_unmasked', 'entropy_delta_vs_unmasked', 'value_delta_abs_vs_unmasked'):
+            s.logger.scalar(f'brain_neuromod/{key}', float(summary[key]), step)
+
+        channel_means = summary.get('channel_means', [])
+        for idx, value in enumerate(channel_means):
+            s.logger.scalar(f'brain_neuromod/channel_mean_{idx}', float(value), step)
 
     def close(self):
         if self._state is not None:

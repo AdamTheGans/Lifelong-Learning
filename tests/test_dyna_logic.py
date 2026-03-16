@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import unittest
+from lifelong_learning.agents.ppo.buffers import RolloutBuffer
 from lifelong_learning.agents.ppo.world_model import SimpleWorldModel
 
 
@@ -71,7 +72,9 @@ class TestDynaLogic(unittest.TestCase):
         self.assertEqual(step0['obs'].shape, (B, *self.obs_shape))
         self.assertEqual(step0['actions'].shape, (B,))
         self.assertEqual(step0['rewards'].shape, (B,))
+        self.assertEqual(step0['dones'].shape, (B,))
         self.assertEqual(step0['next_obs'].shape, (B, *self.obs_shape))
+        self.assertTrue(torch.equal(step0['dones'], torch.zeros_like(step0['dones'])))
 
         # next_obs must be discrete (one-hot)
         unique_vals = torch.unique(step0['next_obs'])
@@ -96,6 +99,29 @@ class TestDynaLogic(unittest.TestCase):
 
         expected_shape = (num_envs, C, H, W)
         self.assertEqual(start_states.shape, expected_shape)
+
+    def test_world_model_uses_extrinsic_reward_targets(self):
+        """Minibatch reward targets for WM training should ignore intrinsic bonuses."""
+        buffer = RolloutBuffer(num_steps=1, num_envs=1, obs_shape=self.obs_shape, device=torch.device("cpu"))
+        obs = torch.zeros(1, *self.obs_shape)
+        next_obs = torch.zeros(1, *self.obs_shape)
+        buffer.add(
+            obs=obs,
+            actions=torch.tensor([0]),
+            logprobs=torch.tensor([0.0]),
+            rewards=torch.tensor([1.25]),
+            dones=torch.tensor([0.0]),
+            values=torch.tensor([0.0]),
+            next_obs=next_obs,
+            extrinsic_rewards=torch.tensor([0.5]),
+        )
+        buffer.compute_returns_and_advantages(last_value=torch.tensor([0.0]), gamma=0.99, gae_lambda=0.95)
+
+        batch = next(buffer.get_minibatches(minibatch_size=1, shuffle=False))
+        reward_targets = batch[-1]
+
+        self.assertAlmostEqual(buffer.rewards.item(), 1.25)
+        self.assertAlmostEqual(reward_targets.item(), 0.5)
 
     def test_proportional_reward(self):
         """Verify pure proportional intrinsic reward logic."""

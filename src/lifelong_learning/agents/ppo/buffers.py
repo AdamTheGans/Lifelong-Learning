@@ -22,6 +22,7 @@ class RolloutBuffer:
         self.actions = torch.zeros((num_steps, num_envs), device=device, dtype=torch.long)
         self.logprobs = torch.zeros((num_steps, num_envs), device=device)
         self.rewards = torch.zeros((num_steps, num_envs), device=device)
+        self.extrinsic_rewards = torch.zeros((num_steps, num_envs), device=device)
         self.dones = torch.zeros((num_steps, num_envs), device=device)
         self.values = torch.zeros((num_steps, num_envs), device=device)
         self.next_obs = torch.zeros((num_steps, num_envs) + obs_shape, device=device)
@@ -31,7 +32,7 @@ class RolloutBuffer:
 
         self.step = 0
 
-    def add(self, obs, actions, logprobs, rewards, dones, values, next_obs):
+    def add(self, obs, actions, logprobs, rewards, dones, values, next_obs, extrinsic_rewards=None):
         t = self.step
         self.obs[t].copy_(obs)
         self.next_obs[t].copy_(next_obs)
@@ -40,6 +41,10 @@ class RolloutBuffer:
         self.rewards[t].copy_(rewards)
         self.dones[t].copy_(dones)
         self.values[t].copy_(values)
+        if extrinsic_rewards is not None:
+            self.extrinsic_rewards[t].copy_(extrinsic_rewards)
+        else:
+            self.extrinsic_rewards[t].copy_(rewards)
         self.step += 1
 
     def compute_returns_and_advantages(self, last_value, gamma: float, gae_lambda: float):
@@ -64,7 +69,10 @@ class RolloutBuffer:
         Flatten (T, N) → (T*N) and yield minibatches.
 
         Yields:
-            (obs, actions, logprobs, advantages, returns, values, next_obs, rewards)
+            (obs, actions, logprobs, advantages, returns, values, next_obs, reward_targets)
+
+        The final tensor uses extrinsic rewards so the world model learns task rewards
+        instead of the curiosity-augmented PPO signal.
         """
         T, N = self.num_steps, self.num_envs
         batch_size = T * N
@@ -76,10 +84,10 @@ class RolloutBuffer:
         b_advantages = self.advantages.reshape(batch_size)
         b_returns = self.returns.reshape(batch_size)
         b_values = self.values.reshape(batch_size)
-        b_rewards = self.rewards.reshape(batch_size)
+        b_rewards = self.extrinsic_rewards.reshape(batch_size)
 
         # Normalize advantages
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std(unbiased=False) + 1e-8)
 
         idxs = np.arange(batch_size)
         if shuffle:

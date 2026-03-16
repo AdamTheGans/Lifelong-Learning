@@ -1,8 +1,11 @@
 """
 Interactive training run analyzer.
-Merges functionality from visualize_regimes.py for enhanced plotting.
+
+Supports the current JSON logs emitted by DataLogger and falls back to
+TensorBoard event files for older runs.
 """
 import argparse
+import glob
 import json
 import os
 import sys
@@ -19,7 +22,7 @@ try:
 except ImportError:
     HAS_MPL = False
 
-# Try imports for TensorBoard reading
+# Optional TensorBoard support for older runs
 try:
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     TENSORBOARD_AVAILABLE = True
@@ -28,35 +31,82 @@ except ImportError:
 
 
 def load_data_from_logdir(logdir, tags=None):
-    """Loads scalars for specified tags from TensorBoard event files."""
-    if not TENSORBOARD_AVAILABLE:
-        print("Error: 'tensorboard' package not installed/found. Cannot read event logs.")
-        return {}
-        
+    """Load scalar logs from DataLogger JSON first, then TensorBoard if needed."""
     print(f"Loading logs from {logdir}...")
-    
-    # Initialize accumulator (load all scalars)
+
+    json_data = load_data_from_json(logdir, tags=tags)
+    if json_data:
+        return json_data
+
+    if not TENSORBOARD_AVAILABLE:
+        print("Error: no DataLogger JSON found and 'tensorboard' is not installed.")
+        return {}
+
+    return load_data_from_tensorboard(logdir, tags=tags)
+
+
+def load_data_from_json(logdir, tags=None):
+    """Load scalar logs from DataLogger JSON exports."""
+    json_candidates = sorted(glob.glob(os.path.join(logdir, "*_data.json")))
+    if not json_candidates:
+        json_candidates = sorted(glob.glob(os.path.join(logdir, "**", "*_data.json"), recursive=True))
+    if not json_candidates:
+        return {}
+
+    requested_tags = list(tags) if tags else None
+    best_path = None
+    best_data = {}
+    best_score = -1
+
+    for json_path in json_candidates:
+        with open(json_path, "r") as f:
+            raw = json.load(f)
+
+        candidate_tags = requested_tags or raw.keys()
+        candidate_data = {}
+        for tag in candidate_tags:
+            points = raw.get(tag, [])
+            rows = []
+            for point in points:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    rows.append([np.nan, point[0], point[1]])
+            if rows:
+                candidate_data[tag] = pd.DataFrame(rows, columns=["timestamp", "step", "value"])
+
+        score = len(candidate_data)
+        if score > best_score:
+            best_path = json_path
+            best_data = candidate_data
+            best_score = score
+
+        if requested_tags and score == len(requested_tags):
+            break
+
+    if not best_data:
+        return {}
+
+    print(f"Using DataLogger JSON: {best_path}")
+    return best_data
+
+
+def load_data_from_tensorboard(logdir, tags=None):
+    """Load scalar logs from TensorBoard event files."""
     event_acc = EventAccumulator(logdir)
     event_acc.Reload()
-    
-    # Check available tags
-    available_tags = event_acc.Tags()['scalars']
-    
+
+    available_tags = event_acc.Tags()["scalars"]
     data = {}
-    
-    # If no tags specified, load all relevant ones
+
     if not tags:
         tags = available_tags
-        
+
     for tag in tags:
         if tag not in available_tags:
             continue
-            
         events = event_acc.Scalars(tag)
-        # Convert to list of [timestamp, step, value]
         raw_data = [[e.wall_time, e.step, e.value] for e in events]
-        data[tag] = pd.DataFrame(raw_data, columns=['timestamp', 'step', 'value'])
-        
+        data[tag] = pd.DataFrame(raw_data, columns=["timestamp", "step", "value"])
+
     return data
 
 
@@ -114,7 +164,7 @@ def smooth_data(data, window_size=10):
 
 
 def find_runs(logdir="logdir"):
-    """Find all run directories that contain tensorboard events."""
+    """Find all run directories that contain DataLogger JSON or TensorBoard events."""
     runs = []
     if not os.path.exists(logdir):
         # Try checking current directory for runs folder or similar
@@ -123,17 +173,17 @@ def find_runs(logdir="logdir"):
         else:
             return runs # Nothing found
 
-    # Walk through directory to find event files
+    # Walk through directory to find supported log files
     for root, dirs, files in os.walk(logdir):
-        for file in files:
-            if "events.out.tfevents" in file:
-                # We found a run directory
-                rel_path = os.path.relpath(root, start=os.getcwd())
-                runs.append((os.path.basename(rel_path), rel_path))
-                break # One event file is enough to mark the dir
-                
-    # Sort
-    runs.sort(key=lambda x: x[0])
+        has_supported_log = any(
+            "events.out.tfevents" in file or file.endswith("_data.json")
+            for file in files
+        )
+        if has_supported_log:
+            rel_path = os.path.relpath(root, start=os.getcwd())
+            runs.append((os.path.basename(rel_path), rel_path))
+
+    runs = sorted(set(runs), key=lambda x: x[0])
     return runs
 
 
@@ -246,7 +296,7 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
         if output_path:
             plt.savefig(output_path, dpi=150)
             plt.close(fig)
-            print(f"  📊 Saved separate plot to: {output_path}")
+            print(f"   Saved separate plot to: {output_path}")
         else:
             plt.show()
 
@@ -254,7 +304,7 @@ def plot_single_graph(df_main, df_wm, title, ylabel, main_color, wm_color, regim
 def plot_run(logdir, run_name):
     """Create a multi-panel figure with key training metrics."""
     if not HAS_MPL:
-        print("  matplotlib not installed — skipping graphs.")
+        print("  matplotlib not installed  skipping graphs.")
         return
 
     # 1. Load Data with TensorBoard tags
@@ -415,7 +465,7 @@ def plot_run(logdir, run_name):
     ax5.set_title("World Model Losses (Log)")
     ax5.legend(fontsize=8)
 
-    # Panel 6: Episodic Return vs Surprise (Regime Analysis) — Duplicate of separate plot
+    # Panel 6: Episodic Return vs Surprise (Regime Analysis)  Duplicate of separate plot
     ax6 = fig.add_subplot(2, 3, 6)
     if df_eps_ret is not None:
         plot_single_graph(
@@ -434,7 +484,7 @@ def plot_run(logdir, run_name):
     # Save Main Figure
     out_path = os.path.join("graphs", f"analysis_{run_name.replace(os.path.sep, '_')}.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\n  📊 Saved summary figure to: {out_path}")
+    print(f"\n   Saved summary figure to: {out_path}")
     
     # Only try to show if we have an interactive backend
     if matplotlib.get_backend().lower() not in ["agg", "cairo", "ps", "pdf", "svg"]:
@@ -469,9 +519,9 @@ def main():
         print("Usage: python scripts/analyze_runs.py [path/to/run]")
         return
 
-    print("\n╔══════════════════════════════════════════╗")
-    print("║       Training Run Analyzer              ║")
-    print("╚══════════════════════════════════════════╝")
+    print("\n")
+    print("       Training Run Analyzer              ")
+    print("")
     print("\nAvailable runs:\n")
     for i, (name, path) in enumerate(runs, 1):
         print(f"  [{i}] {name}  ({path})")

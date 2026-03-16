@@ -26,9 +26,47 @@ from lifelong_learning.agents.ppo.train import (
     run_inner_update,
     close_inner_training,
 )
-from lifelong_learning.agents.brain.signals import SignalExtractor, NUM_SIGNALS
+from lifelong_learning.agents.brain.signals import SignalExtractor
 from lifelong_learning.agents.brain.meta_agent import MLPActorCritic
 from lifelong_learning.utils.logger import DataLogger
+
+
+def _upgrade_legacy_brain_state_dict(state_dict: dict, target_act_dim: int) -> dict:
+    """Pad older Brain checkpoints to the current action dimensionality."""
+    upgraded = dict(state_dict)
+
+    if "actor_mean.weight" not in upgraded:
+        return upgraded
+
+    old_act_dim = upgraded["actor_mean.weight"].shape[0]
+    logstd_key = "actor_log_std" if "actor_log_std" in upgraded else "actor_logstd"
+
+    if old_act_dim >= target_act_dim and logstd_key == "actor_log_std":
+        return upgraded
+
+    old_weight = upgraded["actor_mean.weight"]
+    old_bias = upgraded["actor_mean.bias"]
+    old_logstd = upgraded.get(logstd_key)
+
+    new_weight = old_weight.new_zeros((target_act_dim, old_weight.shape[1]))
+    new_weight[:old_act_dim, :] = old_weight
+    upgraded["actor_mean.weight"] = new_weight
+
+    new_bias = old_bias.new_zeros(target_act_dim)
+    new_bias[:old_act_dim] = old_bias
+    upgraded["actor_mean.bias"] = new_bias
+
+    if old_logstd is None:
+        new_logstd = old_weight.new_full((target_act_dim,), -0.5)
+    else:
+        old_logstd_flat = old_logstd.reshape(-1)
+        new_logstd = old_logstd_flat.new_full((target_act_dim,), -0.5)
+        limit = min(target_act_dim, old_logstd_flat.shape[0])
+        new_logstd[:limit] = old_logstd_flat[:limit]
+
+    upgraded["actor_log_std"] = new_logstd
+    upgraded.pop("actor_logstd", None)
+    return upgraded
 
 
 def eval_brain(args):
@@ -42,28 +80,13 @@ def eval_brain(args):
     
     brain_model = MLPActorCritic().to(device)
     
-    # Handle backward compatibility: older checkpoints may have 5 or 7 action dims, we need 15
-    state_dict = ckpt["model_state_dict"]
-    
-    old_act_dim = state_dict["actor_mean.weight"].shape[0] if "actor_mean.weight" in state_dict else 15
+    # Handle backward compatibility: older checkpoints may use 5-D or 7-D action heads.
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+    old_act_dim = state_dict["actor_mean.weight"].shape[0] if "actor_mean.weight" in state_dict else brain_model.actor_mean.out_features
     if old_act_dim < 15:
         print(f"DETECTED LEGACY {old_act_dim}-DIM ACTION SPACE MODEL. PADDING TO 15-DIM...")
-        old_weight = state_dict["actor_mean.weight"]
-        old_bias = state_dict["actor_mean.bias"]
-        old_logstd = state_dict["actor_logstd"]
-        
-        new_weight = torch.zeros(15, old_weight.shape[1], device=old_weight.device)
-        new_weight[:old_act_dim, :] = old_weight
-        state_dict["actor_mean.weight"] = new_weight
-        
-        new_bias = torch.zeros(15, device=old_bias.device)
-        new_bias[:old_act_dim] = old_bias
-        state_dict["actor_mean.bias"] = new_bias
-        
-        logstd_dim = old_logstd.shape[-1] if old_logstd.dim() > 1 else old_logstd.shape[0]
-        new_logstd = torch.zeros(1, 15, device=old_logstd.device) - 0.5
-        new_logstd[0, :logstd_dim] = old_logstd.view(-1)[:logstd_dim]
-        state_dict["actor_logstd"] = new_logstd
+        state_dict = _upgrade_legacy_brain_state_dict(state_dict, brain_model.actor_mean.out_features)
 
     brain_model.load_state_dict(state_dict)
     brain_model.eval()  # Inference mode — no dropout, batchnorm etc.
@@ -153,7 +176,6 @@ def eval_brain(args):
     # -----------------------------------------------------------------
     start_time = time.time()
     update_count = 0
-    prev_success_rate = 0.0
 
     while True:
         stats = run_inner_update(state)

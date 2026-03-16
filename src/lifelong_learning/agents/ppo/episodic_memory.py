@@ -48,13 +48,15 @@ class EpisodicMemory:
         """Fraction of capacity filled, in [0, 1]."""
         return self._size / self.capacity
 
-    def store_from_rollout(self, rollout_buffer, regime_ids: np.ndarray | torch.Tensor | int | None = None) -> None:
+    def store_from_rollout(self, rollout_buffer, regime_ids: np.ndarray | torch.Tensor | int | None = None, use_extrinsic_rewards: bool = False) -> None:
         """
         Copy all transitions from a RolloutBuffer into episodic memory.
 
         Args:
             rollout_buffer: a RolloutBuffer with shape (T, N, ...) tensors
             regime_ids: optionally track the regime IDs for the transitions.
+            use_extrinsic_rewards: if True, store extrinsic-only rewards
+                (avoids stale intrinsic bonuses biasing replay).
         """
         T = rollout_buffer.num_steps
         N = rollout_buffer.num_envs
@@ -63,7 +65,8 @@ class EpisodicMemory:
         n_transitions = T * N
         flat_obs = rollout_buffer.obs[:T].reshape((n_transitions,) + self.obs_shape).cpu()
         flat_actions = rollout_buffer.actions[:T].reshape(n_transitions).cpu()
-        flat_rewards = rollout_buffer.rewards[:T].reshape(n_transitions).cpu()
+        reward_source = rollout_buffer.extrinsic_rewards if use_extrinsic_rewards else rollout_buffer.rewards
+        flat_rewards = reward_source[:T].reshape(n_transitions).cpu()
         flat_next_obs = rollout_buffer.next_obs[:T].reshape((n_transitions,) + self.obs_shape).cpu()
         flat_dones = rollout_buffer.dones[:T].reshape(n_transitions).cpu()
 

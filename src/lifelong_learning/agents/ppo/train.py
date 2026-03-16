@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import warnings
 
@@ -24,6 +25,29 @@ from lifelong_learning.agents.ppo.episodic_memory import EpisodicMemory
 from lifelong_learning.utils.seeding import seed_everything
 from lifelong_learning.utils.logger import DataLogger
 from lifelong_learning.envs.make_env import make_env
+
+
+def configure_runtime_threads(num_threads: int | None):
+    """Cap per-process CPU thread pools to avoid async worker oversubscription."""
+    if num_threads is None:
+        return
+
+    thread_count = max(1, int(num_threads))
+    thread_count_str = str(thread_count)
+    for env_var in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[env_var] = thread_count_str
+
+    torch.set_num_threads(thread_count)
+    try:
+        torch.set_num_interop_threads(thread_count)
+    except RuntimeError:
+        # PyTorch only allows this before inter-op work starts; subsequent resets can skip it.
+        pass
 
 
 # =========================================================================
@@ -82,6 +106,7 @@ class InnerTrainState:
 
     # --- Outcome tracking ---
     outcome_window: deque = field(default_factory=lambda: deque(maxlen=100))
+    recent_outcome_window: deque = field(default_factory=lambda: deque(maxlen=20))
 
     # --- Logger ---
     logger: DataLogger = field(default=None, repr=False)
@@ -115,6 +140,9 @@ def init_inner_training(
     wm_lr: float = 1e-4,
     log_dir: str = "runs",
     episodic_memory_capacity: int = 50000,
+    replay_ratio: float = 0.0,
+    replay_prioritization: float = 0.0,
+    cpu_threads: int | None = None,
 ) -> InnerTrainState:
     """
     Initialize all components of the Dyna-PPO inner training loop.
@@ -123,9 +151,13 @@ def init_inner_training(
     run_inner_update(), or used internally by train_ppo().
     """
 
+    # Clone the config so meta-controller mutations stay local to this inner run.
+    cfg = copy.deepcopy(cfg)
+
     seed_everything(cfg.seed)
+    configure_runtime_threads(cpu_threads)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    num_envs = max(cfg.num_envs, 16)
+    num_envs = max(1, int(cfg.num_envs))
 
     # -----------------------------------------------------------------
     # Environment Setup
@@ -235,6 +267,8 @@ def init_inner_training(
         intrinsic_coef=intrinsic_coef,
         intrinsic_reward_clip=intrinsic_reward_clip,
         imagined_horizon=imagined_horizon,
+        replay_ratio=replay_ratio,
+        replay_prioritization=replay_prioritization,
         anneal_lr=anneal_lr,
         global_step=global_step,
         current_update=start_update,
@@ -301,6 +335,9 @@ def run_inner_update(state: InnerTrainState) -> dict:
     episodic_intrinsic_rewards = []
     episodic_intrinsic_rewards_max = []
     episodic_returns_this_update = []
+    successes_this_update = 0
+    failures_this_update = 0
+    timeouts_this_update = 0
 
     for t in range(s.cfg.num_steps):
         s.global_step += s.num_envs
@@ -377,7 +414,8 @@ def run_inner_update(state: InnerTrainState) -> dict:
         s.running_lengths += 1
 
         # Store transition (extrinsic + intrinsic reward)
-        total_reward = torch.tensor(reward, dtype=torch.float32, device=s.device) + intrinsic_reward
+        extrinsic_reward = torch.tensor(reward, dtype=torch.float32, device=s.device)
+        total_reward = extrinsic_reward + intrinsic_reward
 
         s.buffer.add(
             obs=s.obs_t,
@@ -387,6 +425,7 @@ def run_inner_update(state: InnerTrainState) -> dict:
             dones=torch.tensor(done, dtype=torch.float32, device=s.device),
             values=value,
             next_obs=real_next_obs_t,
+            extrinsic_rewards=extrinsic_reward,
         )
 
         s.obs_t = torch.tensor(next_obs, dtype=torch.float32, device=s.device)
@@ -410,6 +449,14 @@ def run_inner_update(state: InnerTrainState) -> dict:
                     outcome = -1  # failure
 
                 s.outcome_window.append(outcome)
+                s.recent_outcome_window.append(outcome)
+
+                if outcome == 1:
+                    successes_this_update += 1
+                elif outcome == -1:
+                    failures_this_update += 1
+                else:
+                    timeouts_this_update += 1
 
                 if len(s.outcome_window) > 0:
                     success_rate = sum(1 for x in s.outcome_window if x == 1) / len(s.outcome_window)
@@ -463,7 +510,7 @@ def run_inner_update(state: InnerTrainState) -> dict:
             fresh_idxs = np.random.randint(0, s.cfg.num_steps * s.num_envs, size=n_fresh)
             flat_obs = s.buffer.obs.reshape((-1,) + s.obs_shape)
             flat_actions = s.buffer.actions.reshape(-1)
-            flat_rewards = s.buffer.rewards.reshape(-1)
+            flat_rewards = s.buffer.extrinsic_rewards.reshape(-1)
             flat_next_obs = s.buffer.next_obs.reshape((-1,) + s.obs_shape)
 
             # Combine fresh + replay observations and actions
@@ -485,12 +532,14 @@ def run_inner_update(state: InnerTrainState) -> dict:
             ], dim=0)
             mixed_returns = mixed_rewards + s.cfg.gamma * next_values * (1.0 - mixed_dones)
             mixed_advantages = mixed_returns - mixed_values
-            mixed_advantages = (mixed_advantages - mixed_advantages.mean()) / (mixed_advantages.std() + 1e-8)
+            mixed_advantages = (mixed_advantages - mixed_advantages.mean()) / (mixed_advantages.std(unbiased=False) + 1e-8)
 
-            # Recompute logprobs under current policy
-            new_logprobs, _, _ = s.model.evaluate_actions(mixed_obs, mixed_actions)
+            # Compute old logprobs under current policy BEFORE the update
+            # (detached so they remain fixed as the "old" reference)
+            with torch.no_grad():
+                old_logprobs, _, _ = s.model.evaluate_actions(mixed_obs, mixed_actions)
 
-            ppo_batch = [mixed_obs, mixed_actions, new_logprobs, mixed_advantages, mixed_returns, mixed_values]
+            ppo_batch = [mixed_obs, mixed_actions, old_logprobs, mixed_advantages, mixed_returns, mixed_values]
             
             anchor_logprobs_list = None
             if s.cfg.anchoring_weight > 0.0 and s.anchor_model is not None:
@@ -524,6 +573,14 @@ def run_inner_update(state: InnerTrainState) -> dict:
                 "world_model/loss_state": loss_state.item(),
                 "world_model/loss_reward": loss_reward.item(),
             })
+
+    # Archive current rollout to episodic memory (using extrinsic rewards only
+    # to avoid stale intrinsic bonuses biasing replay)
+    if s.episodic_memory is not None:
+        s.episodic_memory.store_from_rollout(
+            s.buffer, regime_ids=s.current_mode_regime,
+            use_extrinsic_rewards=True,
+        )
 
     # =====================================================================
     # Phase D: Dream & update policy on imagined data
@@ -559,10 +616,6 @@ def run_inner_update(state: InnerTrainState) -> dict:
             with torch.no_grad():
                 _, last_dream_value = s.model.forward(last_dream_obs)
             dream_buffer.compute_returns_and_advantages(last_dream_value, s.cfg.gamma, s.cfg.gae_lambda)
-
-        # Archive current rollout to episodic memory BEFORE dreaming
-        if s.episodic_memory is not None:
-            s.episodic_memory.store_from_rollout(s.buffer, regime_ids=s.current_mode_regime)
 
         for epoch in range(1):
             minibatches = dream_buffer.get_minibatches(s.cfg.minibatch_size, shuffle=True)
@@ -613,7 +666,7 @@ def run_inner_update(state: InnerTrainState) -> dict:
     s.logger.scalar("charts/heartbeat", s.global_step, s.global_step)
     s.logger.scalar("charts/reward_step_mean", s.buffer.rewards.mean().item(), s.global_step)
     s.logger.scalar("charts/reward_step_max", s.buffer.rewards.max().item(), s.global_step)
-    s.logger.scalar("charts/reward_step_std", s.buffer.rewards.std().item(), s.global_step)
+    s.logger.scalar("charts/reward_step_std", s.buffer.rewards.std(unbiased=False).item(), s.global_step)
     s.logger.scalar("brain/ent_coef", s.cfg.ent_coef, s.global_step)
     s.logger.scalar("brain/intrinsic_coef", s.intrinsic_coef, s.global_step)
     s.logger.scalar("brain/imagined_horizon", float(s.imagined_horizon), s.global_step)
@@ -661,10 +714,15 @@ def run_inner_update(state: InnerTrainState) -> dict:
     # Build stats dict for the Brain
     # -----------------------------------------------------------------
 
-    # Outcome rates from the rolling window
+    # Outcome rates from the rolling windows
     n_outcomes = len(s.outcome_window)
     success_rate = sum(1 for x in s.outcome_window if x == 1) / max(n_outcomes, 1)
     failure_rate = sum(1 for x in s.outcome_window if x == -1) / max(n_outcomes, 1)
+
+    n_recent_outcomes = len(s.recent_outcome_window)
+    recent_success_rate = sum(1 for x in s.recent_outcome_window if x == 1) / max(n_recent_outcomes, 1)
+    recent_failure_rate = sum(1 for x in s.recent_outcome_window if x == -1) / max(n_recent_outcomes, 1)
+    recent_timeout_rate = sum(1 for x in s.recent_outcome_window if x == 0) / max(n_recent_outcomes, 1)
 
     mean_return = float(np.mean(episodic_returns_this_update)) if episodic_returns_this_update else 0.0
 
@@ -675,8 +733,16 @@ def run_inner_update(state: InnerTrainState) -> dict:
 
         # Performance signals
         "mean_episodic_return": mean_return,
+        "episodic_return_sum": float(np.sum(episodic_returns_this_update)) if episodic_returns_this_update else 0.0,
+        "completed_episodes": len(episodic_returns_this_update),
+        "successful_episodes": successes_this_update,
+        "failed_episodes": failures_this_update,
+        "timeout_episodes": timeouts_this_update,
         "success_rate": success_rate,
         "failure_rate": failure_rate,
+        "recent_success_rate": recent_success_rate,
+        "recent_failure_rate": recent_failure_rate,
+        "recent_timeout_rate": recent_timeout_rate,
 
         # Surprise / world model signals
         "mean_surprise": float(np.mean(episodic_intrinsic_rewards)) if episodic_intrinsic_rewards else 0.0,
@@ -730,6 +796,8 @@ def train_ppo(
     intrinsic_reward_clip: float = 0.1,
     imagined_horizon: int = 5,
     wm_lr: float = 1e-4,
+    replay_ratio: float = 0.0,
+    replay_prioritization: float = 0.0,
 ):
     """
     Main Dyna-PPO training loop.
@@ -756,6 +824,8 @@ def train_ppo(
         intrinsic_reward_clip=intrinsic_reward_clip,
         imagined_horizon=imagined_horizon,
         wm_lr=wm_lr,
+        replay_ratio=replay_ratio,
+        replay_prioritization=replay_prioritization,
     )
 
     print(f"Training on {state.device} with {state.num_envs} envs "

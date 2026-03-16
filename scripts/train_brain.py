@@ -9,13 +9,13 @@ from __future__ import annotations
 import os
 import argparse
 import time
+from functools import partial
 import numpy as np
 import torch
 import torch.nn.functional as F
 import gymnasium as gym
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig
-from lifelong_learning.agents.brain.signals import NUM_SIGNALS
 from lifelong_learning.agents.brain.meta_env import MetaEnv
 from lifelong_learning.agents.brain.meta_agent import (
     MLPActorCritic,
@@ -26,6 +26,130 @@ from lifelong_learning.agents.brain.meta_agent import (
 from lifelong_learning.utils.logger import DataLogger
 
 
+def should_run_periodic(episode: int, every: int, *, final_episode: int | None = None) -> bool:
+    """Return True when an artifact should be refreshed on this episode."""
+    if every <= 0:
+        return final_episode is not None and episode == final_episode
+    return episode % every == 0 or (final_episode is not None and episode == final_episode)
+
+
+def launch_high_scale_plots(episode_dir: str):
+    """Spawn high-scale plot generation for each inner-env log folder."""
+    import glob
+    import subprocess
+    import sys
+
+    if not os.path.isdir(episode_dir):
+        return
+
+    for env_folder in sorted(glob.glob(os.path.join(episode_dir, "ep*_env*"))):
+        if not os.path.isdir(env_folder):
+            continue
+        try:
+            print(f"  [plot] Generating charts for {os.path.basename(env_folder)}...")
+            subprocess.Popen(
+                [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"  [plot] Failed to launch high-scale plot for {env_folder}: {e}")
+
+
+def build_meta_vector_env(env_fns, vectorization: str):
+    """Create the Brain's vectorized outer environment."""
+    autoreset_mode = gym.vector.AutoresetMode.DISABLED
+    if vectorization == "async":
+        return gym.vector.AsyncVectorEnv(
+            env_fns,
+            shared_memory=False,
+            autoreset_mode=autoreset_mode,
+        )
+    if vectorization == "sync":
+        return gym.vector.SyncVectorEnv(
+            env_fns,
+            autoreset_mode=autoreset_mode,
+        )
+    raise ValueError(f"Unsupported brain vectorization mode: {vectorization}")
+
+
+def get_meta_env_runtime_cpu_threads(vectorization: str) -> int | None:
+    """Limit per-worker CPU thread pools when outer envs run in subprocesses."""
+    if vectorization == "async":
+        return 1
+    return None
+
+
+def should_refresh_brain_trends(plot_episode_artifacts: bool, generate_high_scale_plots: bool) -> bool:
+    """Refresh aggregate Brain plots on schedule or alongside per-episode high-scale plots."""
+    return plot_episode_artifacts or generate_high_scale_plots
+
+
+def _extract_episode_average_success_rate(infos: dict) -> float | None:
+    """Average final inner-agent success rate across Brain vector envs for one episode."""
+    success_rates = []
+    final_infos = infos.get("final_info", [])
+    if isinstance(final_infos, dict):
+        final_infos = [final_infos]
+    for final_info in final_infos:
+        if not isinstance(final_info, dict):
+            continue
+        inner_stats = final_info.get("inner_stats")
+        if not isinstance(inner_stats, dict):
+            continue
+        if "overall_success_rate" in inner_stats:
+            success_rates.append(float(inner_stats["overall_success_rate"]))
+        elif "success_rate" in inner_stats:
+            success_rates.append(float(inner_stats["success_rate"]))
+    if success_rates:
+        return float(np.mean(success_rates))
+    inner_stats = infos.get("inner_stats")
+    if isinstance(inner_stats, dict):
+        if "overall_success_rate" in inner_stats:
+            return float(np.mean(np.asarray(inner_stats["overall_success_rate"], dtype=np.float32)))
+        if "success_rate" in inner_stats:
+            return float(np.mean(np.asarray(inner_stats["success_rate"], dtype=np.float32)))
+    if isinstance(inner_stats, (list, tuple)):
+        fallback_rates = []
+        for stats in inner_stats:
+            if not isinstance(stats, dict):
+                continue
+            if "overall_success_rate" in stats:
+                fallback_rates.append(float(stats["overall_success_rate"]))
+            elif "success_rate" in stats:
+                fallback_rates.append(float(stats["success_rate"]))
+        if fallback_rates:
+            return float(np.mean(fallback_rates))
+    return None
+
+def _upgrade_legacy_brain_state_dict(state_dict: dict, target_act_dim: int) -> dict:
+    """Pad older Brain checkpoints to the current action dimensionality."""
+    upgraded = dict(state_dict)
+    if "actor_mean.weight" not in upgraded:
+        return upgraded
+    old_act_dim = upgraded["actor_mean.weight"].shape[0]
+    logstd_key = "actor_log_std" if "actor_log_std" in upgraded else "actor_logstd"
+    if old_act_dim >= target_act_dim and logstd_key == "actor_log_std":
+        return upgraded
+    old_weight = upgraded["actor_mean.weight"]
+    old_bias = upgraded["actor_mean.bias"]
+    old_logstd = upgraded.get(logstd_key)
+    new_weight = old_weight.new_zeros((target_act_dim, old_weight.shape[1]))
+    new_weight[:old_act_dim, :] = old_weight
+    upgraded["actor_mean.weight"] = new_weight
+    new_bias = old_bias.new_zeros(target_act_dim)
+    new_bias[:old_act_dim] = old_bias
+    upgraded["actor_mean.bias"] = new_bias
+    if old_logstd is None:
+        new_logstd = old_weight.new_full((target_act_dim,), -0.5)
+    else:
+        old_logstd_flat = old_logstd.reshape(-1)
+        new_logstd = old_logstd_flat.new_full((target_act_dim,), -0.5)
+        limit = min(target_act_dim, old_logstd_flat.shape[0])
+        new_logstd[:limit] = old_logstd_flat[:limit]
+    upgraded["actor_log_std"] = new_logstd
+    upgraded.pop("actor_logstd", None)
+    return upgraded
 def train_brain(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -126,38 +250,40 @@ def train_brain(args):
             f.write(f"{key}: {value}\n")
     print(f"Saved configuration to: {config_path}")
 
-    def get_env_maker(log_dir_str, env_idx):
-        def _make_env_fn():
-            return MetaEnv(
-                env_id=args.env_id,
-                inner_cfg=inner_cfg,
-                decision_interval=args.decision_interval,
-                steps_per_regime=args.inner_steps_per_regime,
-                start_regime=0,
-                num_regimes=args.num_regimes,
-                reward_alpha=args.reward_alpha,
-                reward_beta=args.reward_beta,
-                reward_mode=args.reward_mode,
-                anneal_lr=False,  # Brain controls LR
-                intrinsic_coef=args.inner_intrinsic_coef,
-                imagined_horizon=args.inner_imagined_horizon,
-                wm_lr=args.inner_wm_lr,
-                inner_log_dir=log_dir_str,
-                env_index=env_idx,
-                episodic_memory_capacity=args.episodic_memory_capacity,
-                max_inner_lr=args.max_inner_lr,
-                min_inner_lr=args.min_inner_lr,
-                min_ent_coef=args.min_ent_coef,
-                max_ent_coef=args.max_ent_coef,
-                min_intrinsic_coef=args.min_intrinsic_coef,
-                max_intrinsic_coef=args.max_intrinsic_coef,
-                start_episode=start_episode,
-                disable_neuromodulation=args.disable_neuromodulation,
-            )
-        return _make_env_fn
+    env_fns = [
+        partial(
+            MetaEnv,
+            env_id=args.env_id,
+            inner_cfg=inner_cfg,
+            decision_interval=args.decision_interval,
+            steps_per_regime=args.inner_steps_per_regime,
+            start_regime=args.start_regime,
+            randomize_start_regime=args.randomize_start_regime,
+            num_regimes=args.num_regimes,
+            reward_alpha=args.reward_alpha,
+            reward_beta=args.reward_beta,
+            reward_mode=args.reward_mode,
+            anneal_lr=False,
+            intrinsic_coef=args.inner_intrinsic_coef,
+            imagined_horizon=args.inner_imagined_horizon,
+            wm_lr=args.inner_wm_lr,
+            inner_log_dir=logger.full_dir,
+            env_index=env_idx,
+            episodic_memory_capacity=args.episodic_memory_capacity,
+            max_inner_lr=args.max_inner_lr,
+            min_inner_lr=args.min_inner_lr,
+            min_ent_coef=args.min_ent_coef,
+            max_ent_coef=args.max_ent_coef,
+            min_intrinsic_coef=args.min_intrinsic_coef,
+            max_intrinsic_coef=args.max_intrinsic_coef,
+            start_episode=start_episode,
+            disable_neuromodulation=args.disable_neuromodulation,
+            runtime_cpu_threads=get_meta_env_runtime_cpu_threads(args.brain_vectorization),
+        )
+        for env_idx in range(args.brain_num_envs)
+    ]
 
-    # Note: SyncVectorEnv blocks on inner updates, running them sequentially but returning batched results
-    meta_env = gym.vector.SyncVectorEnv([get_env_maker(logger.full_dir, i) for i in range(args.brain_num_envs)])
+    meta_env = build_meta_vector_env(env_fns, args.brain_vectorization)
 
     # -----------------------------------------------------------------
     # Brain agent
@@ -174,18 +300,38 @@ def train_brain(args):
 
     if checkpoint:
         print("Restoring Brain model and optimizer weights...")
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            brain_model.load_state_dict(checkpoint["model_state_dict"])
-            if "optimizer_state_dict" in checkpoint:
-                brain_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            print(f"Resuming at episode {start_episode}")
-        else:
-            brain_model.load_state_dict(checkpoint)
-
+        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        old_act_dim = state_dict["actor_mean.weight"].shape[0] if "actor_mean.weight" in state_dict else brain_model.actor_mean.out_features
+        is_legacy_checkpoint = old_act_dim < brain_model.actor_mean.out_features or (
+            "actor_logstd" in state_dict and "actor_log_std" not in state_dict
+        )
+        if is_legacy_checkpoint:
+            print(
+                f"Detected legacy {old_act_dim}-dim Brain checkpoint. "
+                f"Padding to {brain_model.actor_mean.out_features} dims for resume."
+            )
+            state_dict = _upgrade_legacy_brain_state_dict(
+                state_dict,
+                brain_model.actor_mean.out_features,
+            )
+        brain_model.load_state_dict(state_dict)
+        if isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint:
+            if is_legacy_checkpoint:
+                print("Skipping optimizer state restore for legacy Brain checkpoint.")
+            else:
+                try:
+                    brain_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                except (ValueError, RuntimeError) as exc:
+                    print(f"Warning: failed to restore optimizer state: {exc}")
+        print(f"Resuming at episode {start_episode}")
     print(f"Training Brain on {device} for {brain_cfg.brain_episodes} RL episodes")
     print(f"  Inner: {args.inner_total_timesteps} timesteps, "
           f"regime switch every {args.inner_steps_per_regime} steps")
     print(f"  Parallel Envs: {args.brain_num_envs}")
+    print(f"  Brain vectorization: {args.brain_vectorization}")
+    worker_cpu_threads = get_meta_env_runtime_cpu_threads(args.brain_vectorization)
+    if worker_cpu_threads is not None:
+        print(f"  Async worker CPU threads: {worker_cpu_threads}")
     print(f"  Decision interval: {args.decision_interval} inner updates")
 
     # -----------------------------------------------------------------
@@ -204,7 +350,7 @@ def train_brain(args):
             # Since all vectorized inner envs step synchronously and have deterministic max steps,
             # they will all return True for done at the exact same time.
             while True:
-                # Observation shape: [num_envs, 15]
+                # Observation shape: [num_envs, 19]
                 # Index 1 is success_rate (from signals.py)
                 success_rates = obs[:, 1]
                 
@@ -265,20 +411,8 @@ def train_brain(args):
             ep_time = time.time() - ep_start
             print(f"Pretrain Episode {pre_ep}/{args.pretrain_episodes} | steps={steps} | time={ep_time:.1f}s | last_loss={loss.item():.4f}")
 
-            # Generate high-scale plots for pretrain episode
-            ep_data_dir = os.path.join(logger.full_dir, f"pretrain_{pre_ep}")
-            if os.path.isdir(ep_data_dir):
-                import subprocess, sys, glob as glob_mod
-                for env_folder in sorted(glob_mod.glob(os.path.join(ep_data_dir, "ep*_env*"))):
-                    if os.path.isdir(env_folder):
-                        try:
-                            print(f"  [plot] Generating charts for {os.path.basename(env_folder)}...")
-                            subprocess.Popen(
-                                [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            )
-                        except Exception as e:
-                            print(f"  [plot] Failed to launch high-scale plot for {env_folder}: {e}")
+            if args.generate_high_scale_plots:
+                launch_high_scale_plots(os.path.join(logger.full_dir, f"pretrain_{pre_ep}"))
 
     # -----------------------------------------------------------------
     # Training loop: RL
@@ -330,7 +464,7 @@ def train_brain(args):
             with torch.no_grad():
                 action, log_prob, entropy, value = brain_model.act(obs_t)
 
-            action_np = action.cpu().numpy() # Shape: [num_envs, 4]
+            action_np = action.cpu().numpy()  # Shape: [num_envs, 15]
             next_obs, rewards, terminations, truncations, infos = meta_env.step(action_np)
             
             # Track inner hyperparameter stats from envs
@@ -428,18 +562,35 @@ def train_brain(args):
         if episode_replay_ratios:
             logger.scalar("brain_hyperparams/mean_inner_replay_ratio", float(np.mean(episode_replay_ratios)), episode)
 
-        # Extract final inner training metrics from the first environment
+        # Preserve the legacy single-env metric for continuity, and add the per-episode mean across envs.
         final_info = infos.get("final_info", [{}])[0]
         if final_info and "inner_stats" in final_info:
             inner_stats = final_info["inner_stats"]
-            logger.scalar("brain/inner_final_success_rate", inner_stats.get("success_rate", 0.0), episode)
+            logger.scalar("brain/inner_final_success_rate", inner_stats.get("overall_success_rate", inner_stats.get("success_rate", 0.0)), episode)
+        episode_avg_success_rate = _extract_episode_average_success_rate(infos)
+        if episode_avg_success_rate is not None:
+            logger.scalar("brain/episode_avg_success_rate", episode_avg_success_rate, episode)
+        episode_summary = (
+            f"Episode {episode}/{brain_cfg.brain_episodes} | "
+            f"reward={mean_reward_across_envs:.4f} | avg10={avg_reward_10:.4f}"
+        )
+        if episode_avg_success_rate is not None:
+            episode_summary += f" | avg_success_rate={episode_avg_success_rate:.4f}"
+        episode_summary += f" | steps={steps} | time={ep_time:.1f}s"
+        print(episode_summary)
 
-        print(f"Episode {episode}/{brain_cfg.brain_episodes} | "
-              f"reward={mean_reward_across_envs:.4f} | avg10={avg_reward_10:.4f} | "
-              f"steps={steps} | time={ep_time:.1f}s")
+        save_episode_artifacts = should_run_periodic(
+            episode,
+            args.save_every_episodes,
+            final_episode=target_episodes,
+        )
+        plot_episode_artifacts = should_run_periodic(
+            episode,
+            args.plot_every_episodes,
+            final_episode=target_episodes,
+        )
 
-        # Save Brain checkpoint every episode
-        if True:
+        if save_episode_artifacts:
             ckpt_dir = os.path.join(logger.full_dir, f"episode_{episode}")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"brain_ep{episode}.pt")
@@ -453,26 +604,16 @@ def train_brain(args):
             }, ckpt_path)
             print(f"  [brain ckpt] {ckpt_path}")
 
-            # Live plotting for brain
+        refresh_brain_trends = should_refresh_brain_trends(
+            plot_episode_artifacts,
+            args.generate_high_scale_plots,
+        )
+        if refresh_brain_trends:
             plot_dir = os.path.join(logger.full_dir, "brain_trends")
             logger.plot(save_dir=plot_dir, title="Brain Overall Trends")
 
-            # Generate high-scale plots for each inner env's data from this episode
-            ep_prefix = "pretrain" if episode == 0 else "episode"
-            ep_data_dir = os.path.join(logger.full_dir, f"{ep_prefix}_{episode}")
-            
-            if os.path.isdir(ep_data_dir):
-                import subprocess, sys, glob as glob_mod
-                for env_folder in sorted(glob_mod.glob(os.path.join(ep_data_dir, "ep*_env*"))):
-                    if os.path.isdir(env_folder):
-                        try:
-                            print(f"  [plot] Generating charts for {os.path.basename(env_folder)}...")
-                            subprocess.Popen(
-                                [sys.executable, "scripts/plot_high_scale.py", "--folder", env_folder],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            )
-                        except Exception as e:
-                            print(f"  [plot] Failed to launch high-scale plot for {env_folder}: {e}")
+        if args.generate_high_scale_plots:
+            launch_high_scale_plots(os.path.join(logger.full_dir, f"episode_{episode}"))
               
     # Generate final overall Brain trend charts
     plot_dir = os.path.join(logger.full_dir, "brain_trends")
@@ -502,6 +643,10 @@ def main():
     p.add_argument("--inner_num_envs", type=int, default=8)
     p.add_argument("--inner_num_steps", type=int, default=128)
     p.add_argument("--num_regimes", type=int, default=2)
+    p.add_argument("--start_regime", type=int, default=0,
+                   help="Fixed starting regime for each inner run unless randomization is enabled")
+    p.add_argument("--randomize_start_regime", action="store_true",
+                   help="Sample a fresh starting regime on each MetaEnv reset")
     p.add_argument("--inner_steps_per_regime", type=int, default=296000)
     p.add_argument("--inner_mode", type=str, default="dyna", choices=["dyna", "passive"])
     p.add_argument("--inner_intrinsic_coef", type=float, default=0.015)
@@ -516,8 +661,10 @@ def main():
 
     # Brain meta-agent settings
     p.add_argument("--brain_num_envs", type=int, default=16, help="Number of parallel MetaEnvs run simultaneously")
+    p.add_argument("--brain_vectorization", type=str, default="async", choices=["async", "sync"],
+                   help="Outer Brain env batching mode; async uses subprocesses for real parallel inner runs")
     p.add_argument("--pretrain_episodes", type=int, default=5, help="Number of Imitation Learning pretrain episodes")
-    p.add_argument("--pretrain_mode", type=str, default="basic", choices=["basic", "recovery"],
+    p.add_argument("--pretrain_mode", type=str, default="recovery", choices=["basic", "recovery"],
                    help="Pretrain heuristic: 'basic' (binary explore/exploit) or 'recovery' (multi-tier, surprise-reactive)")
     p.add_argument("--brain_episodes", type=int, default=50)
     p.add_argument("--brain_lr", type=float, default=1e-4)
@@ -544,6 +691,12 @@ def main():
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--resume_path", type=str, default=None, help="Path to brain checkpoint.pt to resume from")
     p.add_argument("--new_run_dir", action="store_true", help="If resuming, create a new run folder instead of continuing in the same folder")
+    p.add_argument("--save_every_episodes", type=int, default=5,
+                   help="Write per-episode Brain checkpoints every N episodes; 0 keeps only the final episode checkpoint")
+    p.add_argument("--plot_every_episodes", type=int, default=5,
+                   help="Refresh aggregate Brain plots every N episodes; 0 plots only at the end")
+    p.add_argument("--generate_high_scale_plots", action="store_true",
+                   help="Spawn plot_high_scale.py for inner env logs after every pretrain and RL episode")
 
     args = p.parse_args()
     train_brain(args)
@@ -551,3 +704,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+

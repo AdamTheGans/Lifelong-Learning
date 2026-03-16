@@ -4,7 +4,7 @@ import numpy as np
 
 # Import our custom components
 from lifelong_learning.agents.ppo.sequence_memory_buffer import SequenceMemoryBuffer, DiagnosticValidationBuffer
-from lifelong_learning.agents.ppo.recurrent_world_model import RecurrentWorldModel
+from lifelong_learning.agents.ppo.recurrent_world_model import TransformerWorldModel
 from lifelong_learning.agents.ppo.context_aware_network import ContextAwarePPONetwork
 
 class MetaRLTrainer:
@@ -17,7 +17,7 @@ class MetaRLTrainer:
     def __init__(
         self, 
         ppo_net: ContextAwarePPONetwork, 
-        world_model: RecurrentWorldModel,
+        world_model: TransformerWorldModel,
         memory_buffer: SequenceMemoryBuffer,
         ppo_optimizer: torch.optim.Optimizer,
         wm_optimizer: torch.optim.Optimizer,
@@ -143,27 +143,59 @@ class MetaRLTrainer:
         # 1. Initialize or persist environment states across iterations
         if not hasattr(self, 'current_obs') or self.current_obs is None:
             self.current_obs = env.reset()
-            self.current_h_t = torch.zeros(1, B, self.world_model.gru.hidden_size, device=device)
+            self.current_prev_act = torch.full((B,), self.world_model.n_actions, dtype=torch.long, device=device) # Dummy action
             self.current_prev_rew = torch.zeros(B, device=device)
+            self.current_prev_don = torch.zeros(B, dtype=torch.bool, device=device)
+            
+            # Initialize rolling windows for Transformer
+            self.window_obs = torch.zeros((B, seq_len, *self.ppo_net.obs_shape), device=device)
+            self.window_act = torch.full((B, seq_len), self.world_model.n_actions, dtype=torch.long, device=device)
+            self.window_rew = torch.zeros((B, seq_len), device=device)
+            self.window_don = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+            self.window_valid = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
+            
+            # Initial context (just zeros before first step)
+            self.current_h_t = torch.zeros(B, self.world_model.hidden_dim, device=device)
             
         obs = self.current_obs
-        h_t = self.current_h_t
+        prev_act = self.current_prev_act
         prev_rew = self.current_prev_rew
+        prev_don = self.current_prev_don
+        h_t = self.current_h_t
         
         for t in range(S):
             self.global_step += B
             
-            # 2. Action Selection
+            # Shift rolling windows left
+            self.window_obs = torch.roll(self.window_obs, shifts=-1, dims=1)
+            self.window_act = torch.roll(self.window_act, shifts=-1, dims=1)
+            self.window_rew = torch.roll(self.window_rew, shifts=-1, dims=1)
+            self.window_don = torch.roll(self.window_don, shifts=-1, dims=1)
+            self.window_valid = torch.roll(self.window_valid, shifts=-1, dims=1)
+            
+            # Insert current step at the end (index 29)
+            self.window_obs[:, -1] = obs
+            self.window_act[:, -1] = prev_act
+            self.window_rew[:, -1] = prev_rew
+            self.window_don[:, -1] = prev_don
+            self.window_valid[:, -1] = True
+            
+            # 2. World Model Step (Live Context Extraction)
             with torch.no_grad():
-                action, logprob, _, value = self.ppo_net.get_action_and_value(obs, h_t.squeeze(0))
+                # padding_mask expects True for values that should be IGNORED
+                padding_mask = ~self.window_valid
+                next_obs_pred, rew_pred, h_t_seq = self.world_model.step(
+                    self.window_obs, self.window_act, self.window_rew, self.window_don, padding_mask
+                )
+                h_t = h_t_seq[:, -1, :] # Extract the context for the current step [B, 256]
                 
-            # 3. Environment Step
+            # 3. Action Selection
+            with torch.no_grad():
+                action, logprob, _, value = self.ppo_net.get_action_and_value(obs, h_t)
+                
+            # 4. Environment Step
             next_obs, reward, done = env.step(action)
             
-            # 4. World Model Step (Live)
-            with torch.no_grad():
-                next_obs_pred, rew_pred, new_h_t = self.world_model.step(obs, action, prev_rew, h_t)
-                
             # 5. Store practically everything
             obs_buf[:, t] = obs
             act_buf[:, t] = action
@@ -171,28 +203,29 @@ class MetaRLTrainer:
             rew_buf[:, t] = reward
             don_buf[:, t] = done
             val_buf[:, t] = value
-            ctx_buf[:, t] = h_t.squeeze(0).detach() # Store the exact h_t used to make the decision (detached for safe buffer storage)
+            ctx_buf[:, t] = h_t.detach() # Store the exact h_t used to make the decision
             
-            # 6. Episode Resets (Boundary Masking on Memory)
-            # If done == True, zero out the GRU state for that specific environment
-            prev_rew = reward.clone() # update for next step
+            # 6. Episode Resets
+            prev_act = action.clone()
+            prev_rew = reward.clone()
+            prev_don = done.clone()
+            
             for i in range(B):
                 if done[i]:
-                    # TEMPORARILY DISABLED: Do not reset hidden context vector
-                    # new_h_t[:, i, :] = 0.0
                     prev_rew[i] = 0.0 # next step is a new episode, so prev_reward is 0
                     
-            h_t = new_h_t
             obs = next_obs
             
         # 7. Persist for the next iteration
         self.current_obs = obs
-        self.current_h_t = h_t
+        self.current_prev_act = prev_act
         self.current_prev_rew = prev_rew
+        self.current_prev_don = prev_don
+        self.current_h_t = h_t
             
         # Bootstrap value for GAE
         with torch.no_grad():
-            _, _, _, next_value = self.ppo_net.get_action_and_value(obs, h_t.squeeze(0))
+            _, _, _, next_value = self.ppo_net.get_action_and_value(obs, h_t)
             returns, advantages = self.calculate_returns_and_advantages(
                 rew_buf, val_buf, don_buf, next_value, self.cfg['gamma'], self.cfg['gae_lambda']
             )
@@ -222,10 +255,11 @@ class MetaRLTrainer:
                 else:
                     chunk_next_obs = torch.cat([obs_buf[:, start_idx+1:end_idx], obs.unsqueeze(1)], dim=1)
                 
-                # Extract h_0 for this chunk (shape: [1, B, 256])
-                chunk_h0 = chunk_ctx[:, 0, :].unsqueeze(0).contiguous()
+                # We don't need h_0 anymore. We pass dones and a padding mask (all False since chunks are full 30 steps)
+                chunk_don = don_buf[:, start_idx:end_idx]
+                padding_mask = torch.zeros((B, seq_len), dtype=torch.bool, device=device)
                 
-                next_state_preds, next_reward_preds = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew, h_0=chunk_h0)
+                next_state_preds, next_reward_preds, _ = self.world_model.forward_sequence(chunk_obs, chunk_act, chunk_rew, chunk_don, padding_mask)
                 
                 # Simplified surprise: MSE of the state logits (or CrossEntropy proxy depending on shape)
                 # target class indices
@@ -327,7 +361,6 @@ class MetaRLTrainer:
         # 1. Gather Current Live Buffer Chunks
         live_batch_obs, live_batch_act, live_batch_rew = [], [], []
         live_batch_next_obs, live_batch_don = [], []
-        live_batch_h0 = []
         
         for _ in range(live_batch_size):
             env_idx = np.random.randint(0, B)
@@ -339,7 +372,6 @@ class MetaRLTrainer:
             live_batch_rew.append(rew_buf[env_idx, start_idx:end_idx])
             live_batch_next_obs.append(obs_buf[env_idx, start_idx+1:end_idx+1])
             live_batch_don.append(don_buf[env_idx, start_idx:end_idx])
-            live_batch_h0.append(ctx_buf[env_idx, start_idx].detach())
                 
         # 2. Mix with Stratified Buffer Chunks
         if use_buffer:
@@ -350,10 +382,6 @@ class MetaRLTrainer:
             mixed_rew  = torch.cat([ltm_batch['reward'].to(device), torch.stack(live_batch_rew)], dim=0)
             mixed_next = torch.cat([ltm_batch['next_state'].to(device), torch.stack(live_batch_next_obs)], dim=0)
             mixed_don  = torch.cat([ltm_batch['done'].to(device).float(),   torch.stack(live_batch_don).float()], dim=0)
-            
-            # Extract h_0 from ltm_batch (which has h_t of shape [buffer_batch_size, seq_len, 256])
-            ltm_h0 = ltm_batch['h_t'][:, 0, :].to(device) # [buffer_batch_size, 256]
-            mixed_h0 = torch.cat([ltm_h0, torch.stack(live_batch_h0)], dim=0).unsqueeze(0).contiguous() # [1, batch_size, 256]
         else:
             # 100% Live batch
             mixed_obs  = torch.stack(live_batch_obs)
@@ -361,12 +389,12 @@ class MetaRLTrainer:
             mixed_rew  = torch.stack(live_batch_rew)
             mixed_next = torch.stack(live_batch_next_obs)
             mixed_don  = torch.stack(live_batch_don).float()
-            mixed_h0   = torch.stack(live_batch_h0).unsqueeze(0).contiguous() # [1, batch_size, 256]
             
         # 3. Diagnostic: compute loss on live vs memory separately (no grad) when in mixed mode
         loss_live_val = loss_memory_val = None
         if use_buffer:
             with torch.no_grad():
+                padding_mask_live = torch.zeros((live_batch_size, seq_len), dtype=torch.bool, device=device)
                 _, loss_live_s, loss_live_r = self.world_model.compute_loss_detailed(
                     states=torch.stack(live_batch_obs),
                     actions=torch.stack(live_batch_act),
@@ -374,9 +402,11 @@ class MetaRLTrainer:
                     next_states=torch.stack(live_batch_next_obs),
                     target_rewards=torch.stack(live_batch_rew),
                     dones=torch.stack(live_batch_don).float(),
-                    h_0=torch.stack(live_batch_h0).unsqueeze(0).contiguous()
+                    padding_mask=padding_mask_live
                 )
                 loss_live_val = (loss_live_s + loss_live_r).item()
+                
+                padding_mask_mem = torch.zeros((buffer_batch_size, seq_len), dtype=torch.bool, device=device)
                 _, loss_mem_s, loss_mem_r = self.world_model.compute_loss_detailed(
                     states=ltm_batch['state'].to(device),
                     actions=ltm_batch['action'].to(device),
@@ -384,12 +414,13 @@ class MetaRLTrainer:
                     next_states=ltm_batch['next_state'].to(device),
                     target_rewards=ltm_batch['reward'].to(device),
                     dones=ltm_batch['done'].to(device).float(),
-                    h_0=ltm_batch['h_t'][:, 0, :].to(device).unsqueeze(0).contiguous()
+                    padding_mask=padding_mask_mem
                 )
                 loss_memory_val = (loss_mem_s + loss_mem_r).item()
         
         # 4. Standard Supervised Training Step
         wm_stats = []
+        padding_mask_mixed = torch.zeros((mixed_obs.shape[0], seq_len), dtype=torch.bool, device=device)
         for _ in range(self.cfg['wm_epochs']):
             # Full batched sequence evaluation
             loss, loss_state, loss_reward = self.world_model.compute_loss_detailed(
@@ -399,7 +430,7 @@ class MetaRLTrainer:
                 next_states=mixed_next,
                 target_rewards=mixed_rew, # target is r_t, forward_sequence shifts 'rewards' to r_{t-1} internally
                 dones=mixed_don,
-                h_0=mixed_h0
+                padding_mask=padding_mask_mixed
             )
             
             self.wm_optimizer.zero_grad(set_to_none=True)
@@ -419,6 +450,7 @@ class MetaRLTrainer:
         if val_batches:
             with torch.no_grad():
                 for category_name, batch in val_batches.items():
+                    padding_mask_val = torch.zeros((batch['state'].shape[0], seq_len), dtype=torch.bool, device=device)
                     _, loss_s, loss_r = self.world_model.compute_loss_detailed(
                         states=batch['state'].to(device),
                         actions=batch['action'].to(device),
@@ -426,7 +458,7 @@ class MetaRLTrainer:
                         next_states=batch['next_state'].to(device),
                         target_rewards=batch['reward'].to(device),
                         dones=batch['done'].to(device).float(),
-                        h_0=batch['h_t'][:, 0, :].to(device).unsqueeze(0).contiguous()
+                        padding_mask=padding_mask_val
                     )
                     val_stats[f"val_loss/{category_name}_state"] = loss_s.item()
                     val_stats[f"val_loss/{category_name}_reward"] = loss_r.item()
@@ -545,7 +577,7 @@ if __name__ == "__main__":
     }
     
     ppo_net = ContextAwarePPONetwork().to(device)
-    wm = RecurrentWorldModel().to(device)
+    wm = TransformerWorldModel().to(device)
     buffer = SequenceMemoryBuffer(max_capacity=100)
     
     ppo_opt = torch.optim.Adam(ppo_net.parameters(), lr=3e-4)

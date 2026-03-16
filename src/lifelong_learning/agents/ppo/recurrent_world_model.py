@@ -3,21 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-class RecurrentWorldModel(nn.Module):
+class TransformerWorldModel(nn.Module):
     """
-    Recurrent World Model for predicting environments with regime shifts.
+    In-Context Causal Transformer World Model for predicting environments with regime shifts.
     
     Architecture:
-        - CNN Extractor: Processes (C, H, W) One-Hot grids into a 4096-D flat vector.
-        - Action Embedding: Extends discrete actions into a 32-D space.
-        - GRU Core: Unrolls sequences of (CNN + Action + Reward) to track context over time.
-        - Output Heads: Predicts next state logits and next reward scalar from the GRU states.
+        - CNN Extractor: Processes (C, H, W) One-Hot grids into a 4096-D flat vector, projected to d_model.
+        - Action/Reward/Done Embeddings: Extends discrete actions, scalar rewards, and boolean dones into d_model.
+        - Transformer Core: Unrolls sequences of (CNN + Action + Reward + Done) to track context over time.
+        - Output Heads: Predicts next state logits and next reward scalar from the Transformer states.
     """
-    def __init__(self, obs_shape: tuple[int, int, int] = (21, 8, 8), n_actions: int = 3, hidden_dim: int = 256):
+    def __init__(self, obs_shape: tuple[int, int, int] = (21, 8, 8), n_actions: int = 3, hidden_dim: int = 256, max_seq_len: int = 30):
         super().__init__()
         self.obs_shape = obs_shape
         self.c, self.h, self.w = obs_shape
         self.n_actions = n_actions
+        self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
         self.flat_obs_dim = self.c * self.h * self.w
         
         # Borrowed CNN architecture from SimpleWorldModel
@@ -38,17 +40,30 @@ class RecurrentWorldModel(nn.Module):
             
         # Project CNN features to a compact latent space
         self.cnn_proj = nn.Sequential(
-            nn.Linear(self.cnn_out_dim, 256),
+            nn.Linear(self.cnn_out_dim, hidden_dim),
             nn.ReLU()
         )
         
-        # Input size to GRU: CNN Proj (256) + Action One-Hot (n_actions) + Reward (1)
-        self.gru_input_dim = 256 + n_actions + 1
+        # Embeddings for previous action, reward, and done
+        # We add 1 to n_actions for a dummy/padding action if needed, but we can just use 0 as dummy since it's an embedding
+        self.act_emb = nn.Embedding(n_actions + 1, hidden_dim) # +1 for dummy action at t=0
+        self.rew_emb = nn.Linear(1, hidden_dim)
+        self.don_emb = nn.Embedding(2, hidden_dim) # 0 or 1
         
-        # GRU Core
-        self.gru = nn.GRU(input_size=self.gru_input_dim, hidden_size=hidden_dim, batch_first=True)
+        # Positional Encoding
+        self.pos_emb = nn.Embedding(max_seq_len, hidden_dim)
         
-        # Output Heads (from 256-D GRU output)
+        # Transformer Core
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=8, 
+            dim_feedforward=hidden_dim * 4, 
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2, enable_nested_tensor=False)
+        
+        # Output Heads
         self.next_state_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -77,19 +92,21 @@ class RecurrentWorldModel(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.1)
 
-    def forward_sequence(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, h_0: torch.Tensor = None):
+    def forward_sequence(self, states: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, dones: torch.Tensor, padding_mask: torch.Tensor = None):
         """
-        Unrolls the GRU over an entire sequence of transitions for training.
+        Unrolls the Transformer over an entire sequence of transitions for training.
         
         Args:
             states:  [B, S, C, H, W] tensor of observations
             actions: [B, S] tensor of actions
             rewards: [B, S] tensor of rewards
-            h_0:     [1, B, 256] optional initial hidden state
+            dones:   [B, S] tensor of dones
+            padding_mask: [B, S] boolean tensor, True where padded (ignored)
             
         Returns:
             next_state_preds:  [B, S, C, H, W] predicted logits
             next_reward_preds: [B, S] predicted rewards
+            out:               [B, S, hidden_dim] contextual embeddings
         """
         B, S, C, H, W = states.shape
         
@@ -97,159 +114,134 @@ class RecurrentWorldModel(nn.Module):
         states_flat = states.contiguous().view(B * S, C, H, W)
         cnn_features = self.cnn(states_flat)              # [B*S, 4096]
         cnn_features = self.cnn_proj(cnn_features)        # [B*S, 256]
-        cnn_features = cnn_features.view(B, S, -1)        # [B, S, 256]
+        cnn_features = cnn_features.view(B, S, self.hidden_dim) # [B, S, 256]
         
-        # Use one-hot encoded actions instead of embeddings
-        act_one_hot = F.one_hot(actions, num_classes=self.n_actions).float() # [B, S, n_actions]
+        # CRITICAL FIX: The model must not see a_t, r_t, d_t when predicting step t.
+        # We shift them to be a_{t-1}, r_{t-1}, d_{t-1}, padding the first step with dummies.
+        # We use n_actions as the dummy action index.
+        dummy_actions = torch.full((B, 1), self.n_actions, dtype=torch.long, device=actions.device)
+        prev_actions = torch.cat([dummy_actions, actions[:, :-1]], dim=1)
         
-        # CRITICAL FIX: The model must not see r_t when predicting r_t.
-        # We shift the rewards to be r_{t-1}, padding the first step with 0.
         prev_rewards = torch.cat([torch.zeros(B, 1, device=rewards.device), rewards[:, :-1]], dim=1)
-        rew_emb = prev_rewards.unsqueeze(-1)              # [B, S, 1]
+        prev_dones = torch.cat([torch.zeros(B, 1, dtype=torch.long, device=dones.device), dones[:, :-1].long()], dim=1)
         
-        # Concatenate features 
-        rnn_input = torch.cat([cnn_features, act_one_hot, rew_emb], dim=-1) # [B, S, 256 + n_actions + 1]
+        act_feat = self.act_emb(prev_actions)
+        rew_feat = self.rew_emb(prev_rewards.unsqueeze(-1))
+        don_feat = self.don_emb(prev_dones)
         
-        # --- DIAGNOSTIC 1: GRU INITIALIZATION ---
-        if np.random.rand() < 0.005:  # Print ~0.5% of the time to avoid massive spam
-            print(f"\n[DIAGNOSTIC 1] GRU forward_sequence called. rnn_input shape: {rnn_input.shape}")
-            if h_0 is None:
-                print("[DIAGNOSTIC 1] Origin of h_0: NOT PROVIDED (Defaults to ZEROS by PyTorch).")
-            else:
-                print(f"[DIAGNOSTIC 1] Origin of h_0: PROVIDED. Shape: {h_0.shape}")
+        # Combine features
+        tokens = cnn_features + act_feat + rew_feat + don_feat
         
-        # Unroll GRU
-        gru_out, _ = self.gru(rnn_input, h_0)                  # [B, S, 256]
+        # Positional Encoding
+        positions = torch.arange(S, device=states.device).unsqueeze(0).expand(B, S)
+        pos_feat = self.pos_emb(positions)
+        
+        tokens = tokens + pos_feat
+        
+        # Causal Mask
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(S, device=states.device, dtype=torch.bool)
+        
+        # Transformer
+        out = self.transformer(
+            src=tokens,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask,
+            is_causal=True
+        ) # [B, S, 256]
         
         # Flatten again for independent step-wise predictions
-        gru_out_flat = gru_out.contiguous().view(B * S, -1)
+        out_flat = out.contiguous().view(B * S, -1)
         
         # Heads
-        next_states_flat = self.next_state_head(gru_out_flat) # [B*S, C*H*W]
+        next_states_flat = self.next_state_head(out_flat) # [B*S, C*H*W]
         next_state_preds = next_states_flat.view(B, S, C, H, W)
         
-        next_rewards_flat = self.next_reward_head(gru_out_flat) # [B*S, num_bins]
+        next_rewards_flat = self.next_reward_head(out_flat) # [B*S, num_bins]
         next_reward_preds = next_rewards_flat.view(B, S, self.num_reward_bins) # Return logits
         
-        return next_state_preds, next_reward_preds
+        return next_state_preds, next_reward_preds, out
 
-    def step(self, state: torch.Tensor, action: torch.Tensor, prev_reward: torch.Tensor, hidden_state: torch.Tensor):
+    def step(self, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, padding_mask: torch.Tensor):
         """
-        Live PPO Inference stepping.
+        Live PPO Inference stepping using a rolling window.
         
         Args:
-            state:        [B, C, H, W]
-            action:       [B]
-            prev_reward:  [B] (The reward from the previous step)
-            hidden_state: [1, B, 256] GRU recurrent state
+            states_window:  [B, S, C, H, W]
+            actions_window: [B, S] (These are PREVIOUS actions, already shifted by the rolling window)
+            rewards_window: [B, S] (PREVIOUS rewards)
+            dones_window:   [B, S] (PREVIOUS dones)
+            padding_mask:   [B, S] boolean tensor, True where padded (ignored)
             
         Returns:
             next_state_pred:  [B, C, H, W]
             next_reward_pred: [B]
-            new_hidden_state: [1, B, 256] GRU recurrent state
+            context_seq:      [B, S, 256] full sequence of contexts
         """
-        # Process inputs
-        cnn_feat = self.cnn(state)                           # [B, 4096]
-        cnn_feat = self.cnn_proj(cnn_feat)                   # [B, 256]
-        act_one_hot = F.one_hot(action, num_classes=self.n_actions).float() # [B, n_actions]
-        rew_emb = prev_reward.unsqueeze(-1)                  # [B, 1]
+        B, S, C, H, W = states_window.shape
         
-        # Add sequence dimension of size 1
-        rnn_input = torch.cat([cnn_feat, act_one_hot, rew_emb], dim=-1).unsqueeze(1) # [B, 1, 256 + n_actions + 1]
+        # Embeddings
+        states_flat = states_window.contiguous().view(B * S, C, H, W)
+        cnn_feat = self.cnn(states_flat)
+        cnn_feat = self.cnn_proj(cnn_feat).view(B, S, self.hidden_dim)
         
-        gru_out, new_hidden_state = self.gru(rnn_input, hidden_state) # gru_out: [B, 1, 256]
+        act_feat = self.act_emb(actions_window)
+        rew_feat = self.rew_emb(rewards_window.unsqueeze(-1))
+        don_feat = self.don_emb(dones_window.long())
         
-        # Remove sequence dimension for heads
-        gru_out_squeeze = gru_out.squeeze(1)                 # [B, 256]
+        # Combine
+        tokens = cnn_feat + act_feat + rew_feat + don_feat
         
-        # Forward through heads
-        next_state_pred = self.next_state_head(gru_out_squeeze).view(-1, self.c, self.h, self.w)
+        # Positional Encoding
+        positions = torch.arange(S, device=states_window.device).unsqueeze(0).expand(B, S)
+        pos_feat = self.pos_emb(positions)
         
-        # Categorical inference: Expected value
-        next_reward_logits = self.next_reward_head(gru_out_squeeze) # [B, num_bins]
-        next_reward_probs = F.softmax(next_reward_logits, dim=-1) # [B, num_bins]
-        next_reward_pred = (next_reward_probs * self.reward_bins).sum(dim=-1) # [B]
+        tokens = tokens + pos_feat
         
-        return next_state_pred, next_reward_pred, new_hidden_state
+        # Causal Mask
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(S, device=states_window.device, dtype=torch.bool)
+        
+        out = self.transformer(
+            src=tokens,
+            mask=causal_mask,
+            src_key_padding_mask=padding_mask,
+            is_causal=True
+        ) # [B, S, hidden_dim]
+        
+        # We only need the predictions for the last step
+        last_out = out[:, -1, :] # [B, hidden_dim]
+        
+        next_state_pred = self.next_state_head(last_out).view(-1, self.c, self.h, self.w)
+        
+        next_reward_logits = self.next_reward_head(last_out)
+        next_reward_probs = F.softmax(next_reward_logits, dim=-1)
+        next_reward_pred = (next_reward_probs * self.reward_bins).sum(dim=-1)
+        
+        return next_state_pred, next_reward_pred, out
+
+    def autoregressive_dream_step(self, states_window, actions_window, rewards_window, dones_window, padding_mask):
+        """
+        Scaffold for dreaming. In the future, this will take the window, predict the next state/reward,
+        and the caller will append the prediction to the window for the next step.
+        """
+        return self.step(states_window, actions_window, rewards_window, dones_window, padding_mask)
 
     def generate_dream_trajectories(self, policy_net, start_states: torch.Tensor, start_h_t: torch.Tensor, horizon: int) -> list[dict]:
         """
-        Generates simulated trajectories using the World Model for PPO Generative Replay.
-        
-        Args:
-            policy_net: Main ContextAwarePPONetwork
-            start_states: [B, C, H, W] initial discrete grid states (seeded from buffer)
-            start_h_t: [1, B, 256] initial GRU hidden contexts (seeded from buffer)
-            horizon: Number of steps to roll forward
-            
-        Returns:
-            List of dictionaries containing transition data for the imagined trajectory.
+        Temporarily disabled or requires refactoring to use rolling windows.
         """
-        trajectories = []
-        curr_state = start_states
-        curr_h_t = start_h_t
-        
-        # In a dream, we start with a dummy previous reward of 0
-        curr_prev_reward = torch.zeros(start_states.shape[0], dtype=torch.float32, device=start_states.device)
-        
-        for _ in range(horizon):
-            with torch.no_grad():
-                # 1. PPO decides action based on current state & WM context badge
-                action, logprob, entropy, value = policy_net.get_action_and_value(curr_state, curr_h_t.squeeze(0))
-                
-                # 2. WM predicts next frame and next reward
-                next_state_logits, next_reward_pred, next_h_t = self.step(curr_state, action, curr_prev_reward, curr_h_t)
-                
-                # 3. Strict Discretization (Guardrail against compounding blurriness)
-                # Argument max over channel dim C, then re-encode into One-Hot float tensor
-                max_indices = torch.argmax(next_state_logits, dim=1)           # [B, H, W]
-                one_hot = torch.nn.functional.one_hot(max_indices, num_classes=self.c)  # [B, H, W, C]
-                next_state_discrete = one_hot.permute(0, 3, 1, 2).float()      # [B, C, H, W]
-                
-                # Assume dreams don't terminate early to keep batch dimensions clean
-                dones = torch.zeros_like(action, dtype=torch.float32)
-                
-                # 5. Store imagined transition
-                trajectories.append({
-                    "state": curr_state,
-                    "action": action,
-                    "logprob": logprob,
-                    "reward": next_reward_pred,
-                    "done": dones,
-                    "value": value,
-                    "next_state": next_state_discrete,
-                    "h_t": curr_h_t.squeeze(0) # Store context used to make decision
-                })
-                
-                curr_state = next_state_discrete
-                curr_h_t = next_h_t
-                curr_prev_reward = next_reward_pred # The predicted reward becomes the prev_reward for the next step
-                
-        return trajectories
+        raise NotImplementedError("Dreaming with Transformer requires rolling window refactoring.")
 
-    def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones, h_0=None):
+    def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones, padding_mask=None):
         """Standard loss wrapper"""
-        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, target_rewards, dones, h_0)
+        loss, _, _ = self.compute_loss_detailed(states, actions, rewards, next_states, target_rewards, dones, padding_mask)
         return loss
 
-    def compute_loss_detailed(self, states, actions, rewards, next_states, target_rewards, dones, h_0=None):
+    def compute_loss_detailed(self, states, actions, rewards, next_states, target_rewards, dones, padding_mask=None):
         """
         Calculates loss handling randomized episode bounds masking, returning detailed components.
-        
-        Args:
-            states:         [B, S, C, H, W]
-            actions:        [B, S]
-            rewards:        [B, S] (shifted to r_{t-1} internally)
-            next_states:    [B, S, C, H, W] real next states 
-            target_rewards: [B, S] real target rewards (r_t)
-            dones:          [B, S] 0 or 1 done flags
-            h_0:            [1, B, 256] optional initial hidden state
-            
-        Returns:
-            Mean total loss, Mean state loss, Mean reward loss
         """
         # 1. Forward pass
-        next_state_preds, next_reward_preds = self.forward_sequence(states, actions, rewards, h_0)
+        next_state_preds, next_reward_preds, _ = self.forward_sequence(states, actions, rewards, dones, padding_mask)
         
         # --- DIAGNOSTIC 2: SEQUENCE ALIGNMENT ---
         if np.random.rand() < 0.005:
@@ -313,6 +305,9 @@ class RecurrentWorldModel(nn.Module):
         # If dones[:, t-1] is true, the sequence crossed an episode boundary, so step t is invalid.
         valid_mask = torch.cat([torch.ones(B, 1, device=dones.device), 1.0 - dones[:, :-1].float()], dim=1) # [B, S]
         
+        if padding_mask is not None:
+            valid_mask = valid_mask * (~padding_mask).float()
+        
         # We also mask the state loss for the step where dones[:, t] is true, because next_state is a random reset.
         state_mask = valid_mask * (1.0 - dones.float())
         
@@ -320,8 +315,13 @@ class RecurrentWorldModel(nn.Module):
         reward_mask = valid_mask
         
         # Dynamic Loss Balancing for Rewards
-        num_non_terminal = (dones == 0.0).sum()
-        num_terminal = (dones == 1.0).sum().clamp(min=1.0)
+        if padding_mask is not None:
+            valid_dones = dones[~padding_mask]
+        else:
+            valid_dones = dones
+            
+        num_non_terminal = (valid_dones == 0.0).sum()
+        num_terminal = (valid_dones == 1.0).sum().clamp(min=1.0)
         dynamic_weight = num_non_terminal / num_terminal
         
         # We want to value predicting terminal rewards 20x higher than other steps
@@ -340,10 +340,10 @@ class RecurrentWorldModel(nn.Module):
 
 
 if __name__ == "__main__":
-    print("--- Testing RecurrentWorldModel Component ---")
+    print("--- Testing TransformerWorldModel Component ---")
     
     # Instantiate the model
-    model = RecurrentWorldModel()
+    model = TransformerWorldModel()
     
     # 1. Dummy batch dimensions mimicking SequenceMemoryBuffer sample space
     B, S, C, H, W = 64, 30, 21, 8, 8
@@ -360,36 +360,38 @@ if __name__ == "__main__":
     next_states[:, :, 1, :, :] = 1.0
     target_rewards = torch.randn((B, S))
     dones = torch.randint(0, 2, (B, S)).float()
+    padding_mask = torch.zeros((B, S), dtype=torch.bool)
     
     # 2. Verify sequence shapes 
     print("Evaluating forward_sequence processing...")
-    s_preds, r_preds = model.forward_sequence(states, actions, rewards)
+    s_preds, r_preds, out = model.forward_sequence(states, actions, rewards, dones, padding_mask)
     assert list(s_preds.shape) == [B, S, C, H, W]
     assert list(r_preds.shape) == [B, S, model.num_reward_bins]
+    assert list(out.shape) == [B, S, 256]
     print("  -> forward_sequence shapes match specifications.")
 
     # 3. Verify singular stepwise inference shapes
     print("Evaluating PPO live step integration processing...")
-    # Initialize zero hidden batch
-    h0 = torch.zeros(1, B, 256)
-    prev_r = torch.zeros(B)
+    # Initialize rolling windows
+    states_window = torch.zeros((B, S, C, H, W))
+    actions_window = torch.zeros((B, S), dtype=torch.long)
+    rewards_window = torch.zeros((B, S))
+    dones_window = torch.zeros((B, S), dtype=torch.long)
     
-    s_pred_live, r_pred_live, h1 = model.step(states[:, 0], actions[:, 0], prev_r, h0)
+    s_pred_live, r_pred_live, out_live = model.step(states_window, actions_window, rewards_window, dones_window, padding_mask)
     assert list(s_pred_live.shape) == [B, C, H, W]
     assert list(r_pred_live.shape) == [B]
-    assert list(h1.shape) == [1, B, 256]
+    assert list(out_live.shape) == [B, S, 256]
     print("  -> live step mechanism shapes match specifications.")
     
     # 4. Calculate Loss & Masking Validation
     print("Computing Loss and running backpropagation...")
-    loss = model.compute_loss(states, actions, rewards, next_states, target_rewards, dones)
+    loss = model.compute_loss(states, actions, rewards, next_states, target_rewards, dones, padding_mask)
     
     loss.backward()
     
     # 5. Gradient Assertions
-    assert model.gru.weight_ih_l0.grad is not None, "GRU input-hidden weights did not receive gradients."
-    assert model.gru.weight_hh_l0.grad is not None, "GRU hidden-hidden weights did not receive gradients."
     assert model.cnn[0].weight.grad is not None, "CNN extractor layer 0 did not receive gradients."
     assert model.next_state_head[0].weight.grad is not None, "MLP Output head did not receive gradients."
     
-    print("\nVerification Successful: Gradients successfully backpropagated through sequential GRU back into the CNN Extractor!")
+    print("\nVerification Successful: Gradients successfully backpropagated through sequential Transformer back into the CNN Extractor!")

@@ -85,10 +85,10 @@ class ContextAwarePPONetwork(nn.Module):
         
         Args:
             state:      (B, 21, 8, 8) Tensor of exact visual grids
-            context_ht: (B, 256) Internal GRU historical summary from WM
+            context_ht: (B, 256) Internal Transformer historical summary from WM
         """
         # --- THE BULLETPROOF VEST (STOP-GRADIENT) ---
-        # Critical rule: PPO must NEVER backpropagate into the world model's GRU. 
+        # Critical rule: PPO must NEVER backpropagate into the world model's Transformer. 
         # The world model solely exists for system identification, not reward hacking.
         context_ht = context_ht.detach()
         # --------------------------------------------

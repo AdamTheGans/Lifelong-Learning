@@ -15,7 +15,7 @@ import gymnasium as gym
 
 from lifelong_learning.agents.ppo.ppo import PPOConfig
 from lifelong_learning.agents.ppo.sequence_memory_buffer import SequenceMemoryBuffer
-from lifelong_learning.agents.ppo.recurrent_world_model import RecurrentWorldModel
+from lifelong_learning.agents.ppo.recurrent_world_model import TransformerWorldModel
 from lifelong_learning.agents.ppo.context_aware_network import ContextAwarePPONetwork
 from lifelong_learning.agents.ppo.meta_rl_trainer import MetaRLTrainer
 from lifelong_learning.envs.make_env import make_env
@@ -104,7 +104,7 @@ def main():
 
     # Use default dimensions (21, 8, 8), 256-D context, 3 actions
     ppo_net = ContextAwarePPONetwork(obs_shape=obs_shape, context_dim=256, n_actions=n_actions).to(device)
-    wm = RecurrentWorldModel(obs_shape=obs_shape, hidden_dim=256, n_actions=n_actions).to(device)
+    wm = TransformerWorldModel(obs_shape=obs_shape, hidden_dim=256, n_actions=n_actions).to(device)
     buffer = SequenceMemoryBuffer(max_capacity=12000, seq_len=30)
     
     ppo_opt = torch.optim.Adam(ppo_net.parameters(), lr=args.ppo_lr, eps=1e-5)

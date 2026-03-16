@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 
 # Import our custom components
-from lifelong_learning.agents.ppo.sequence_memory_buffer import SequenceMemoryBuffer
+from lifelong_learning.agents.ppo.sequence_memory_buffer import SequenceMemoryBuffer, DiagnosticValidationBuffer
 from lifelong_learning.agents.ppo.recurrent_world_model import RecurrentWorldModel
 from lifelong_learning.agents.ppo.context_aware_network import ContextAwarePPONetwork
 
@@ -21,11 +21,14 @@ class MetaRLTrainer:
         memory_buffer: SequenceMemoryBuffer,
         ppo_optimizer: torch.optim.Optimizer,
         wm_optimizer: torch.optim.Optimizer,
-        cfg: dict
+        cfg: dict,
+        regime_switch_step: int = 1500000
     ):
         self.ppo_net = ppo_net
         self.world_model = world_model
         self.memory_buffer = memory_buffer
+        self.val_buffer = DiagnosticValidationBuffer(seq_len=memory_buffer.seq_len)
+        self.regime_switch_step = regime_switch_step
         
         # Strict separation of optimizers to ensure World Model gradients never touch PPO, and vice versa.
         self.ppo_optimizer = ppo_optimizer
@@ -260,6 +263,7 @@ class MetaRLTrainer:
                         'h_t': chunk_ctx[i].cpu()
                     }
                     self.memory_buffer.push(chunk)
+                    self.val_buffer.push_if_needed(chunk, self.global_step, self.regime_switch_step)
 
         # --- PHASE 1.5: Generative Replay (Dreaming) ---
         dream_horizon = self.cfg.get('dream_horizon', 5)
@@ -408,6 +412,26 @@ class MetaRLTrainer:
                 "world_model/loss_reward": loss_reward.item(),
             })
 
+        # --- PHASE 3.5: Diagnostic Validation Evaluation ---
+        # Evaluate the golden sequences without computing gradients
+        val_batches = self.val_buffer.get_all_batches()
+        val_stats = {}
+        if val_batches:
+            with torch.no_grad():
+                for category_name, batch in val_batches.items():
+                    _, loss_s, loss_r = self.world_model.compute_loss_detailed(
+                        states=batch['state'].to(device),
+                        actions=batch['action'].to(device),
+                        rewards=batch['reward'].to(device),
+                        next_states=batch['next_state'].to(device),
+                        target_rewards=batch['reward'].to(device),
+                        dones=batch['done'].to(device).float(),
+                        h_0=batch['h_t'][:, 0, :].to(device).unsqueeze(0).contiguous()
+                    )
+                    val_stats[f"val_loss/{category_name}_state"] = loss_s.item()
+                    val_stats[f"val_loss/{category_name}_reward"] = loss_r.item()
+                    val_stats[f"val_loss/{category_name}_total"] = (loss_s + loss_r).item()
+
         # --- PHASE 4: The PPO Policy Update ---
         
         ppo_stats_live = {}
@@ -484,6 +508,10 @@ class MetaRLTrainer:
         if wm_stats:
             avg_wm = {k: np.mean([s[k] for s in wm_stats]) for k in wm_stats[0]}
             results.update(avg_wm)
+            
+        # Add validation stats
+        if val_stats:
+            results.update(val_stats)
             
         results["ppo/intrinsic_reward_mean"] = 0.0 # Solution 5 doesn't use intrinsic curiosity directly
             

@@ -105,12 +105,20 @@ def main():
     # Use default dimensions (21, 8, 8), 256-D context, 3 actions
     ppo_net = ContextAwarePPONetwork(obs_shape=obs_shape, context_dim=256, n_actions=n_actions).to(device)
     wm = RecurrentWorldModel(obs_shape=obs_shape, hidden_dim=256, n_actions=n_actions).to(device)
-    buffer = SequenceMemoryBuffer(max_capacity=4000, seq_len=30)
+    buffer = SequenceMemoryBuffer(max_capacity=12000, seq_len=30)
     
     ppo_opt = torch.optim.Adam(ppo_net.parameters(), lr=args.ppo_lr, eps=1e-5)
     wm_opt = torch.optim.Adam(wm.parameters(), lr=args.wm_lr)
 
-    trainer = MetaRLTrainer(ppo_net, wm, buffer, ppo_opt, wm_opt, cfg)
+    trainer = MetaRLTrainer(
+        ppo_net=ppo_net, 
+        world_model=wm, 
+        memory_buffer=buffer, 
+        ppo_optimizer=ppo_opt, 
+        wm_optimizer=wm_opt, 
+        cfg=cfg,
+        regime_switch_step=args.steps_per_regime * args.num_envs # This is approx when the regime switches
+    )
 
     # 3. Master Training Loop
     global_step = 0

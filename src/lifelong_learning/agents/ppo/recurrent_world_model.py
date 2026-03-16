@@ -324,11 +324,15 @@ class RecurrentWorldModel(nn.Module):
         num_terminal = (dones == 1.0).sum().clamp(min=1.0)
         dynamic_weight = num_non_terminal / num_terminal
         
-        reward_weights = torch.where(dones == 1.0, dynamic_weight, torch.ones_like(dones))
+        # We want to value predicting terminal rewards 20x higher than other steps
+        reward_weights = torch.where(dones == 1.0, dynamic_weight * 20.0, torch.ones_like(dones))
         
         # Apply masks and weights
         masked_state = (state_loss_per_step * state_mask).sum() / state_mask.sum().clamp(min=1.0)
-        masked_reward = (reward_loss_per_step * reward_weights * reward_mask).sum() / reward_mask.sum().clamp(min=1.0)
+        
+        # For reward, we use a weighted mean over the valid elements
+        valid_reward_weights = reward_weights * reward_mask
+        masked_reward = (reward_loss_per_step * valid_reward_weights).sum() / valid_reward_weights.sum().clamp(min=1.0)
         
         masked_total = masked_state + masked_reward
         

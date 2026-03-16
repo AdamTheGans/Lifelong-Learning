@@ -2,6 +2,81 @@ import torch
 import numpy as np
 import random
 
+class DiagnosticValidationBuffer:
+    """
+    A read-only buffer that stores a fixed set of "golden" sequences from early in training.
+    Used exclusively to evaluate the World Model's convergence and track catastrophic forgetting.
+    """
+    def __init__(self, seq_len: int = 30):
+        self.seq_len = seq_len
+        self.regime_0_success = []
+        self.regime_0_failure = []
+        self.regime_1_success = []
+        self.regime_1_failure = []
+        
+        self.max_per_category = 20
+        
+    def push_if_needed(self, chunk: dict, global_step: int, regime_switch_step: int):
+        """
+        Evaluates a chunk and saves it if we still need golden sequences for the current regime.
+        """
+        rewards = chunk['reward']
+        if isinstance(rewards, torch.Tensor):
+            max_r = rewards.max().item()
+            min_r = rewards.min().item()
+        else:
+            max_r = np.max(rewards)
+            min_r = np.min(rewards)
+            
+        is_success = max_r > 4.0
+        is_failure = min_r < -0.5
+        
+        if not (is_success or is_failure):
+            return # We only care about terminal sequences for validation
+            
+        # Determine regime
+        if global_step < regime_switch_step:
+            # Regime 0
+            if is_success and len(self.regime_0_success) < self.max_per_category:
+                self.regime_0_success.append(chunk)
+            elif is_failure and len(self.regime_0_failure) < self.max_per_category:
+                self.regime_0_failure.append(chunk)
+        else:
+            # Regime 1
+            if is_success and len(self.regime_1_success) < self.max_per_category:
+                self.regime_1_success.append(chunk)
+            elif is_failure and len(self.regime_1_failure) < self.max_per_category:
+                self.regime_1_failure.append(chunk)
+                
+    def get_all_batches(self) -> dict:
+        """
+        Returns a dictionary of batched tensors for each category that has data.
+        """
+        batches = {}
+        
+        categories = {
+            'regime0_success': self.regime_0_success,
+            'regime0_failure': self.regime_0_failure,
+            'regime1_success': self.regime_1_success,
+            'regime1_failure': self.regime_1_failure
+        }
+        
+        for name, chunks in categories.items():
+            if len(chunks) > 0:
+                batch = {key: [] for key in chunks[0].keys()}
+                for chunk in chunks:
+                    for key in batch.keys():
+                        batch[key].append(chunk[key])
+                        
+                stacked_batch = {}
+                for key in batch.keys():
+                    tensor_list = [torch.as_tensor(item) for item in batch[key]]
+                    stacked_batch[key] = torch.stack(tensor_list, dim=0)
+                
+                batches[name] = stacked_batch
+                
+        return batches
+
 class SequenceMemoryBuffer:
     """
     A Long-Term Memory Buffer designed to store sequences of transitions to
@@ -37,6 +112,13 @@ class SequenceMemoryBuffer:
             'success': [],
             'failure': [],
             'neutral': []
+        }
+        
+        # Reservoir Sampling Counters (N)
+        self.seen_counts = {
+            'success': 0,
+            'failure': 0,
+            'neutral': 0
         }
         
         # Tracking for the rate limits
@@ -141,15 +223,23 @@ class SequenceMemoryBuffer:
             max_cap = self.max_neutral
 
         target_buffer = self.buffers[category]
+        
+        # Increment the total number of items ever seen for this category (N)
+        self.seen_counts[category] += 1
+        n = self.seen_counts[category]
 
         if len(target_buffer) < max_cap:
             # Buffer has room, append normally
             target_buffer.append(chunk)
         else:
-            # Buffer is full, overwrite a uniformly selected existing chunk 
-            # This naturally acts as reservoir sampling, permanently protecting a percentage of early sequences
-            evict_index = random.randint(0, max_cap - 1)
-            target_buffer[evict_index] = chunk
+            # True Reservoir Sampling Algorithm (Algorithm R)
+            # Generate a random number R between 1 and N
+            r = random.randint(1, n)
+            
+            # If R is less than or equal to the buffer capacity, overwrite the sequence at index R - 1.
+            # Otherwise, discard the new sequence.
+            if r <= max_cap:
+                target_buffer[r - 1] = chunk
 
     def sample(self, batch_size: int) -> dict:
         """

@@ -27,8 +27,10 @@ class SequenceMemoryBuffer:
         self.surprise_ema_alpha = surprise_ema_alpha
         
         # Stratified Buffer storage
-        self.max_success = max_capacity // 3
-        self.max_failure = max_capacity // 3
+        # We want to save triple the amount of failure endings
+        # So we allocate 60% of capacity to failures, 20% to success, 20% to neutral
+        self.max_failure = int(max_capacity * 0.6)
+        self.max_success = int(max_capacity * 0.2)
         self.max_neutral = max_capacity - self.max_success - self.max_failure
         
         self.buffers = {
@@ -166,12 +168,22 @@ class SequenceMemoryBuffer:
             
         sampled_chunks = []
         
-        # Try to sample equally from all 3 categories
-        categories = ['success', 'failure', 'neutral']
-        per_category = batch_size // 3
-        remainder = batch_size % 3
+        # Try to sample proportionally to our new 60/20/20 split
+        # If batch_size is 8 (for 50/50 split of 16):
+        # 60% of 8 = 4.8 -> 5 failures
+        # 20% of 8 = 1.6 -> 2 successes (rounded up to fill)
+        # 20% of 8 = 1.6 -> 1 neutral
+        categories = ['failure', 'success', 'neutral']
         
-        requests = {cat: per_category + (1 if i < remainder else 0) for i, cat in enumerate(categories)}
+        req_failure = int(batch_size * 0.6)
+        req_success = int(batch_size * 0.2)
+        req_neutral = batch_size - req_failure - req_success
+        
+        requests = {
+            'failure': req_failure,
+            'success': req_success,
+            'neutral': req_neutral
+        }
         
         # Adjust requests if some buffers don't have enough
         for _ in range(2): # Two passes to distribute shortfall

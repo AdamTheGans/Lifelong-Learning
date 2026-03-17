@@ -212,10 +212,6 @@ class MetaRLTrainer:
             prev_rew = reward.clone()
             prev_don = done.clone()
             
-            for i in range(B):
-                if done[i]:
-                    prev_rew[i] = 0.0 # next step is a new episode, so prev_reward is 0
-                    
             obs = next_obs
             
         # 7. Persist for the next iteration

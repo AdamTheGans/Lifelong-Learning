@@ -209,15 +209,21 @@ class TransformerWorldModel(nn.Module):
         # Convert reward logits to expected scalar values for diagnostic
         next_reward_probs = F.softmax(next_reward_preds, dim=-1)
         next_reward_scalar_preds = (next_reward_probs * self.reward_bins).sum(dim=-1)
-
+        
+        B, S, C, H, W = states.shape
+        
+        # --- BURN-IN MASK (Local computation for diagnostics) ---
+        has_seen_done = torch.cumsum(dones.float(), dim=1) > 0
+        burn_in_unmask = torch.cat([torch.zeros(B, 1, device=dones.device), has_seen_done[:, :-1]], dim=1)
+        
         # --- DIAGNOSTIC 3: OUTPUT VS TARGET VALUES ---
-        # Find terminal steps
-        success_mask = target_rewards > 4.0
-        failure_mask = target_rewards < -0.5
+        # Find terminal steps that are NOT masked out by the burn-in period
+        success_mask = (target_rewards > 4.0) & (burn_in_unmask > 0)
+        failure_mask = (target_rewards < -0.5) & (burn_in_unmask > 0)
         
         if success_mask.any() or failure_mask.any():
             if np.random.rand() < 0.05: # Print occasionally when terminal is found
-                print(f"\n[DIAGNOSTIC 3] Terminal State Found!")
+                print(f"\n[DIAGNOSTIC 3] Valid Terminal State Found!")
                 if success_mask.any():
                     print(f"  Success Preds:    {next_reward_scalar_preds[success_mask][:5].detach().cpu().numpy()}")
                     print(f"  Success Targets:  {target_rewards[success_mask][:5].detach().cpu().numpy()}")
@@ -226,12 +232,10 @@ class TransformerWorldModel(nn.Module):
                     print(f"  Failure Targets:  {target_rewards[failure_mask][:5].detach().cpu().numpy()}")
                 
                 # Also print some non-terminal for comparison (around -0.01)
-                non_term_mask = (target_rewards > -0.5) & (target_rewards < 1.0)
+                non_term_mask = (target_rewards > -0.5) & (target_rewards < 1.0) & (burn_in_unmask > 0)
                 if non_term_mask.any():
                     print(f"  Non-Term Preds:   {next_reward_scalar_preds[non_term_mask][:5].detach().cpu().numpy()}")
                     print(f"  Non-Term Targets: {target_rewards[non_term_mask][:5].detach().cpu().numpy()}")
-        
-        B, S, C, H, W = states.shape
         
         # 2. State loss (Cross-Entropy). Converting one-hot (C channel) to hard class indices.
         target_state_idx = next_states.argmax(dim=2)              # [B, S, H, W]
@@ -269,7 +273,19 @@ class TransformerWorldModel(nn.Module):
         # Reward loss is masked by valid_mask, but NOT by dones[:, t], because we need to learn terminal rewards!
         reward_mask = valid_mask
         
+        # BURN-IN MASK: Only evaluate reward and state predictions AFTER the first terminal state is observed in the chunk.
+        # This prevents the Transformer from being heavily penalized for guessing regimes blindly.
+        # cumsum of dones > 0 means a done has happened at or before step t.
+        # We shift it by 1 so the unmasking starts at t+1 (the step after the first terminal outcome).
+        has_seen_done = torch.cumsum(dones.float(), dim=1) > 0
+        burn_in_unmask = torch.cat([torch.zeros(B, 1, device=dones.device), has_seen_done[:, :-1]], dim=1)
+        
+        # Apply burn-in mask to both state and reward losses
+        state_mask = state_mask * burn_in_unmask
+        reward_mask = reward_mask * burn_in_unmask
+        
         # Apply masks directly without dynamic weighting
+        # Use clamp to avoid division by zero if an entire sequence is masked
         masked_state = (state_loss_per_step * state_mask).sum() / state_mask.sum().clamp(min=1.0)
         masked_reward = (reward_loss_per_step * reward_mask).sum() / reward_mask.sum().clamp(min=1.0)
         

@@ -203,6 +203,16 @@ class SequenceMemoryBuffer:
             if len(value) != self.seq_len:
                 raise ValueError(f"Chunk key '{key}' has length {len(value)}, expected {self.seq_len}")
 
+        # Note 2: Ensure that every saved sequence contains a terminal state
+        dones = chunk['done']
+        if isinstance(dones, torch.Tensor):
+            has_terminal = dones.any().item()
+        else:
+            has_terminal = np.any(dones)
+            
+        if not has_terminal:
+            return  # Reject chunks without any terminal states to ensure valid contexts
+
         # Categorize the chunk based on rewards
         rewards = chunk['reward']
         if isinstance(rewards, torch.Tensor):

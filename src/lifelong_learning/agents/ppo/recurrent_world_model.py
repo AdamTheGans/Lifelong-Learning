@@ -63,6 +63,9 @@ class TransformerWorldModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2, enable_nested_tensor=False)
         
+        # LayerNorm to stabilize representations for PPO
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        
         # Output Heads
         self.next_state_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -121,6 +124,8 @@ class TransformerWorldModel(nn.Module):
             src_key_padding_mask=padding_mask,
             is_causal=True
         ) # [B, S, hidden_dim]
+        
+        out = self.out_norm(out)
         
         return out
 

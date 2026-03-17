@@ -102,8 +102,10 @@ class MetaRLTrainer:
                 # Entropy
                 ent_loss = entropy.mean()
                 
-                # Total Loss
-                loss = pg_loss - self.cfg['ent_coef'] * ent_loss + self.cfg['vf_coef'] * v_loss
+                # Total Loss with Entropy Floor to prevent deterministic collapse
+                # We enforce a strict minimum entropy coefficient of 0.01
+                current_ent_coef = max(self.cfg.get('ent_coef', 0.01), 0.01)
+                loss = pg_loss - current_ent_coef * ent_loss + self.cfg['vf_coef'] * v_loss
                 
                 self.ppo_optimizer.zero_grad(set_to_none=True)
                 loss.backward()

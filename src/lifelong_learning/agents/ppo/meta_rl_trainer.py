@@ -302,20 +302,26 @@ class MetaRLTrainer:
         dream_batch_size = self.cfg.get('dream_batch_size', B) # Default to rolling out B dreams
         
         has_dreams = False
-        # QUICK DISABLE: Turning off generative replay completely for now (100% real PPO training)
-        if False and len(self.memory_buffer) >= dream_batch_size:
+        if len(self.memory_buffer) >= dream_batch_size:
             has_dreams = True
             
-            # Sample seeds (extract final state & h_t of the chunk)
+            # Sample seeds (extract full chunks)
             ltm_dream_seed = self.memory_buffer.sample(dream_batch_size)
-            seed_states = ltm_dream_seed['state'][:, -1].to(device) # [dream_batch_size, C, H, W]
-            seed_h_t = ltm_dream_seed['h_t'][:, -1].unsqueeze(0).to(device) # [1, dream_batch_size, 256]
+            seed_states = ltm_dream_seed['state'].to(device) # [actual_batch_size, seq_len, C, H, W]
+            actual_batch_size = seed_states.shape[0]
+            seed_actions = ltm_dream_seed['action'].to(device)
+            seed_rewards = ltm_dream_seed['reward'].to(device)
+            seed_dones = ltm_dream_seed['done'].to(device)
+            seed_padding = torch.zeros((actual_batch_size, seq_len), dtype=torch.bool, device=device)
             
             # Generate dreams
             dream_trajectories = self.world_model.generate_dream_trajectories(
                 policy_net=self.ppo_net,
-                start_states=seed_states,
-                start_h_t=seed_h_t,
+                states_window=seed_states,
+                actions_window=seed_actions,
+                rewards_window=seed_rewards,
+                dones_window=seed_dones,
+                padding_mask=seed_padding,
                 horizon=dream_horizon
             )
             
@@ -336,7 +342,7 @@ class MetaRLTrainer:
             with torch.no_grad():
                 _, _, _, d_next_value = self.ppo_net.get_action_and_value(d_next_state, d_next_ctx)
                 d_returns, d_advantages = self.calculate_returns_and_advantages(
-                    d_rew, d_val, d_don, d_next_value, self.cfg['gamma'], self.cfg['gae_lambda']
+                    d_rew, d_val, d_don.float(), d_next_value, self.cfg['gamma'], self.cfg['gae_lambda']
                 )
 
         # --- PHASE 3: The World Model Update (Mixed Batch) ---
@@ -480,18 +486,15 @@ class MetaRLTrainer:
         
         # 2. Update on Dream Generative Replay Rollout (if valid)
         if has_dreams:
-            # TEMPORARILY DISABLED: The PPO is currently training on hallucinated trajectories 
-            # from a World Model that has not yet converged, causing it to confidently learn a broken environment.
-            pass
-            # ppo_stats_dream = self.ppo_update(
-            #     obs=d_obs,
-            #     actions=d_act,
-            #     old_logprobs=d_logp,
-            #     context_ht=d_ctx,
-            #     advantages=d_advantages,
-            #     returns=d_returns,
-            #     old_values=d_val
-            # )
+            ppo_stats_dream = self.ppo_update(
+                obs=d_obs,
+                actions=d_act,
+                old_logprobs=d_logp,
+                context_ht=d_ctx,
+                advantages=d_advantages,
+                returns=d_returns,
+                old_values=d_val
+            )
             
         # Aggregate stats
         results = {

@@ -172,19 +172,105 @@ class TransformerWorldModel(nn.Module):
         
         return next_state_preds, next_reward_preds, out
 
-    def autoregressive_dream_step(self, states_window, actions_window, rewards_window, dones_window, padding_mask):
+    def autoregressive_dream_step(self, h_t: torch.Tensor, action: torch.Tensor):
         """
-        Scaffold for dreaming. In the future, this will take the window, predict the next state/reward,
-        and the caller will append the prediction to the window for the next step.
+        Takes the current context h_t and chosen action, predicts the next state and scalar reward.
         """
-        # Currently disabled, but this would use get_context, then inject the action, then predict.
-        raise NotImplementedError("Dreaming requires post-action context refactoring.")
+        B = h_t.shape[0]
+        act_feat = self.act_emb(action)
+        pred_input = torch.cat([h_t, act_feat], dim=-1) # [B, hidden_dim * 2]
+        
+        # Predict State logits
+        next_states_flat = self.next_state_head(pred_input) # [B, flat_obs_dim]
+        next_state_logits = next_states_flat.view(B, self.c, self.h, self.w)
+        
+        # Convert to hard one-hot grid (acting as environment simulated response)
+        state_idx = next_state_logits.argmax(dim=1) # [B, H, W]
+        next_state_one_hot = F.one_hot(state_idx, num_classes=self.c).permute(0, 3, 1, 2).float() # [B, C, H, W]
+        
+        # Predict Reward
+        next_rewards_flat = self.next_reward_head(pred_input) # [B, num_reward_bins]
+        next_reward_probs = F.softmax(next_rewards_flat, dim=-1)
+        next_reward_scalar = (next_reward_probs * self.reward_bins).sum(dim=-1) # [B]
+        
+        return next_state_one_hot, next_reward_scalar
 
-    def generate_dream_trajectories(self, policy_net, start_states: torch.Tensor, start_h_t: torch.Tensor, horizon: int) -> list[dict]:
+    def generate_dream_trajectories(self, policy_net, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, padding_mask: torch.Tensor, horizon: int) -> list[dict]:
         """
-        Temporarily disabled or requires refactoring to use rolling windows.
+        Unrolls the transformer autoregressively for `horizon` steps inside its own imagination.
+        Dynamically infers `done` from predicted rewards to prevent post-terminal hallucination corruption.
         """
-        raise NotImplementedError("Dreaming with Transformer requires rolling window refactoring.")
+        # Ensure gradients don't flow through WM during dreaming
+        with torch.no_grad():
+            B, S, C, H, W = states_window.shape
+            
+            # Working copies of the sliding windows
+            cur_states = states_window.clone()
+            cur_actions = actions_window.clone()
+            cur_rewards = rewards_window.clone()
+            cur_dones = dones_window.clone()
+            cur_padding = padding_mask.clone() if padding_mask is not None else torch.zeros((B, S), dtype=torch.bool, device=states_window.device)
+            
+            # Track which environments in the batch have already terminated
+            env_is_done = torch.zeros(B, dtype=torch.bool, device=states_window.device)
+            
+            trajectories = []
+            
+            for t in range(horizon):
+                # 1. Get Context
+                h_t_seq = self.get_context(cur_states, cur_actions, cur_rewards, cur_dones, cur_padding)
+                h_t = h_t_seq[:, -1, :] # [B, 256]
+                
+                # 2. Sample Action from Policy
+                action, logprob, _, value = policy_net.get_action_and_value(cur_states[:, -1], h_t)
+                
+                # Zero out actions for environments that are already done
+                action = torch.where(env_is_done, torch.zeros_like(action), action)
+                
+                # 3. Predict Dynamics
+                next_state_one_hot, next_reward_scalar = self.autoregressive_dream_step(h_t, action)
+                
+                # Zero out rewards for already done envs
+                next_reward_scalar = torch.where(env_is_done, torch.zeros_like(next_reward_scalar), next_reward_scalar)
+                
+                # 4. Infer Done mathematically
+                # If reward > 1.0 or < -1.0, it's a terminal state
+                next_done = torch.abs(next_reward_scalar) > 1.0
+                next_done = next_done | env_is_done
+                
+                # Append step to trajectory
+                trajectories.append({
+                    'state': cur_states[:, -1].clone(),
+                    'action': action.clone(),
+                    'logprob': logprob.clone(),
+                    'reward': next_reward_scalar.clone(),
+                    'done': next_done.clone(),
+                    'value': value.clone(),
+                    'h_t': h_t.clone(),
+                    'next_state': next_state_one_hot.clone() # Needed for GAE bootstrap of final step
+                })
+                
+                # Update the running done tracker
+                env_is_done = env_is_done | next_done
+                
+                # 5. Shift Windows Left and Append
+                cur_states = torch.roll(cur_states, shifts=-1, dims=1)
+                cur_actions = torch.roll(cur_actions, shifts=-1, dims=1)
+                cur_rewards = torch.roll(cur_rewards, shifts=-1, dims=1)
+                cur_dones = torch.roll(cur_dones, shifts=-1, dims=1)
+                cur_padding = torch.roll(cur_padding, shifts=-1, dims=1)
+                
+                # Insert at the end
+                cur_states[:, -1] = next_state_one_hot
+                cur_actions[:, -1] = action
+                cur_rewards[:, -1] = next_reward_scalar
+                cur_dones[:, -1] = next_done
+                
+                # Mask out context for future frames if it produced a terminal goal, 
+                # effectively stabilizing the sequence prediction
+                cur_padding[:, -1] = env_is_done
+                
+            return trajectories
 
     def compute_loss(self, states, actions, rewards, next_states, target_rewards, dones, padding_mask=None):
         """Standard loss wrapper"""

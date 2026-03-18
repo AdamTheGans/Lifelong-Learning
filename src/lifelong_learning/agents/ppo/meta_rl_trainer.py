@@ -6,6 +6,7 @@ import numpy as np
 from lifelong_learning.agents.ppo.sequence_memory_buffer import SequenceMemoryBuffer, DiagnosticValidationBuffer
 from lifelong_learning.agents.ppo.recurrent_world_model import TransformerWorldModel
 from lifelong_learning.agents.ppo.context_aware_network import ContextAwarePPONetwork
+from lifelong_learning.agents.ppo.context_prober import ContextProber
 
 class MetaRLTrainer:
     """
@@ -29,6 +30,14 @@ class MetaRLTrainer:
         self.memory_buffer = memory_buffer
         self.val_buffer = DiagnosticValidationBuffer(seq_len=memory_buffer.seq_len)
         self.regime_switch_step = regime_switch_step
+        
+        # Initialize the Context Prober for tracking representational drift
+        self.prober = ContextProber(
+            world_model=self.world_model,
+            ppo_net=self.ppo_net,
+            eval_interval=10000,
+            baseline_step=2000000
+        )
         
         # Strict separation of optimizers to ensure World Model gradients never touch PPO, and vice versa.
         self.ppo_optimizer = ppo_optimizer
@@ -545,6 +554,11 @@ class MetaRLTrainer:
         # Add validation stats
         if val_stats:
             results.update(val_stats)
+            
+        # Run Context Prober Evaluation
+        probe_metrics = self.prober.evaluate(self.global_step, self.memory_buffer)
+        if probe_metrics:
+            results.update(probe_metrics)
             
         results["ppo/intrinsic_reward_mean"] = 0.0 # Solution 5 doesn't use intrinsic curiosity directly
             

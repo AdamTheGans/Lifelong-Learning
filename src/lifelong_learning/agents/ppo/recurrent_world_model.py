@@ -188,10 +188,10 @@ class TransformerWorldModel(nn.Module):
         state_idx = next_state_logits.argmax(dim=1) # [B, H, W]
         next_state_one_hot = F.one_hot(state_idx, num_classes=self.c).permute(0, 3, 1, 2).float() # [B, C, H, W]
         
-        # Predict Reward
+        # Predict Reward (Use argmax to prevent bimodal smearing and ensure strict done triggers)
         next_rewards_flat = self.next_reward_head(pred_input) # [B, num_reward_bins]
-        next_reward_probs = F.softmax(next_rewards_flat, dim=-1)
-        next_reward_scalar = (next_reward_probs * self.reward_bins).sum(dim=-1) # [B]
+        reward_idx = next_rewards_flat.argmax(dim=-1) # [B]
+        next_reward_scalar = self.reward_bins[reward_idx] # [B]
         
         return next_state_one_hot, next_reward_scalar
 

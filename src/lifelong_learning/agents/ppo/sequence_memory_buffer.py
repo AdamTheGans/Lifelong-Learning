@@ -21,15 +21,27 @@ class DiagnosticValidationBuffer:
         Evaluates a chunk and saves it if we still need golden sequences for the current regime.
         """
         rewards = chunk['reward']
-        if isinstance(rewards, torch.Tensor):
-            max_r = rewards.max().item()
-            min_r = rewards.min().item()
+        dones = chunk['done']
+        
+        if isinstance(dones, torch.Tensor):
+            num_terminals = dones.sum().item()
         else:
-            max_r = np.max(rewards)
-            min_r = np.min(rewards)
+            num_terminals = np.sum(dones)
             
-        is_success = max_r > 4.0
-        is_failure = min_r < -0.5
+        if num_terminals < 2:
+            return
+            
+        if isinstance(dones, torch.Tensor):
+            done_indices = torch.nonzero(dones).squeeze(-1)
+            last_done_idx = done_indices[-1].item()
+            last_terminal_reward = rewards[last_done_idx].item()
+        else:
+            done_indices = np.nonzero(dones)[0]
+            last_done_idx = done_indices[-1]
+            last_terminal_reward = rewards[last_done_idx]
+            
+        is_success = last_terminal_reward > 4.0
+        is_failure = last_terminal_reward < -0.5
         
         if not (is_success or is_failure):
             return # We only care about terminal sequences for validation
@@ -203,29 +215,31 @@ class SequenceMemoryBuffer:
             if len(value) != self.seq_len:
                 raise ValueError(f"Chunk key '{key}' has length {len(value)}, expected {self.seq_len}")
 
-        # Note 2: Ensure that every saved sequence contains a terminal state
+        # Note 2: Ensure that every saved sequence contains at least 2 terminal states
         dones = chunk['done']
         if isinstance(dones, torch.Tensor):
-            has_terminal = dones.any().item()
+            num_terminals = dones.sum().item()
         else:
-            has_terminal = np.any(dones)
+            num_terminals = np.sum(dones)
             
-        if not has_terminal:
-            return  # Reject chunks without any terminal states to ensure valid contexts
+        if num_terminals < 2:
+            return  # Reject chunks with fewer than 2 terminal states so the WM can learn from the 2nd one
 
-        # Categorize the chunk based on rewards
+        # Categorize the chunk based on the LAST terminal reward
         rewards = chunk['reward']
-        if isinstance(rewards, torch.Tensor):
-            max_r = rewards.max().item()
-            min_r = rewards.min().item()
+        if isinstance(dones, torch.Tensor):
+            done_indices = torch.nonzero(dones).squeeze(-1)
+            last_done_idx = done_indices[-1].item()
+            last_terminal_reward = rewards[last_done_idx].item()
         else:
-            max_r = np.max(rewards)
-            min_r = np.min(rewards)
+            done_indices = np.nonzero(dones)[0]
+            last_done_idx = done_indices[-1]
+            last_terminal_reward = rewards[last_done_idx]
 
-        if min_r < -0.5:
+        if last_terminal_reward < -0.5:
             category = 'failure'
             max_cap = self.max_failure
-        elif max_r > 4.0:
+        elif last_terminal_reward > 4.0:
             category = 'success'
             max_cap = self.max_success
         else:
@@ -301,6 +315,20 @@ class SequenceMemoryBuffer:
                             requests[c] += can_add
                             shortfall -= can_add
                             if shortfall <= 0: break
+                            
+        # Final pass: If there's still a shortfall (because the others couldn't absorb it all), 
+        # just greedily take from whatever is left until we hit batch_size
+        total_requested = sum(requests.values())
+        if total_requested < batch_size:
+            remaining_shortfall = batch_size - total_requested
+            for cat in categories:
+                avail = len(self.buffers[cat])
+                if avail > requests[cat]:
+                    can_add = min(remaining_shortfall, avail - requests[cat])
+                    requests[cat] += can_add
+                    remaining_shortfall -= can_add
+                    if remaining_shortfall <= 0:
+                        break
 
         # Actually sample
         for cat in categories:

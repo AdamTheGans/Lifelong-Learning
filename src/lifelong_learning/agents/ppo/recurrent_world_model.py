@@ -195,7 +195,7 @@ class TransformerWorldModel(nn.Module):
         
         return next_state_one_hot, next_reward_scalar
 
-    def generate_dream_trajectories(self, policy_net, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, padding_mask: torch.Tensor, horizon: int) -> list[dict]:
+    def generate_dream_trajectories(self, policy_net, states_window: torch.Tensor, actions_window: torch.Tensor, rewards_window: torch.Tensor, dones_window: torch.Tensor, next_states_window: torch.Tensor, padding_mask: torch.Tensor, horizon: int) -> list[dict]:
         """
         Unrolls the transformer autoregressively for `horizon` steps inside its own imagination.
         Dynamically infers `done` from predicted rewards to prevent post-terminal hallucination corruption.
@@ -204,30 +204,38 @@ class TransformerWorldModel(nn.Module):
         with torch.no_grad():
             B, S, C, H, W = states_window.shape
             
-            # Working copies of the sliding windows
-            cur_states = states_window.clone()
-            cur_actions = actions_window.clone()
-            cur_rewards = rewards_window.clone()
-            cur_dones = dones_window.clone()
+            # We want to start dreaming at step S (e.g., step 30).
+            # The context for step S needs the window of states ending in obs_{30}.
+            # So we shift states_window left by 1, and append next_states_window[:, -1].
+            cur_states = torch.roll(states_window, shifts=-1, dims=1)
+            cur_states[:, -1] = next_states_window[:, -1]
+            
+            # The actions, rewards, and dones for the context of step S should end with act_{29}, rew_{29}, don_{29}.
+            # These are exactly the elements of actions_window, rewards_window, dones_window!
+            cur_prev_actions = actions_window.clone()
+            cur_prev_rewards = rewards_window.clone()
+            cur_prev_dones = dones_window.clone()
+            
             cur_padding = padding_mask.clone() if padding_mask is not None else torch.zeros((B, S), dtype=torch.bool, device=states_window.device)
             
-            # Track which environments in the batch have already terminated
+            # Track which environments in the batch have already terminated during the dream
             env_is_done = torch.zeros(B, dtype=torch.bool, device=states_window.device)
             
             trajectories = []
             
             for t in range(horizon):
                 # 1. Get Context
-                h_t_seq = self.get_context(cur_states, cur_actions, cur_rewards, cur_dones, cur_padding)
+                # cur_prev_actions ends in act_{29+t}, which is exactly what get_context expects for obs_{30+t}
+                h_t_seq = self.get_context(cur_states, cur_prev_actions, cur_prev_rewards, cur_prev_dones, cur_padding)
                 h_t = h_t_seq[:, -1, :] # [B, 256]
                 
-                # 2. Sample Action from Policy
+                # 2. Sample Action from Policy for obs_{30+t}
                 action, logprob, _, value = policy_net.get_action_and_value(cur_states[:, -1], h_t)
                 
                 # Zero out actions for environments that are already done
                 action = torch.where(env_is_done, torch.zeros_like(action), action)
                 
-                # 3. Predict Dynamics
+                # 3. Predict Dynamics (predicts obs_{31+t} and rew_{30+t})
                 next_state_one_hot, next_reward_scalar = self.autoregressive_dream_step(h_t, action)
                 
                 # Zero out rewards for already done envs
@@ -240,14 +248,14 @@ class TransformerWorldModel(nn.Module):
                 
                 # Append step to trajectory
                 trajectories.append({
-                    'state': cur_states[:, -1].clone(),
-                    'action': action.clone(),
+                    'state': cur_states[:, -1].clone(), # obs_{30+t}
+                    'action': action.clone(),           # act_{30+t}
                     'logprob': logprob.clone(),
-                    'reward': next_reward_scalar.clone(),
-                    'done': next_done.clone(),
+                    'reward': next_reward_scalar.clone(), # rew_{30+t}
+                    'done': next_done.clone(),            # don_{30+t}
                     'value': value.clone(),
                     'h_t': h_t.clone(),
-                    'next_state': next_state_one_hot.clone() # Needed for GAE bootstrap of final step
+                    'next_state': next_state_one_hot.clone() # obs_{31+t}
                 })
                 
                 # Update the running done tracker
@@ -255,19 +263,20 @@ class TransformerWorldModel(nn.Module):
                 
                 # 5. Shift Windows Left and Append
                 cur_states = torch.roll(cur_states, shifts=-1, dims=1)
-                cur_actions = torch.roll(cur_actions, shifts=-1, dims=1)
-                cur_rewards = torch.roll(cur_rewards, shifts=-1, dims=1)
-                cur_dones = torch.roll(cur_dones, shifts=-1, dims=1)
-                cur_padding = torch.roll(cur_padding, shifts=-1, dims=1)
-                
-                # Insert at the end
                 cur_states[:, -1] = next_state_one_hot
-                cur_actions[:, -1] = action
-                cur_rewards[:, -1] = next_reward_scalar
-                cur_dones[:, -1] = next_done
+                
+                cur_prev_actions = torch.roll(cur_prev_actions, shifts=-1, dims=1)
+                cur_prev_actions[:, -1] = action
+                
+                cur_prev_rewards = torch.roll(cur_prev_rewards, shifts=-1, dims=1)
+                cur_prev_rewards[:, -1] = next_reward_scalar
+                
+                cur_prev_dones = torch.roll(cur_prev_dones, shifts=-1, dims=1)
+                cur_prev_dones[:, -1] = next_done
                 
                 # Mask out context for future frames if it produced a terminal goal, 
                 # effectively stabilizing the sequence prediction
+                cur_padding = torch.roll(cur_padding, shifts=-1, dims=1)
                 cur_padding[:, -1] = env_is_done
                 
             return trajectories

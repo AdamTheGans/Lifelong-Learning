@@ -359,6 +359,7 @@ class MetaRLTrainer:
             seed_actions = ltm_dream_seed['action'].to(device)
             seed_rewards = ltm_dream_seed['reward'].to(device)
             seed_dones = ltm_dream_seed['done'].to(device)
+            seed_next_states = ltm_dream_seed['next_state'].to(device)
             seed_padding = torch.zeros((actual_batch_size, seq_len), dtype=torch.bool, device=device)
             
             # Generate dreams
@@ -368,6 +369,7 @@ class MetaRLTrainer:
                 actions_window=seed_actions,
                 rewards_window=seed_rewards,
                 dones_window=seed_dones,
+                next_states_window=seed_next_states,
                 padding_mask=seed_padding,
                 horizon=dream_horizon
             )

@@ -43,6 +43,9 @@ def main():
     p.add_argument("--dream_horizon", type=int, default=5)
     p.add_argument("--wm_lr", type=float, default=1e-4)
     p.add_argument("--ppo_lr", type=float, default=3e-4)
+    
+    # Freeze Test Curriculum
+    p.add_argument("--freeze_test_curriculum", action="store_true", help="Enable the Freeze Test ablation study curriculum")
 
     args = p.parse_args()
 
@@ -99,7 +102,9 @@ def main():
         'wm_epochs': 2,
         'wm_warmup_steps': args.wm_warmup_steps,
         'dream_horizon': args.dream_horizon,
-        'dream_batch_size': args.num_envs 
+        'original_dream_horizon': args.dream_horizon,
+        'dream_batch_size': args.num_envs,
+        'freeze_test_curriculum': args.freeze_test_curriculum
     }
 
     # Use default dimensions (21, 8, 8), 256-D context, 3 actions
@@ -150,6 +155,19 @@ def main():
             # Auto-reset state tracker
             self._obs = None
             
+        def set_regime(self, regime_id):
+            """Forcefully set the regime for all environments and disable automatic switching."""
+            for env in self.envs.envs:
+                # Unwrap to find RegimeGoalSwapWrapper
+                curr_env = env
+                while hasattr(curr_env, 'env'):
+                    if hasattr(curr_env, 'regime_id'):
+                        curr_env.regime_id = regime_id
+                        curr_env.steps_per_regime = None
+                        curr_env.episodes_per_regime = None
+                        break
+                    curr_env = curr_env.env
+
         def reset(self):
             obs, info = self.envs.reset()
             self._obs = torch.tensor(obs, dtype=torch.float32, device=self.device)

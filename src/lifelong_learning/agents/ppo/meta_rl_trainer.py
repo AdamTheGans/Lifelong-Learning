@@ -45,6 +45,7 @@ class MetaRLTrainer:
         
         self.cfg = cfg
         self.global_step = 0
+        self.wm_frozen = False
 
     def calculate_returns_and_advantages(self, rewards, values, dones, next_value, gamma, gae_lambda):
         """Standard GAE calculation adapted for direct tensor processing."""
@@ -138,6 +139,43 @@ class MetaRLTrainer:
         S = self.cfg['num_steps']
         seq_len = self.memory_buffer.seq_len # Exactly 30
         
+        # --- PHASE 0: Curriculum Enforcement ---
+        if self.cfg.get('freeze_test_curriculum', False):
+            if self.global_step < 5_000_000:
+                # Phase A: Standard Learning
+                self.cfg['dream_horizon'] = 0
+                self.wm_frozen = False
+                self.world_model.train()
+                for param in self.world_model.parameters():
+                    param.requires_grad = True
+                
+                if self.global_step < 2_500_000:
+                    env.set_regime(0)
+                else:
+                    env.set_regime(1)
+            else:
+                # Phase B & C: The Freeze and Dreaming Gauntlet
+                if not self.wm_frozen:
+                    print(f"*** FREEZING WORLD MODEL AT STEP {self.global_step} ***")
+                    self.wm_frozen = True
+                    self.world_model.eval() # Prevent Dropout Trap
+                    for param in self.world_model.parameters():
+                        param.requires_grad = False
+                        
+                    # Ensure PPO learning rate is reasonable (in case a scheduler decayed it)
+                    for param_group in self.ppo_optimizer.param_groups:
+                        if param_group['lr'] < 1e-4:
+                            print(f"*** RESETTING PPO LR to 1e-4 ***")
+                            param_group['lr'] = 1e-4
+                
+                self.cfg['dream_horizon'] = self.cfg.get('original_dream_horizon', 5)
+                
+                # Switch regime every 1M steps starting at 5M
+                # 5M-6M: 0, 6M-7M: 1, 7M-8M: 0, 8M-9M: 1
+                phase_c_step = self.global_step - 5_000_000
+                target_regime = (phase_c_step // 1_000_000) % 2
+                env.set_regime(target_regime)
+
         # Initialize storage for the rollout
         obs_buf = torch.zeros((B, S, *self.ppo_net.obs_shape), device=device)
         act_buf = torch.zeros((B, S), dtype=torch.long, device=device)
@@ -311,7 +349,7 @@ class MetaRLTrainer:
         dream_batch_size = self.cfg.get('dream_batch_size', B) # Default to rolling out B dreams
         
         has_dreams = False
-        if len(self.memory_buffer) >= dream_batch_size:
+        if dream_horizon > 0 and len(self.memory_buffer) >= dream_batch_size:
             has_dreams = True
             
             # Sample seeds (extract full chunks)
@@ -434,27 +472,46 @@ class MetaRLTrainer:
         # 4. Standard Supervised Training Step
         wm_stats = []
         padding_mask_mixed = torch.zeros((mixed_obs.shape[0], seq_len), dtype=torch.bool, device=device)
-        for _ in range(self.cfg['wm_epochs']):
-            # Full batched sequence evaluation
-            loss, loss_state, loss_reward = self.world_model.compute_loss_detailed(
-                states=mixed_obs,
-                actions=mixed_act,
-                rewards=mixed_rew,
-                next_states=mixed_next,
-                target_rewards=mixed_rew, # target is r_t, forward_sequence shifts 'rewards' to r_{t-1} internally
-                dones=mixed_don,
-                padding_mask=padding_mask_mixed
-            )
-            
-            self.wm_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self.wm_optimizer.step()
-            
-            wm_stats.append({
-                "world_model/loss_total": loss.item(),
-                "world_model/loss_state": loss_state.item(),
-                "world_model/loss_reward": loss_reward.item(),
-            })
+        
+        if not getattr(self, 'wm_frozen', False):
+            for _ in range(self.cfg['wm_epochs']):
+                # Full batched sequence evaluation
+                loss, loss_state, loss_reward = self.world_model.compute_loss_detailed(
+                    states=mixed_obs,
+                    actions=mixed_act,
+                    rewards=mixed_rew,
+                    next_states=mixed_next,
+                    target_rewards=mixed_rew, # target is r_t, forward_sequence shifts 'rewards' to r_{t-1} internally
+                    dones=mixed_don,
+                    padding_mask=padding_mask_mixed
+                )
+                
+                self.wm_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                self.wm_optimizer.step()
+                
+                wm_stats.append({
+                    "world_model/loss_total": loss.item(),
+                    "world_model/loss_state": loss_state.item(),
+                    "world_model/loss_reward": loss_reward.item(),
+                })
+        else:
+            # If frozen, compute loss once under no_grad for diagnostic logging
+            with torch.no_grad():
+                loss, loss_state, loss_reward = self.world_model.compute_loss_detailed(
+                    states=mixed_obs,
+                    actions=mixed_act,
+                    rewards=mixed_rew,
+                    next_states=mixed_next,
+                    target_rewards=mixed_rew,
+                    dones=mixed_don,
+                    padding_mask=padding_mask_mixed
+                )
+                wm_stats.append({
+                    "world_model/loss_total": loss.item(),
+                    "world_model/loss_state": loss_state.item(),
+                    "world_model/loss_reward": loss_reward.item(),
+                })
 
         # --- PHASE 3.5: Diagnostic Validation Evaluation ---
         # Evaluate the golden sequences without computing gradients

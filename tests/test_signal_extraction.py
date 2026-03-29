@@ -50,6 +50,24 @@ class TestRunningNormalizer(unittest.TestCase):
         # Mean should be close to 5
         self.assertAlmostEqual(norm.mean[0], 5.0, delta=0.3)
 
+    def test_state_dict_round_trip(self):
+        """Serialized normalizer state should restore count and moments exactly."""
+        norm = RunningNormalizer(size=2, clip=3.5)
+        for sample in (
+            np.array([1.0, -1.0], dtype=np.float32),
+            np.array([2.5, 0.5], dtype=np.float32),
+            np.array([-0.5, 3.0], dtype=np.float32),
+        ):
+            norm.update(sample)
+
+        restored = RunningNormalizer(size=2)
+        restored.load_state_dict(norm.state_dict())
+
+        self.assertEqual(restored.count, norm.count)
+        self.assertEqual(restored.clip, norm.clip)
+        np.testing.assert_allclose(restored.mean, norm.mean)
+        np.testing.assert_allclose(restored.var, norm.var)
+        np.testing.assert_allclose(restored._M2, norm._M2)
 
 class TestSignalExtractor(unittest.TestCase):
     """Tests for the full signal extraction pipeline."""
@@ -134,6 +152,26 @@ class TestSignalExtractor(unittest.TestCase):
         self.assertEqual(ext.prev_surprise, 0.0)
         self.assertEqual(len(ext.surprise_history), 0)
 
+    def test_state_dict_restores_cross_episode_normalizer(self):
+        """A restored extractor should match a warm process at the next episode boundary."""
+        ext = SignalExtractor()
+        for idx in range(8):
+            ext.extract(
+                self._make_stats(
+                    mean_episodic_return=float(idx),
+                    mean_surprise=0.1 + 0.05 * idx,
+                    policy_loss=0.1 * idx,
+                )
+            )
+
+        resume_state = ext.state_dict()
+        ext.reset()
+
+        restored = SignalExtractor()
+        restored.load_state_dict(resume_state)
+
+        stats = self._make_stats(mean_episodic_return=3.5, mean_surprise=0.42, policy_loss=0.77)
+        np.testing.assert_allclose(restored.extract(stats), ext.extract(stats))
     def test_static_override_indices_match_signal_names(self):
         """Static normalization overrides must write to indices matching SIGNAL_NAMES."""
         ext = SignalExtractor()

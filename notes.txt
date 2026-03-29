@@ -1,0 +1,3 @@
+Run a baseline evals with
+1. inner_checkpoint hyperparams of episode 130 of neuromod
+2. episode 130 hyperparams neuromod start with neuromod checkpoint

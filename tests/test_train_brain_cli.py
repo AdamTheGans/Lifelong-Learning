@@ -1,6 +1,9 @@
+import random
 import sys
 from functools import partial
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 import gymnasium as gym
@@ -82,11 +85,16 @@ def test_upgrade_legacy_brain_state_dict_pads_old_action_heads():
         "actor_mean.bias": torch.randn(7),
         "actor_logstd": torch.randn(7),
     }
-    upgraded = train_brain_script._upgrade_legacy_brain_state_dict(legacy, target_act_dim=15)
+    upgraded, notices = train_brain_script._upgrade_legacy_brain_state_dict(
+        legacy,
+        target_obs_dim=19,
+        target_act_dim=15,
+    )
     assert upgraded["actor_mean.weight"].shape == (15, 128)
     assert upgraded["actor_mean.bias"].shape == (15,)
     assert upgraded["actor_log_std"].shape == (15,)
     assert "actor_logstd" not in upgraded
+    assert notices
     assert torch.allclose(upgraded["actor_mean.weight"][:7], legacy["actor_mean.weight"])
     assert torch.allclose(upgraded["actor_mean.bias"][:7], legacy["actor_mean.bias"])
     assert torch.allclose(upgraded["actor_log_std"][:7], legacy["actor_logstd"])
@@ -103,3 +111,44 @@ def test_extract_episode_average_success_rate_averages_final_info():
     avg_success_rate = train_brain_script._extract_episode_average_success_rate(infos)
     assert avg_success_rate == 0.5
 
+def test_capture_and_restore_brain_rng_state_round_trip():
+    random.seed(123)
+    np.random.seed(123)
+    torch.manual_seed(123)
+
+    state = train_brain_script.capture_brain_rng_state()
+    first = (random.random(), float(np.random.rand()), float(torch.rand(1)))
+
+    assert train_brain_script.restore_brain_rng_state(state) is True
+    second = (random.random(), float(np.random.rand()), float(torch.rand(1)))
+
+    assert second == first
+
+
+def test_build_brain_checkpoint_payload_includes_resume_state():
+    class DummyVecEnv:
+        def call(self, name, *args):
+            assert name == "get_resume_state"
+            assert args == ()
+            return [{"env_index": 0, "signal_extractor": {"normalizer": {"count": 4}}}]
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(seed=7, brain_episodes=9)
+
+    payload = train_brain_script.build_brain_checkpoint_payload(
+        model,
+        optimizer,
+        DummyVecEnv(),
+        episodes_trained=4,
+        args=args,
+        episode=4,
+        avg_reward_10=1.25,
+    )
+
+    assert payload["episode"] == 4
+    assert payload["avg_reward_10"] == 1.25
+    assert payload["episodes_trained"] == 4
+    assert payload["args"] == {"seed": 7, "brain_episodes": 9}
+    assert "rng_state" in payload
+    assert payload["meta_env_resume_state"] == [{"env_index": 0, "signal_extractor": {"normalizer": {"count": 4}}}]

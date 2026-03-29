@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import random
 import time
 from functools import partial
 import numpy as np
@@ -85,6 +86,65 @@ def should_refresh_brain_trends(plot_episode_artifacts: bool, generate_high_scal
     return plot_episode_artifacts or generate_high_scale_plots
 
 
+def capture_brain_rng_state() -> dict:
+    """Snapshot Python, NumPy, and Torch RNG state for a resumable Brain checkpoint."""
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_brain_rng_state(state: dict | None) -> bool:
+    """Restore RNG state captured alongside a Brain checkpoint."""
+    if not state:
+        return False
+
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch_cpu" in state:
+        torch.random.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    return True
+
+
+def capture_meta_env_resume_state(meta_env) -> list[dict] | None:
+    """Collect per-worker MetaEnv state that should survive a resume."""
+    if not hasattr(meta_env, "call"):
+        return None
+    return meta_env.call("get_resume_state")
+
+
+def restore_meta_env_resume_state(meta_env, resume_state) -> bool:
+    """Push a saved MetaEnv resume payload back into each vectorized worker."""
+    if resume_state is None or not hasattr(meta_env, "call"):
+        return False
+    meta_env.call("load_resume_state", resume_state)
+    return True
+
+
+def build_brain_checkpoint_payload(brain_model, brain_optimizer, meta_env, *, episodes_trained: int, args, episode: int | None = None, avg_reward_10: float | None = None) -> dict:
+    """Build a Brain checkpoint payload including resume-sensitive outer state."""
+    payload = {
+        "model_state_dict": brain_model.state_dict(),
+        "optimizer_state_dict": brain_optimizer.state_dict(),
+        "episodes_trained": episodes_trained,
+        "args": vars(args),
+        "rng_state": capture_brain_rng_state(),
+        "meta_env_resume_state": capture_meta_env_resume_state(meta_env),
+    }
+    if episode is not None:
+        payload["episode"] = episode
+    if avg_reward_10 is not None:
+        payload["avg_reward_10"] = avg_reward_10
+    return payload
+
 def _extract_episode_average_success_rate(infos: dict) -> float | None:
     """Average final inner-agent success rate across Brain vector envs for one episode."""
     success_rates = []
@@ -122,34 +182,76 @@ def _extract_episode_average_success_rate(infos: dict) -> float | None:
             return float(np.mean(fallback_rates))
     return None
 
-def _upgrade_legacy_brain_state_dict(state_dict: dict, target_act_dim: int) -> dict:
-    """Pad older Brain checkpoints to the current action dimensionality."""
+def _upgrade_legacy_brain_state_dict(
+    state_dict: dict,
+    target_obs_dim: int,
+    target_act_dim: int,
+) -> tuple[dict, list[str]]:
+    """Pad or trim older Brain checkpoints to the current observation/action shapes."""
     upgraded = dict(state_dict)
+    notices: list[str] = []
+
+    shared_key = "shared.0.weight"
+    if shared_key in upgraded:
+        old_obs_dim = upgraded[shared_key].shape[1]
+        if old_obs_dim != target_obs_dim:
+            old_weight = upgraded[shared_key]
+            new_weight = old_weight.new_zeros((old_weight.shape[0], target_obs_dim))
+            limit = min(old_obs_dim, target_obs_dim)
+            new_weight[:, :limit] = old_weight[:, :limit]
+            upgraded[shared_key] = new_weight
+            verb = "PADDING" if old_obs_dim < target_obs_dim else "TRUNCATING"
+            notices.append(
+                f"DETECTED LEGACY {old_obs_dim}-DIM OBS SPACE MODEL. "
+                f"{verb} INPUT LAYER TO {target_obs_dim}-DIM..."
+            )
+
     if "actor_mean.weight" not in upgraded:
-        return upgraded
+        return upgraded, notices
+
     old_act_dim = upgraded["actor_mean.weight"].shape[0]
     logstd_key = "actor_log_std" if "actor_log_std" in upgraded else "actor_logstd"
-    if old_act_dim >= target_act_dim and logstd_key == "actor_log_std":
-        return upgraded
+    needs_action_upgrade = old_act_dim != target_act_dim
+    needs_logstd_rename = logstd_key != "actor_log_std"
+
+    if not needs_action_upgrade and not needs_logstd_rename:
+        return upgraded, notices
+
     old_weight = upgraded["actor_mean.weight"]
     old_bias = upgraded["actor_mean.bias"]
     old_logstd = upgraded.get(logstd_key)
+
     new_weight = old_weight.new_zeros((target_act_dim, old_weight.shape[1]))
-    new_weight[:old_act_dim, :] = old_weight
+    row_limit = min(old_act_dim, target_act_dim)
+    new_weight[:row_limit, :] = old_weight[:row_limit, :]
     upgraded["actor_mean.weight"] = new_weight
+
     new_bias = old_bias.new_zeros(target_act_dim)
-    new_bias[:old_act_dim] = old_bias
+    new_bias[:row_limit] = old_bias[:row_limit]
     upgraded["actor_mean.bias"] = new_bias
+
     if old_logstd is None:
         new_logstd = old_weight.new_full((target_act_dim,), -0.5)
     else:
         old_logstd_flat = old_logstd.reshape(-1)
         new_logstd = old_logstd_flat.new_full((target_act_dim,), -0.5)
-        limit = min(target_act_dim, old_logstd_flat.shape[0])
-        new_logstd[:limit] = old_logstd_flat[:limit]
+        logstd_limit = min(target_act_dim, old_logstd_flat.shape[0])
+        new_logstd[:logstd_limit] = old_logstd_flat[:logstd_limit]
+
     upgraded["actor_log_std"] = new_logstd
     upgraded.pop("actor_logstd", None)
-    return upgraded
+
+    if needs_action_upgrade:
+        verb = "PADDING" if old_act_dim < target_act_dim else "TRUNCATING"
+        notices.append(
+            f"DETECTED LEGACY {old_act_dim}-DIM ACTION SPACE MODEL. "
+            f"{verb} TO {target_act_dim}-DIM..."
+        )
+    elif needs_logstd_rename:
+        notices.append("DETECTED LEGACY BRAIN LOGSTD KEY. RENAMING TO actor_log_std...")
+
+    return upgraded, notices
+
 def train_brain(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -301,19 +403,14 @@ def train_brain(args):
     if checkpoint:
         print("Restoring Brain model and optimizer weights...")
         state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-        old_act_dim = state_dict["actor_mean.weight"].shape[0] if "actor_mean.weight" in state_dict else brain_model.actor_mean.out_features
-        is_legacy_checkpoint = old_act_dim < brain_model.actor_mean.out_features or (
-            "actor_logstd" in state_dict and "actor_log_std" not in state_dict
+        state_dict, upgrade_messages = _upgrade_legacy_brain_state_dict(
+            state_dict,
+            brain_model.shared[0].in_features,
+            brain_model.actor_mean.out_features,
         )
-        if is_legacy_checkpoint:
-            print(
-                f"Detected legacy {old_act_dim}-dim Brain checkpoint. "
-                f"Padding to {brain_model.actor_mean.out_features} dims for resume."
-            )
-            state_dict = _upgrade_legacy_brain_state_dict(
-                state_dict,
-                brain_model.actor_mean.out_features,
-            )
+        is_legacy_checkpoint = bool(upgrade_messages)
+        for message in upgrade_messages:
+            print(message)
         brain_model.load_state_dict(state_dict)
         if isinstance(checkpoint, dict) and "optimizer_state_dict" in checkpoint:
             if is_legacy_checkpoint:
@@ -323,6 +420,18 @@ def train_brain(args):
                     brain_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 except (ValueError, RuntimeError) as exc:
                     print(f"Warning: failed to restore optimizer state: {exc}")
+
+        if isinstance(checkpoint, dict):
+            if restore_meta_env_resume_state(meta_env, checkpoint.get("meta_env_resume_state")):
+                print("Restored MetaEnv resume state.")
+            else:
+                print("Warning: checkpoint missing MetaEnv resume state; signal normalizers will warm up from scratch.")
+
+            if restore_brain_rng_state(checkpoint.get("rng_state")):
+                print("Restored Brain RNG state.")
+            else:
+                print("Warning: checkpoint missing Brain RNG state; action sampling will resume from a fresh RNG stream.")
+
         print(f"Resuming at episode {start_episode}")
     print(f"Training Brain on {device} for {brain_cfg.brain_episodes} RL episodes")
     print(f"  Inner: {args.inner_total_timesteps} timesteps, "
@@ -594,14 +703,18 @@ def train_brain(args):
             ckpt_dir = os.path.join(logger.full_dir, f"episode_{episode}")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"brain_ep{episode}.pt")
-            torch.save({
-                "model_state_dict": brain_model.state_dict(),
-                "optimizer_state_dict": brain_optimizer.state_dict(),
-                "episode": episode,
-                "avg_reward_10": avg_reward_10,
-                "episodes_trained": episode,
-                "args": vars(args),
-            }, ckpt_path)
+            torch.save(
+                build_brain_checkpoint_payload(
+                    brain_model,
+                    brain_optimizer,
+                    meta_env,
+                    episode=episode,
+                    avg_reward_10=avg_reward_10,
+                    episodes_trained=episode,
+                    args=args,
+                ),
+                ckpt_path,
+            )
             print(f"  [brain ckpt] {ckpt_path}")
 
         refresh_brain_trends = should_refresh_brain_trends(
@@ -621,12 +734,16 @@ def train_brain(args):
 
     # Save Brain model checkpoint for evaluation
     brain_save_path = os.path.join(logger.full_dir, "brain_model.pt")
-    torch.save({
-        "model_state_dict": brain_model.state_dict(),
-        "optimizer_state_dict": brain_optimizer.state_dict(),
-        "episodes_trained": brain_cfg.brain_episodes,
-        "args": vars(args),
-    }, brain_save_path)
+    torch.save(
+        build_brain_checkpoint_payload(
+            brain_model,
+            brain_optimizer,
+            meta_env,
+            episodes_trained=brain_cfg.brain_episodes,
+            args=args,
+        ),
+        brain_save_path,
+    )
     print(f"Saved Brain model to: {brain_save_path}")
 
     meta_env.close()
@@ -691,7 +808,7 @@ def main():
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--resume_path", type=str, default=None, help="Path to brain checkpoint.pt to resume from")
     p.add_argument("--new_run_dir", action="store_true", help="If resuming, create a new run folder instead of continuing in the same folder")
-    p.add_argument("--save_every_episodes", type=int, default=5,
+    p.add_argument("--save_every_episodes", type=int, default=1,
                    help="Write per-episode Brain checkpoints every N episodes; 0 keeps only the final episode checkpoint")
     p.add_argument("--plot_every_episodes", type=int, default=5,
                    help="Refresh aggregate Brain plots every N episodes; 0 plots only at the end")
@@ -704,11 +821,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-

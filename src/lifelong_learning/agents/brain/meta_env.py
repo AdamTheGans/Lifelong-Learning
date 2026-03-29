@@ -27,16 +27,15 @@ class MetaEnv(gym.Env):
     Gymnasium environment where:
       - Observation: 19-dim vector of normalized training signals
       - Action: 15-dim continuous vector controlling hyperparameter adjustments
-        [0]  lr scale             ∈ [-1, 1] → mapped linearly to [lr_min, lr_max]
-        [1]  ent_coef scale       ∈ [-1, 1] → mapped linearly to [ent_min, ent_max]
-        [2]  intrinsic_coef       ∈ [-1, 1] → mapped linearly to [intr_min, intr_max]
-        [3]  imagined_horizon     ∈ [-1, 1] → mapped linearly to [1, 30]
-        [4]  replay_ratio         ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
-        [5]  replay_prioritization ∈ [-1, 1] → mapped linearly to [0.0, 1.0]
-        [6]  anchoring_weight     ∈ [-1, 1] → mapped linearly to [0.0, 0.5]
-        [7:15] context_code       ∈ [-1, 1]^8 → neuromodulation mask via ContextDecoder
-      - Reward: recovery-based metric (Δ success_rate + α·Δ return - β·failure_rate)
-      - Episode: one full inner training run
+        [0]  lr scale             in [-1, 1] -> mapped linearly to [lr_min, lr_max]
+        [1]  ent_coef scale       in [-1, 1] -> mapped linearly to [ent_min, ent_max]
+        [2]  intrinsic_coef       in [-1, 1] -> mapped linearly to [intr_min, intr_max]
+        [3]  imagined_horizon     in [-1, 1] -> mapped linearly to [1, 30]
+        [4]  replay_ratio         in [-1, 1] -> mapped linearly to [0.0, 0.5]
+        [5]  replay_prioritization in [-1, 1] -> mapped linearly to [0.0, 1.0]
+        [6]  anchoring_weight     in [-1, 1] -> mapped linearly to [0.0, 0.5]
+        [7:15] context_code       in [-1, 1]^8 -> neuromodulation mask via ContextDecoder
+      - Reward: recovery-based metric (delta success_rate + alpha * delta return - beta * failure_rate)      - Episode: one full inner training run
     """
 
     metadata = {"render_modes": []}
@@ -134,9 +133,15 @@ class MetaEnv(gym.Env):
         self._episode_prefix = "episode"
         self._regime_exposures = {}
         self._current_regime = None
+        self._pending_resume_state = None
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        pending_resume_state = self._pending_resume_state or {}
+        np_random_state = pending_resume_state.get("np_random_state")
+        if np_random_state is not None and getattr(self, "_np_random", None) is not None:
+            self.np_random.bit_generator.state = copy.deepcopy(np_random_state)
+
         if self.randomize_start_regime:
             start_regime = int(self.np_random.integers(0, self.num_regimes))
         else:
@@ -186,6 +191,12 @@ class MetaEnv(gym.Env):
             )
         else:
             self._signal_extractor.reset()
+
+        signal_extractor_state = pending_resume_state.get("signal_extractor")
+        if signal_extractor_state is not None:
+            self._signal_extractor.load_state_dict(signal_extractor_state)
+        self._pending_resume_state = None
+
         self._prev_success_rate = 0.0
         self._prev_mean_return = 0.0
         self._prev_failure_rate = 0.0
@@ -363,6 +374,31 @@ class MetaEnv(gym.Env):
         channel_means = summary.get('channel_means', [])
         for idx, value in enumerate(channel_means):
             s.logger.scalar(f'brain_neuromod/channel_mean_{idx}', float(value), step)
+
+    def get_resume_state(self) -> dict:
+        """Return per-env state needed to smooth Brain checkpoint resumes."""
+        signal_extractor_state = None
+        if self._signal_extractor is not None:
+            signal_extractor_state = self._signal_extractor.state_dict()
+
+        np_random_state = None
+        if getattr(self, "_np_random", None) is not None:
+            np_random_state = copy.deepcopy(self.np_random.bit_generator.state)
+
+        return {
+            "env_index": int(self.env_index),
+            "signal_extractor": signal_extractor_state,
+            "np_random_state": np_random_state,
+        }
+
+    def load_resume_state(self, resume_state):
+        """Queue a per-env resume payload to apply on the next reset."""
+        if isinstance(resume_state, (list, tuple)):
+            if 0 <= self.env_index < len(resume_state):
+                resume_state = resume_state[self.env_index]
+            else:
+                resume_state = None
+        self._pending_resume_state = copy.deepcopy(resume_state)
 
     def close(self):
         if self._state is not None:

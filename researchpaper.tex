@@ -1,0 +1,346 @@
+﻿\documentclass[sigconf]{acmart}
+% Optional: remove ACM reference format footer for class submissions (uncomment if allowed)
+% \settopmatter{printacmref=false}
+% \renewcommand\footnotetextcopyrightpermission[1]{}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{siunitx}
+\usepackage{hyperref}
+
+\title{Catastrophic Forgetting in Continual RL: Comparing PPO, Dyna-PPO, Regime-Specific World Models, and Meta-Learning}
+
+% ---- Authors (replace with your team) ----
+\author{Adam Gans}
+\email{agans1@uci.edu}
+\affiliation{
+  \institution{University Of California, Irvine}
+  \city{Irvine}
+  \state{California}
+  \country{USA}
+}
+\author{Elijah Tabachnik}
+\email{fill-in-email}
+\affiliation{
+  \institution{University Of California, Irvine}
+  \city{Irvine}
+  \state{California}
+  \country{USA}
+}
+\author{Juan Martinez}
+\email{juanrm3@uci.edu}
+\affiliation{
+  \institution{University Of California, Irvine}
+  \city{Irvine}
+  \state{California}
+  \country{USA}
+}
+\author{Harshvardhan Sharaff}
+\email{fill-in-email}
+\affiliation{
+  \institution{University Of California, Irvine}
+  \city{Irvine}
+  \state{California}
+  \country{USA}
+}
+
+\begin{abstract}
+Continual reinforcement learning agents must adapt to shifting task demands while retaining previously acquired competence, a challenge known as catastrophic forgetting. We study this problem in a goal-switching MiniGrid benchmark family and compare three mechanisms for mitigating forgetting beyond a vanilla PPO baseline. First, we establish a Dyna-PPO agent that augments Proximal Policy Optimization with a lightweight convolutional world model: prediction error drives an intrinsic curiosity signal, and imagined rollouts provide additional Dyna-style updates. Second, we study a meta-learning approach in which an outer ``Brain'' agent adjusts the hyperparameters of an inner policy-learning agent online and emits an 8-dimensional neuromodulatory context code. Third, we reserve a regime-specific world model that routes specialized dynamics heads based on surprise. Together, these systems let us analyze the trade-offs between model-based imagination, modular specialization, and outer-loop control for continual reinforcement learning in non-stationary environments.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10010147.10010257.10010293.10010294</concept_id>
+  <concept_desc>Computing methodologies~Reinforcement learning</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10010147.10010257.10010293.10010296</concept_id>
+  <concept_desc>Computing methodologies~Sequential decision making</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Computing methodologies~Reinforcement learning}
+\ccsdesc[300]{Computing methodologies~Sequential decision making}
+\keywords{continual reinforcement learning, catastrophic forgetting, world models, PPO, Dyna architecture, intrinsic motivation, MiniGrid, meta-learning, neuromodulation, multi-head networks}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+Deep reinforcement learning (RL) agents typically assume a stationary environment, yet real-world settings are inherently non-stationary: reward functions, dynamics, and goals can shift over time. A well-documented failure mode under such conditions is catastrophic forgetting, where adapting to a new task regime degrades competence in previously mastered regimes. We study this problem in a controlled MiniGrid benchmark family in which the identity of the rewarded goal switches periodically, forcing the agent to repeatedly relearn and retain competing reward mappings.
+
+We implement and compare four configurations: (i) a standard PPO baseline \cite{schulman2017ppo}; (ii) Dyna-PPO, which adds a learned world model, intrinsic curiosity, and imagined updates; (iii) a regime-specific world model that dynamically spawns and routes specialized dynamics heads based on prediction-error surprise; and (iv) a meta-learning agent in which an outer ``Brain'' RL policy modulates the hyperparameters of an inner policy-learning agent and provides a neuromodulatory context code.
+
+Our central questions are (1) how severely does a standard PPO agent forget under repeated regime switches? (2) How much do world-model-based imagination and intrinsic motivation improve recovery? (3) Can a modular, surprise-routed world model automatically detect regime shifts and maintain per-regime dynamics? (4) Does hierarchical control through meta-learning and neuromodulation improve adaptation across regimes?
+
+\section{Data}
+\label{sec:data}
+Our ``data'' consists of agent-environment interaction trajectories collected online during training.
+
+\subsection{Environment: Goal-Switching MiniGrid}
+We use a custom $8 \times 8$ MiniGrid benchmark family built on the MiniGrid environment suite~\cite{chevalierboisvert2023minigrid}. The baseline PPO and Dyna-PPO comparisons use a legacy Dual-Goal variant containing two colored goal tiles (e.g., green and blue), while the Brain experiments use the same wrapper stack with a configurable MultiGoal variant.
+
+The agent starts at a random position and orientation inside a walled grid. Each episode terminates when the agent reaches either goal or exceeds a horizon of 256 steps. At any given time, exactly one goal is designated as ``correct.'' In the Dual-Goal setting, stepping on the correct goal yields a reward of $+5$, stepping on the incorrect goal yields $-1$, and a per-step penalty of $-0.01$ is applied at every timestep. The MultiGoal setting generalizes the same idea to more than two regimes while keeping the observation representation and reduced action space unchanged.
+
+\subsection{Non-Stationarity via Regime Switching}
+To induce non-stationarity and catastrophic forgetting, we periodically switch which goal color is correct. We define a \emph{regime} as a contiguous segment of training in which one goal is correct. After a fixed number of environment steps, the roles of the goals are swapped: during a green regime, the green goal yields $+5$ and the blue goal yields $-1$; during a blue regime, the mapping is reversed.
+
+From the agent's perspective, the optimal policy must change whenever a regime switch occurs. Across experiments, we use both rapid-switch stress tests and longer schedules that allow near-convergence inside a regime. In the current codebase, switch intervals range from roughly $12{,}500$ to $296{,}000$ environment steps per regime, depending on the benchmark and controller under study. Total training ranges from 300K to 2.5M environment steps, depending on the experiment.
+
+\subsection{Observations and Action Space}
+Observations are represented as a one-hot tensor with $C$ channels over the grid. In our implementation, $C = 21$, corresponding to MiniGrid's encoding of walls, floor, agent, and goal objects, yielding an observation shape of $(C, H, W) = (21, 8, 8)$. This symbolic grid input is well-suited to convolutional encoders and to discrete next-state prediction in the world model.
+
+The action space is reduced to three discrete actions: turn left, turn right, and move forward. We inherit MiniGrid's standard transition dynamics for movement and collisions with walls. Training is parallelized across 8--16 vectorized environment instances to accelerate data collection.
+
+\section{Methods: Architecture Design and Training}
+\label{sec:methods}
+
+\subsection{Baseline: Proximal Policy Optimization}
+Our baseline agent is Proximal Policy Optimization (PPO)~\cite{schulman2017ppo} implemented with an actor-critic architecture and generalized advantage estimation (GAE). The policy and value function share a three-layer convolutional encoder ($32 \to 64 \to 64$ channels, $3{\times}3$ kernels with padding, ReLU activations) followed by separate two-layer MLP heads for policy logits and state value. Given a batch of on-policy trajectories, we compute advantages using GAE and optimize the clipped surrogate objective with value regression and entropy regularization. Training is parallelized across synchronous vectorized environments.
+
+\subsection{World Model}
+The Dyna-PPO agent augments the PPO backbone with a lightweight convolutional world model $f_\phi$ that predicts both the next observation and the immediate reward from the current observation and action. Formally,
+\[
+(\hat{o}_{t+1}, \hat{r}_t) = f_\phi(o_t, a_t),
+\]
+where $o_t \in \mathbb{R}^{C \times H \times W}$ is a one-hot grid, $a_t$ is a discrete action, $\hat{o}_{t+1}$ are next-state logits, and $\hat{r}_t$ is a scalar reward prediction.
+
+The world model consists of: (i) a convolutional encoder mirroring the actor-critic encoder, (ii) an action embedding combined with the encoded observation via late fusion, and (iii) two output heads, one for next-state logits and one for reward. We train it on real transitions from the PPO buffer using a sum of next-state cross-entropy loss (after converting one-hot observations to per-cell class indices) and reward mean squared error.
+
+\subsection{Intrinsic Curiosity from Prediction Error}
+We derive an intrinsic reward from the world model's prediction error, in the spirit of curiosity-driven exploration~\cite{pathak2017curiosity}. For each transition, we compute
+\[
+\mathcal{L}_{\text{state}} = \text{CE}(\hat{o}_{t+1}, o_{t+1}), \quad
+\mathcal{L}_{\text{reward}} = \text{MSE}(\hat{r}_t, r_t),
+\]
+and define the intrinsic reward as
+\[
+r_t^{\text{int}} = \operatorname{clip}\big(\beta \cdot (\mathcal{L}_{\text{state}} + \mathcal{L}_{\text{reward}}), 0, r_{\max}\big),
+\]
+with scaling coefficient $\beta$ and clip $r_{\max}$. The total reward used for PPO updates is
+\[
+r_t^{\text{tot}} = r_t^{\text{ext}} + r_t^{\text{int}}.
+\]
+In \emph{passive} mode we disable the intrinsic term to recover a pure PPO baseline.
+
+\subsection{Dreaming: Imagined Rollouts for Policy Updates}
+Following Dyna~\cite{sutton1990dyna}, we periodically generate imagined trajectories by rolling out the policy inside the world model for a short horizon $H$. We seed imagination from real states sampled from the rollout buffer. At each imagined step, the policy selects an action, the world model predicts the next observation and reward, and we discretize the predicted observation logits back into a one-hot grid (argmax over channels) to prevent the accumulation of ``blurry'' states.
+
+We treat imagined transitions as additional on-policy data: we compute advantages using the value function evaluated on dreamed states (with gradients stopped through the world model), and perform extra PPO updates on the imagined trajectories. In \emph{passive} mode we skip imagination entirely.
+
+\subsection{Regime-Specific World Model}
+This subsection is reserved for the regime-specific world model contribution. In the final draft, it will describe the shared feature trunk, surprise-based head creation and routing mechanism, and the corresponding experiments once those runs are frozen.
+
+\subsection{Meta-Learning and Neuromodulation}
+Our meta-learning system wraps a full inner Dyna-PPO training run inside an outer Gymnasium environment (\texttt{MetaEnv}). Every outer step executes $K$ inner PPO updates, where $K$ is the \emph{decision interval}, and returns a normalized 19-dimensional summary of the inner learner's state. The Brain observation includes performance signals (mean episodic return, success rate, and failure rate), surprise and world-model diagnostics (mean surprise, surprise delta, state loss, and reward loss), policy statistics (entropy, policy loss, and value loss), the current values of the controllable inner hyperparameters, the time since the most recent surprise spike, and episodic-memory utilization.
+
+The outer Brain policy is itself trained with PPO. It uses a two-layer MLP actor-critic and a tanh-squashed Gaussian policy over a 15-dimensional continuous action space. Seven action dimensions control scalar inner-loop levers: learning rate, entropy coefficient, intrinsic curiosity coefficient, imagined rollout horizon, replay ratio, replay prioritization, and policy anchoring weight. The remaining eight dimensions form a context code for neuromodulation.
+
+Neuromodulation is implemented inside the inner CNN actor-critic. Let $h_t$ denote the flattened shared convolutional features for the current observation and let $c_t \in [-1,1]^8$ be the Brain's context code. A context decoder maps $c_t$ through a small MLP to a suppressive template, and the resulting mask $m_t \in (0,1]^d$ is applied multiplicatively to the shared features:
+\[
+\tilde{h}_t = h_t \odot m_t.
+\]
+The actor and critic heads then consume $\tilde{h}_t$ rather than the unmasked features. Importantly, the mask magnitude is scaled by $\lVert c_t \rVert_2$, so the zero context code produces an all-ones mask and therefore a neutral, no-gating baseline. This design lets the outer controller learn context-dependent feature suppression without changing the inner network topology.
+
+We log both the Brain's selected hyperparameters and dedicated neuromodulation diagnostics, including mask mean and standard deviation, per-channel mask activity, policy KL divergence relative to the unmasked policy, entropy change, and value shift. These diagnostics let us later test whether the context code behaves like a regime-sensitive routing signal rather than uncontrolled noise.
+
+The implementation also supports a small number of imitation-style pretraining episodes before outer-loop PPO. During this warm start, a hand-coded heuristic increases exploration-oriented levers immediately after low success rates or surprise spikes, then tapers toward more exploitative settings as the inner learner recovers. During full Brain training, the outer reward can be configured as an area-under-the-curve score, a recovery-oriented shaping function, or a curriculum-style reward that up-weights successful revisits of earlier regimes.
+
+\subsection{Training Protocol and Hyperparameters}
+Each training update consists of four phases:
+\begin{enumerate}
+  \item \textbf{Real experience collection}: interact with synchronized vectorized environments for a fixed number of steps, compute intrinsic rewards, and populate the rollout buffer.
+  \item \textbf{Policy update on real data}: compute returns and advantages using GAE and run several epochs of PPO updates.
+  \item \textbf{World model update}: train the world model on the same real transitions with supervised losses.
+  \item \textbf{Dreaming (Dyna-PPO only)}: sample start states, roll out imagined trajectories in the world model, and run one additional PPO epoch on dreamed data.
+\end{enumerate}
+For meta-learning, one Brain episode consists of repeated executions of this inner loop, with the outer controller selecting new inner hyperparameters and context codes every decision interval.
+
+\subsection{Logging and Evaluation}
+Training statistics are logged to TensorBoard via scalar summaries. We record standard RL metrics (episodic return, episode length), success/failure/timeout rates, world model losses (state cross-entropy, reward MSE), and intrinsic reward statistics. For Brain experiments we additionally log the outer-agent reward, the trajectories of all Brain-controlled levers, and the neuromodulation diagnostics described above. Checkpoints are saved periodically to allow resumption and post-hoc analysis.
+
+For quantitative evaluation and figures, we post-process TensorBoard event files using a dedicated analysis script that reads logged scalars, applies exponential smoothing, detects regime-switch boundaries, and exports publication-ready plots. Table~\ref{tab:hyperparams} summarizes the representative hyperparameters and controller dimensions used in our experiments.
+
+\begin{table}[t]
+  \caption{Representative hyperparameters and controller dimensions used in our experiments.}
+  \label{tab:hyperparams}
+  \centering
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Parameter & Value \\
+    \midrule
+    Inner total timesteps & $300{,}000$--$2{,}500{,}000$ \\
+    Inner number of environments & $8$--$16$ \\
+    Rollout length (steps) & $128$ \\
+    Initial inner PPO learning rate & $3 \times 10^{-4}$ \\
+    PPO update epochs / minibatch size & $4 / 1024$ \\
+    Discount factor $\gamma$ & $0.99$ \\
+    GAE parameter $\lambda$ & $0.95$ \\
+    Initial intrinsic coefficient $\beta$ & $0.015$ \\
+    Intrinsic clip $r_{\max}$ & $0.1$ \\
+    Initial imagined horizon $H$ & $10$ \\
+    World model learning rate & $1 \times 10^{-4}$ \\
+    Brain observation / action dims & $19 / 15$ \\
+    Neuromodulation context dimension & $8$ \\
+    Brain decision interval & $10$ inner updates \\
+    Inner learning-rate range (Brain) & $[10^{-4}, 3 \times 10^{-3}]$ \\
+    Entropy-coefficient range (Brain) & $[10^{-3}, 10^{-1}]$ \\
+    Intrinsic-coefficient range (Brain) & $[10^{-3}, 5 \times 10^{-1}]$ \\
+    Replay ratio / anchoring range & $[0, 0.5] / [0, 0.5]$ \\
+    Regime switch period & $12{,}500$--$296{,}000$ steps/env \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Results}
+\label{sec:results}
+
+We compare four configurations---PPO baseline (\emph{passive} mode), Dyna-PPO (\emph{dyna} mode), the regime-specific world model, and meta-learning---in both stationary and regime-switching settings. The current draft includes finalized methodology and result templates for all four methods; final comparative claims will be updated once the remaining plots and summary statistics are inserted.
+
+\subsection{Learning Curves and Success Rates}
+Figure~\ref{fig:learning_curves} is a placeholder for the final continual-learning plots. We use a common plotting template across PPO, Dyna-PPO, and Brain-controlled runs so that return, success rate, and surprise can be compared under the same smoothing and switch-alignment settings.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}{\linewidth}
+    \centering
+    \fbox{\parbox[c][1.3in][c]{0.92\linewidth}{\centering Placeholder for episodic-return curves\\Insert final exported plot here.}}
+    \caption{Episodic return over time.}
+    \label{fig:return_curve}
+  \end{subfigure}
+  \vspace{0.5em}
+  \begin{subfigure}{\linewidth}
+    \centering
+    \fbox{\parbox[c][1.3in][c]{0.92\linewidth}{\centering Placeholder for success-rate / surprise curves\\Insert final exported plot here.}}
+    \caption{Success rate and surprise over time.}
+    \label{fig:success_rates}
+  \end{subfigure}
+  \caption{Template for continual-learning plots. Replace these placeholders with final exported figures and update the caption with the exact run identifiers, switch schedule, and plotted quantities.}
+  \label{fig:learning_curves}
+\end{figure}
+
+Once the final plots are exported, this subsection will summarize how the four methods differ in stability, post-switch collapse, and recovery speed.
+
+\subsection{Forgetting and Recovery After Regime Switches}
+To quantify catastrophic forgetting we measure three metrics:
+\begin{enumerate}
+  \item \textbf{Average episodic return} across the entire training run,
+  \item \textbf{Recovery steps}: environment steps required after each switch to reach a target success rate of $80\%$, and $95\%$,
+  \item \textbf{Return on revisits}: mean episodic return during the first $1{,}000$ episodes when a previously seen regime reappears.
+\end{enumerate}
+
+Table~\ref{tab:continual_metrics} is the template we will populate once the final evaluation runs and plots are frozen.
+
+\begin{table}[t]
+  \caption{Continual-learning metrics template. Fill with final aggregated values once the evaluation pipeline and plots are finalized.}
+  \label{tab:continual_metrics}
+  \centering
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Method & Avg. return & Recovery steps & Return on revisits \\
+    \midrule
+    PPO baseline & \textit{TBD} & \textit{TBD} & \textit{TBD} \\
+    Dyna-PPO & \textit{TBD} & \textit{TBD} & \textit{TBD} \\
+    Regime-Specific WM & \textit{TBD} & \textit{TBD} & \textit{TBD} \\
+    Meta-Learning & \textit{TBD} & \textit{TBD} & \textit{TBD} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{PPO and Dyna-PPO}
+This subsection will summarize how Dyna-style imagination and curiosity affect recovery speed and revisit performance relative to the passive PPO baseline once the final baseline plots and aggregate metrics are inserted.
+
+\subsection{Regime-Specific World Model}
+This subsection is reserved for the regime-specific world model results and the corresponding head-routing figure.
+% Insert head-routing figure here once the regime-specific world model results are finalized.
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.7\linewidth]{figures/head_routing.pdf}
+%   \caption{World model active head index vs. ground-truth regime. Vertical dashed lines indicate regime switches.}
+%   \label{fig:head_routing}
+% \end{figure}
+
+\subsection{Meta-Learning}
+For the Brain controller, the main question is whether the outer agent learns phase-specific responses around regime switches rather than merely improving stationary training. The current plot set suggests that this is where the outer controller is most useful: several of the strongest Brain runs still adapt relatively slowly in the very first regime, but they recover much faster once at least one switch has been observed.
+
+In a slow-switch two-regime baseline with fixed inner hyperparameters, the agent averages $0.9426$ success and fails to reach $95\%$ in the initial regime, only reaching that mark after $197{,}648$ steps once the opposite regime appears; the subsequent revisits recover in $54{,}624$ and $36{,}080$ steps. A neuromodulated Brain checkpoint evaluated under the same slow-switch schedule averages $0.8906$ success and reaches $95\%$ in all four plotted regimes, with recovery times of $294{,}968$, $86{,}160$, $111{,}344$, and $68{,}128$ steps. Two additional strong Brain plots in our current analysis snapshot achieve average success rates of $0.9357$ and $0.9590$, and their post-switch recoveries fall into the roughly $39{,}680$--$75{,}952$ step range after the first regime. Taken together, these curves suggest that outer-loop control is especially valuable for re-adaptation and retention across revisits.
+
+Under a harsher rapid-fire schedule, the difference between static and Brain-controlled settings becomes much clearer. The rapid-fire baseline averages only $0.4638$ success and fails to reach $80\%$ in every regime. By contrast, a Brain-controlled rapid-fire run averages $0.7307$ success, misses only the first regime, then reaches $80\%$ in $97{,}312$, $59{,}440$, and $51{,}168$ steps and reaches $95\%$ in the next four revisits after $66{,}744$, $71{,}848$, $73{,}576$, and $67{,}472$ steps. Two additional rapid-fire Brain plots in the current snapshot average $0.6989$ and $0.7498$ success; the strongest of these recovers in every plotted regime and reaches $95\%$ in several later revisits. These results indicate that Brain-style control substantially improves continual adaptation under frequent switching, even though the very first regime remains the hardest acquisition case.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}{\linewidth}
+    \centering
+    \fbox{\parbox[c][1.2in][c]{0.92\linewidth}{\centering Placeholder for Brain outer reward and final inner success-rate plots}}
+    \caption{Outer reward and final inner performance by Brain episode.}
+    \label{fig:brain_outer_reward}
+  \end{subfigure}
+  \vspace{0.5em}
+  \begin{subfigure}{\linewidth}
+    \centering
+    \fbox{\parbox[c][1.2in][c]{0.92\linewidth}{\centering Placeholder for Brain-selected lever trajectories and neuromodulation diagnostics}}
+    \caption{Hyperparameter and neuromodulation trajectories aligned to regime switches.}
+    \label{fig:brain_hyperparams}
+  \end{subfigure}
+  \caption{Planned Brain-RL analysis. Final figures will include the slow-switch two-regime plots, the rapid-fire stress-test comparison, and the neuromodulation diagnostics derived from the decoded feature mask.}
+  \label{fig:brain_analysis}
+\end{figure}
+
+\subsubsection{How Neuromodulation Works and How to Read the Diagnostic Dashboard}
+The neuromodulation dashboard summarizes one Brain-controlled inner run at the exact timesteps when the Brain emits a new context code. The horizontal axis is therefore not raw episode index but \emph{inner global step at Brain decision time}. Colored regime backgrounds and dashed vertical lines mark reward-regime switches. Read together, the four panels show the full causal chain from Brain output, to decoded mask, to changed network behavior.
+
+The top panel (``Learning Progress and Regime Context'') provides behavioral context for the rest of the dashboard. It overlays success rate, mean reward per step, and episodic return, so that drops in performance can be aligned with regime boundaries. When neuromodulation is useful, we expect these drops to be followed by recovery rather than prolonged collapse. This panel therefore tells us \emph{when} adaptation is happening and whether changes in the lower panels occur near the moments when they matter most.
+
+The second panel (``Brain Context Code'') visualizes the 8-dimensional continuous context vector produced by the outer Brain. Each row is one context dimension and each column is one Brain decision. Red values indicate positive code entries and blue values indicate negative entries. If the Brain were not using this channel meaningfully, the heatmap would look like unstructured noise with no persistence. Instead, the code often forms temporally coherent bands and visibly changes near some regime boundaries, which is consistent with the Brain using the context code as a compact latent description of the current training situation.
+
+The third panel (``Decoded Neuromodulation Mask'') shows what happens after that 8-dimensional code is passed through the context decoder inside the inner actor-critic. The decoder maps the code to a feature-wise suppressive mask that is multiplied into the shared convolutional representation before both the actor and critic heads. In the dashboard, each row corresponds to one of the 64 shared CNN feature channels, and the plotted value is the mean mask strength for that channel after averaging over spatial positions. Values near $1$ indicate channels that are largely preserved, whereas lower values indicate channels that are being suppressed. Vertical stripes in this heatmap therefore indicate moments when the Brain is reweighting which internal features the inner agent is allowed to rely on.
+
+The fourth panel (``Neuromodulation Effect on Policy and Value'') measures the downstream consequence of that masking. At each Brain decision, the same observation batch is run through the network twice: once with the current neuromodulation mask and once with an all-ones mask corresponding to ``no neuromodulation.'' From those two forward passes we log three quantities: (i) the KL divergence between the masked and unmasked action distributions, (ii) the difference in policy entropy, and (iii) the mean absolute difference between the masked and unmasked value estimates. Formally, if $\pi_m$ and $\pi_u$ denote the masked and unmasked policies and $V_m, V_u$ the corresponding value predictions, we track $\mathrm{KL}(\pi_m\,\|\,\pi_u)$, $H(\pi_m)-H(\pi_u)$, and $\mathbb{E}[|V_m-V_u|]$.
+
+This final panel is the clearest direct test of whether neuromodulation is actually doing anything. If the context code were being ignored, all three traces would remain at or extremely near zero. Instead, the policy-KL curve stays consistently above zero, the entropy-delta curve also remains nonzero, and the absolute value-delta curve exhibits the largest excursions. In other words, the mask changes both the actor and the critic, but in this run it affects the critic more strongly than the action distribution itself. That pattern is reasonable: a scalar value estimate is often more sensitive to feature suppression than the ranking of a small discrete action set. The graph therefore supports the interpretation that neuromodulation is not merely an auxiliary logging signal; it is actively changing the computation performed by the inner policy/value network.
+
+One caveat is that the three traces in the bottom panel do not share the same natural units, even though they are plotted on a common axis for convenience. Their magnitudes should therefore be interpreted relative to their own zero baselines rather than directly compared numerically. Even with that caveat, persistent nonzero values in all three traces provide strong evidence that the Brain's context code is functioning as a genuine control signal for internal feature routing.
+
+\subsection{World Model Quality and Intrinsic Rewards}
+We monitor world model losses (next-state cross-entropy and reward MSE) alongside intrinsic reward statistics throughout training. Early in training, prediction errors and intrinsic rewards are high, encouraging exploration. As the world model improves, both losses and intrinsic rewards decrease, shifting the agent toward exploitation.
+
+When a regime switch occurs, the world model's reward prediction error spikes because the reward mapping has inverted. This spike temporarily increases intrinsic rewards and drives exploration toward discovering the new correct goal. For the final draft, this subsection will contrast how quickly the single-head and regime-specific world models return to their pre-switch loss levels, and whether per-head specialization reduces interference.
+
+\section{Conclusion and Discussion}
+\label{sec:conclusion}
+We study catastrophic forgetting in a non-stationary MiniGrid benchmark family and compare baseline PPO, Dyna-PPO, a regime-specific world-model design, and a Brain-style meta-learning controller. The current draft now includes a quantitative Brain-RL summary from the provided success-rate plots in addition to the finalized methodological description of neuromodulation.
+
+The Brain contribution adds outer-loop control over inner learning dynamics by selecting seven training levers and an 8-dimensional context code that gates inner policy features. In the current plot set, this controller clearly improves rapid-switch adaptation relative to static hyperparameters: the rapid-fire baseline averages $0.4638$ success, while Brain-controlled variants reach $0.6989$--$0.7498$, with one representative run achieving $0.7307$ and recovering in seven of eight regimes after the initial miss. Under slower two-regime switching, representative Brain and neuromodulated checkpoints remain in the $0.8906$--$0.9590$ average-success range and show substantially faster post-switch reacquisition than initial first-regime learning. These trends are consistent with the intended role of the Brain as a switch-aware controller that reallocates exploration, replay, anchoring, and feature gating over time.
+
+\subsection{Limitations}
+Several limitations remain. First, our evaluation is restricted to a goal-switching gridworld benchmark; while this isolates the phenomenon of interest, the dynamics are simpler than many real-world tasks. Second, even short imagined rollouts can compound prediction errors, especially immediately after regime changes when the world model is least accurate. Third, the meta-learning approach introduces additional complexity in defining the outer agent's state and reward, and its benefits depend on the granularity of hyperparameter control. Finally, all experiments are currently organized around a small number of runs; broader multi-seed statistical evaluation would strengthen the conclusions.
+
+\subsection{Future Work}
+Future directions include: (1) extending to richer observation spaces and more complex control tasks, such as continuous-control benchmarks or partially observable environments; (2) scaling the multi-head world model to settings with more than two regimes, where head management and routing become more challenging; (3) investigating alternative intrinsic motivation signals less tightly coupled to prediction error, such as information gain or disagreement-based exploration; and (4) running explicit Brain ablations that disable replay, anchoring, or neuromodulation to measure which control channels matter most for continual adaptation.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\clearpage
+\section*{Team Contributions}
+\label{sec:contributions}
+\noindent\textbf{Adam Gans.}
+Contribution summary pending final confirmation. This slot is reserved for the regime-specific world model architecture, experiments, and associated paper sections.
+
+\vspace{0.5em}
+\noindent\textbf{Elijah Tabachnik.}
+Designed and implemented the Brain meta-agent, the \texttt{MetaEnv} wrapper around inner-agent training, the signal-extraction pipeline, and the neuromodulation pathway that maps an 8-dimensional Brain context code into feature-wise gating inside the inner CNN actor-critic. Added Brain-controlled levers for learning rate, entropy, intrinsic curiosity, imagined horizon, replay, prioritization, and anchoring, along with checkpoint/resume and evaluation support. Drafted the meta-learning and neuromodulation sections of the paper and prepared placeholders for the final Brain figures and statistics.
+
+\vspace{0.5em}
+\noindent\textbf{Juan Martinez.}
+Contribution summary pending final confirmation.
+
+\vspace{0.5em}
+\noindent\textbf{Harshvardhan Sharaff.}
+Contribution summary pending final confirmation.
+
+\end{document}
+

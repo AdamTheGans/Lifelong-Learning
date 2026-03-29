@@ -77,7 +77,7 @@ class TestMetaEnv(unittest.TestCase):
         ic_before = state.intrinsic_coef
         hz_before = state.imagined_horizon
 
-        # Action [1,1,...,1] (15-dim) → max scale everything up
+        # Action [1,1,...,1] (15-dim) Ã¢â€ â€™ max scale everything up
         action = np.ones(15, dtype=np.float32)
         self.env.step(action)
 
@@ -149,6 +149,48 @@ class TestMetaEnv(unittest.TestCase):
         finally:
             env.close()
 
+    def test_resume_state_restores_signal_normalizer_on_next_reset(self):
+        """A fresh MetaEnv should pick up the saved cross-episode normalizer state."""
+        inner_cfg = PPOConfig(
+            total_timesteps=10_000,
+            num_envs=4,
+            num_steps=32,
+            seed=11,
+            device="cpu",
+            mode="dyna",
+        )
+        env = MetaEnv(
+            env_id="MiniGrid-MultiGoal-8x8-v0",
+            inner_cfg=inner_cfg,
+            decision_interval=1,
+            steps_per_regime=10_000,
+            intrinsic_coef=0.015,
+            imagined_horizon=3,
+        )
+        restored_env = MetaEnv(
+            env_id="MiniGrid-MultiGoal-8x8-v0",
+            inner_cfg=inner_cfg,
+            decision_interval=1,
+            steps_per_regime=10_000,
+            intrinsic_coef=0.015,
+            imagined_horizon=3,
+        )
+        try:
+            env.reset(seed=0)
+            env.step(np.zeros(15, dtype=np.float32))
+            resume_state = env.get_resume_state()
+
+            self.assertIn("np_random_state", resume_state)
+            self.assertIn("signal_extractor", resume_state)
+
+            restored_env.load_resume_state(resume_state)
+            restored_env.reset(seed=1)
+
+            expected_count = resume_state["signal_extractor"]["normalizer"]["count"] + 1
+            self.assertEqual(restored_env._signal_extractor.normalizer.count, expected_count)
+        finally:
+            env.close()
+            restored_env.close()
     def test_interval_summary_uses_completed_episode_counts(self):
         """Meta-step summaries should aggregate the full decision interval, not just the last update."""
         env = MetaEnv(inner_cfg=PPOConfig(total_timesteps=10_000, num_envs=4, num_steps=32, seed=0, device="cpu", mode="dyna"))

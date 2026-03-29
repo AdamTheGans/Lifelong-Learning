@@ -61,6 +61,31 @@ class RunningNormalizer:
         normed = (x - self.mean) / std
         return np.clip(normed, -self.clip, self.clip).astype(np.float32)
 
+    def state_dict(self) -> dict:
+        """Serialize running statistics for checkpointing."""
+        return {
+            "size": int(self.size),
+            "clip": float(self.clip),
+            "count": int(self.count),
+            "mean": self.mean.copy(),
+            "var": self.var.copy(),
+            "M2": self._M2.copy(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore running statistics from a checkpoint payload."""
+        if not state:
+            return
+
+        size = int(state.get("size", self.size))
+        if size != self.size:
+            raise ValueError(f"Normalizer size mismatch: expected {self.size}, got {size}")
+
+        self.clip = float(state.get("clip", self.clip))
+        self.count = int(state.get("count", 0))
+        self.mean = np.asarray(state.get("mean", self.mean), dtype=np.float32).copy()
+        self.var = np.asarray(state.get("var", self.var), dtype=np.float32).copy()
+        self._M2 = np.asarray(state.get("M2", state.get("_M2", self._M2)), dtype=np.float32).copy()
 
 class SignalExtractor:
     """
@@ -203,3 +228,15 @@ class SignalExtractor:
         self.steps_since_spike = 0
         self.prev_surprise = 0.0
         # Keep normalizer stats across episodes for stability
+
+    def state_dict(self) -> dict:
+        """Serialize only the cross-episode state needed for smooth resume."""
+        return {
+            "normalizer": self.normalizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore cross-episode normalization state after a resume."""
+        if not state:
+            return
+        self.normalizer.load_state_dict(state.get("normalizer", {}))

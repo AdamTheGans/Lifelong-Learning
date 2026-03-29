@@ -4,8 +4,11 @@ __pycache__/
 *.pyd
 .DS_Store
 .env
+debug_out.txt
+notes.txt
 .venv/
 venv/
+myenv/
 wandb/
 runs/
 checkpoints/
